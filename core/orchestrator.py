@@ -30,18 +30,6 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, List, Optional
 
-from services.cache_service    import CacheService
-from services.graph_service    import dependency_builder
-from services.project_indexer  import get_project_index
-from services.knowledge_graph  import knowledge_graph
-from services.knowledge_loader import ProjectCodeIndexer
-from services.llm_service      import assistant_agent
-from agents.retriever_agent    import retriever_agent
-from agents.analysis_agent     import analysis_agent
-from agents.learning_agent     import learning_agent
-
-
-                                    
 logger = logging.getLogger(__name__)
 
 
@@ -71,6 +59,14 @@ class Orchestrator:
         self._print_lock     = threading.Lock()
         self._last_hash: Dict[str, str] = {}
         self._file_contents: Dict[str, str] = {}
+        # Fichiers en cours d'analyse — évite les doublons dans la queue
+        self._in_progress: set = set()
+        self._in_progress_lock = threading.Lock()
+        # Fichiers qui ont reçu une solution full_class cette session
+        # Format : {str(file_path): content_hash_de_la_solution}
+        # Quand ce fichier est sauvegardé, on injecte un flag "solution déjà générée"
+        # pour que Gemini ne produise pas une seconde réécriture complète.
+        self._solution_applied: Dict[str, str] = {}
 
         self._stats = {
             "analyzed":      0,
@@ -87,7 +83,15 @@ class Orchestrator:
         Initialise tous les composants et branche les agents.
         Migré depuis IncrementalAnalyzer.initialize()
         """
- 
+        from services.cache_service    import CacheService
+        from services.graph_service    import dependency_builder
+        from services.project_indexer  import get_project_index
+        from services.knowledge_graph  import knowledge_graph
+        from services.knowledge_loader import ProjectCodeIndexer
+        from services.llm_service      import assistant_agent
+        from agents.retriever_agent    import retriever_agent
+        from agents.analysis_agent     import analysis_agent
+        from agents.learning_agent     import learning_agent
 
         print(" Initialisation System-Aware RAG...")
 
@@ -174,8 +178,15 @@ class Orchestrator:
         if deleted:
             self._queue.put({"file_path": file_path, "deleted": True})
             return
-        if self._cache and not self._cache.has_file_changed(file_path):
-            return
+        # Bloquer si ce fichier est déjà dans la queue ou en cours d'analyse
+        file_key = str(file_path)
+        with self._in_progress_lock:
+            if file_key in self._in_progress:
+                logger.debug("Doublon ignoré (déjà en cours) : %s", file_path.name)
+                return
+            if self._cache and not self._cache.has_file_changed(file_path):
+                return
+            self._in_progress.add(file_key)
         self._queue.put({"file_path": file_path, "deleted": False})
 
     def stop(self):
@@ -258,7 +269,7 @@ class Orchestrator:
         from agents.analysis_agent import build_context
         from services.graph_service import update_graph
         from services.knowledge_graph import knowledge_graph
-        from output.console_renderer import print_results, print_minor_change, parse_fix_blocks, _GR, _R, _CY, _DM
+        from output.console_renderer import print_results, print_minor_change, parse_fix_blocks, print_targeted_methods, print_solution, _GR, _R, _CY, _DM
 
         start = time.time()
         print(f"\n{'─'*70}")
@@ -274,7 +285,13 @@ class Orchestrator:
         try:
             new_content = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
-            print(f" Erreur lecture : {e}\n"); return
+            print(f" Erreur lecture : {e}\n")
+            with self._in_progress_lock:
+                self._in_progress.discard(str(file_path))
+            return
+
+        # file_key défini ici — utilisé dans étape 8.6, affichage et cache
+        file_key = str(file_path)
 
         # ── ÉTAPE 3 : Filtre intelligent — changements mineurs ────────────────
         old_content = self._file_contents.get(str(file_path), "")
@@ -290,6 +307,8 @@ class Orchestrator:
                 self._cache.update_file_cache(
                     file_path, {"analysis": "RAS — changement mineur", "relevant_knowledge": []}, [], [])
             self._file_contents[str(file_path)] = new_content
+            with self._in_progress_lock:
+                self._in_progress.discard(str(file_path))
             return
 
         print(" Analyse System-Aware lancée...")
@@ -377,6 +396,21 @@ class Orchestrator:
             if cached and cached.get("analysis"):
                 previous_analysis = cached["analysis"]
 
+        # ── ÉTAPE 8.6 : Injecter flag post-solution si ce fichier en a eu une ──
+        # Si une solution full_class a été générée pour ce fichier dans cette session,
+        # on force Gemini à ne faire que des block_fix résiduels — pas de nouvelle
+        # réécriture complète qui créerait une boucle infinie.
+        if file_key in self._solution_applied:
+            context["post_solution_mode"] = True
+            context["post_solution_hint"] = (
+                "A complete full_class solution was ALREADY generated for this file "
+                "in this session. The developer just saved that solution. "
+                "DO NOT generate another full_class rewrite. "
+                "Use ONLY block_fix for any small residual issues you find. "
+                "If the code is substantially correct, choose block_fix with 0-2 issues max."
+            )
+            print(f"  {_DM}↩  Mode post-solution — block_fix uniquement{_R}", flush=True)
+
         # ── ÉTAPE 9 : LLM ────────────────────────────────────────────────────
         print(" Analyse LLM (System-Aware)...", flush=True)
         analysis = self._analysis_agent.analyze(
@@ -395,7 +429,6 @@ class Orchestrator:
         elapsed     = time.time() - start
         result_text = analysis["analysis"]
         result_hash = hashlib.md5(result_text.encode("utf-8", errors="replace")).hexdigest()
-        file_key    = str(file_path)
 
         self._stats["analyzed"]   += 1
         self._stats["time_total"] += elapsed
@@ -413,17 +446,25 @@ class Orchestrator:
 
         with self._print_lock:
             if strategy == "full_class":
-                from output.console_renderer import print_solution
-                from config import config as _cfg
-                output_dir = _cfg.BASE_DIR / "data" / "solutions"
                 print(f"  Strategy : {_CY}full_class{_R} — {parsed['reason'][:80]}")
                 print_solution(
                     solution_text = result_text,
                     file_name     = file_path.name,
                     changes       = parsed["payload"].get("changes", []),
                     language      = language,
-                    output_dir    = output_dir,
+                    elapsed       = elapsed,
+                    analyzed_count= self._stats["analyzed"],
+                    score         = change_info["score"],
+                    impacted      = preds,
                 )
+                # Mémoriser que ce fichier vient de recevoir une solution complète.
+                # Le prochain save déclenchera une analyse en mode "post-solution"
+                # (block_fix seulement, pas de nouvelle réécriture complète).
+                code_block = parsed["payload"].get("class_code", "")
+                if code_block:
+                    self._solution_applied[file_key] = hashlib.md5(
+                        code_block.encode("utf-8", errors="replace")
+                    ).hexdigest()
                 # Afficher aussi les blocs fix s'il y en a dans la réponse
                 remaining = parsed["payload"].get("remaining_blocks", [])
                 if remaining:
@@ -438,7 +479,6 @@ class Orchestrator:
             elif strategy == "targeted_methods":
                 methods = parsed["payload"].get("methods", [])
                 print(f"  Strategy : {_CY}targeted_methods{_R} ({len(methods)} méthode(s)) — {parsed['reason'][:80]}")
-                from output.console_renderer import print_targeted_methods
                 print_targeted_methods(
                     methods    = methods,
                     file_name  = file_path.name,
@@ -475,3 +515,7 @@ class Orchestrator:
                     )
                 except Exception as e:
                     logger.debug("Feedback Loop erreur : %s", e)
+
+        # Libérer le verrou — ce fichier peut maintenant être re-analysé
+        with self._in_progress_lock:
+            self._in_progress.discard(str(file_path))

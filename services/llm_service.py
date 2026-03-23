@@ -92,6 +92,21 @@ class CodeRAGSystemAPI:
                 "Lancez : python knowledge_loader.py",
                 config.CHROMA_COLLECTION,
             )
+            print("\n⚠️  ATTENTION : Knowledge Base vide !")
+            print("   Lancez : python knowledge_loader.py")
+            print("   (sans ça, le RAG ne trouvera aucune règle)\n")
+        elif chunk_count < 50:
+            # KB anormalement petite — probablement seules les règles auto_learned
+            # sont présentes, la KB manuelle (java/, python/...) est absente.
+            logger.warning(
+                "Collection ChromaDB '%s' : seulement %d chunks — KB incomplète ! "
+                "Les règles manuelles sont absentes. Lancez : python knowledge_loader.py",
+                config.CHROMA_COLLECTION, chunk_count,
+            )
+            print(f"\n⚠️  KB INCOMPLÈTE : {chunk_count} chunks seulement (normal = 200+)")
+            print("   Les règles manuelles sont absentes du vector store.")
+            print("   Lancez : python knowledge_loader.py  pour restaurer la KB complète")
+            print("   (le système fonctionne mais le RAG sera dégradé)\n")
         else:
             logger.info("Collection '%s' : %d chunks disponibles",
                         config.CHROMA_COLLECTION, chunk_count)
@@ -374,6 +389,19 @@ If 3 methods use undeclared `connection` → 3 separate blocks, each with
                    if criticality > 0 else "")
             )
 
+        # Flag post-solution — interdit une seconde réécriture full_class
+        post_solution_hint = ""
+        if context.get("post_solution_mode"):
+            post_solution_hint = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║  POST-SOLUTION MODE — IMPORTANT                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+{context.get("post_solution_hint", "")}
+CONSEQUENCE: In STEP 1 (DECIDE YOUR REPAIR STRATEGY), you MUST choose
+block_fix or targeted_methods. full_class is FORBIDDEN for this analysis.
+If the code looks mostly correct, respond with block_fix and 0 issues.
+"""
+
         # Focus area
         focus_map = {
             "new_function":       "New function added — check logic, edge cases, resource management",
@@ -398,7 +426,7 @@ If 3 methods use undeclared `connection` → 3 separate blocks, each with
         # ── Prompt final ──────────────────────────────────────────────────────
         prompt = f"""You are a SENIOR code reviewer performing an EXHAUSTIVE audit.
 Your mission: find and report EVERY issue in the code below — do not skip, do not group, do not stop early.
-{project_ctx_compressed}
+{post_solution_hint}{project_ctx_compressed}
 {context.get("system_impact_section", "")}
 {dependency_info}{focus_area}{security_section}
 CODE TO ANALYZE:
@@ -503,12 +531,13 @@ IF STRATEGY = full_class:
 
   HARD CONSTRAINTS — violating any of these makes the solution worse than the original:
 
-  A. NEVER change any public method signature.
-     • Same method name, same parameter types, same return type.
-     • If findById() returns User, it must still return User — not Optional<User>.
-     • If findAll() takes no args, it must still take no args — no new (page, size).
-     • Other classes call these methods and will break if signatures change.
-     • ONLY exception: if the original signature is the direct cause of a CRITICAL bug.
+  A. NEVER change any public method signature — name, return type, OR parameter names.
+     • Same method name, same parameter types and names, same return type.
+     • If authenticate(String username, String password) → keep EXACTLY those parameter names.
+       NEVER rename password to Stringpassword, pwd, rawPassword or anything else.
+     • If findById() returns User → still returns User (not Optional<User>).
+     • If findAll() takes no args → still takes no args.
+     • This applies to EVERY parameter of EVERY public method, no exceptions.
 
   B. NEVER create new classes inside this file.
      • If a feature requires a class that does not exist (e.g. Order), SKIP that feature.
@@ -529,6 +558,12 @@ IF STRATEGY = full_class:
      → Wrap every Statement/PreparedStatement/ResultSet/Connection in try-with-resources
      → Replace string-concatenated SQL with PreparedStatement + setXxx()
      → Add rollback in batchInsert: catch(SQLException e){{ conn.rollback(); throw e; }}
+
+  F. Write CLEAN code — minimal inline comments.
+     • DO NOT add // PROBLEM 4: ..., // CRITICAL:, // Fixed by try-with-resources, // MEDIUM: etc.
+     • These explanatory comments pollute the production code.
+     • One short Javadoc per public method is acceptable. No inline fix-annotations.
+     • The CHANGES MADE section (after ---SOLUTION END---) is the right place for explanations.
 
   Format — use EXACTLY these markers, no variation:
   ---SOLUTION START---
