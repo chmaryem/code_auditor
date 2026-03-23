@@ -28,7 +28,7 @@ class APIConfig(BaseModel):
     api_key:     str   = os.getenv("GOOGLE_API_KEY", "")
     model:       str   = "gemini-2.5-flash"
     temperature: float = 0.0
-    max_tokens:  int   = 8192
+    max_tokens: int = 32768
 
 
 class RAGConfig(BaseModel):
@@ -36,12 +36,10 @@ class RAGConfig(BaseModel):
     embedding_dimension: int   = 768
     embedding_device:    str   = None
     vector_store:        str   = "chromadb"
-    # CORRIGÉ : distance cosinus explicite
     distance_metric:     str   = "cosine"
     chunk_size:          int   = 800
     chunk_overlap:       int   = 150
     top_k:               int   = 8
-    # CORRIGÉ : 0.75 → 0.45 (seuil cosinus correct)
     relevance_threshold: float = 0.45
 
     @field_validator("embedding_device", mode="before")

@@ -156,7 +156,72 @@ class KGBuilder:
                     total_nodes, total_edges, len(md_files))
         return total_nodes
 
-    # ── Source 2A : depuis project_indexer (prioritaire) ────────────────────
+    def build_from_kb_single_file(self, md_path: Path) -> int:
+        """
+        Recharge UN SEUL fichier .md dans le KG existant.
+        Utilisé par FeedbackProcessor et LearningAgent après promotion d'un fix.
+
+        Complète le pattern_map existant au lieu de le remplacer.
+        Retourne le nombre de nœuds ajoutés.
+        """
+        if not md_path.exists():
+            logger.warning("build_from_kb_single_file : fichier introuvable %s", md_path)
+            return 0
+
+        total_nodes = 0
+        total_edges = 0
+        pattern_map = self._g.graph.get("pattern_map", {})
+
+        try:
+            content = md_path.read_text(encoding="utf-8")
+            front   = self._parse_front_matter(content)
+
+            for node_def in front.get("kg_nodes", []):
+                if isinstance(node_def, str):
+                    node_def = {"name": node_def}
+                nid = node_def.get("name", "")
+                if not nid:
+                    continue
+                self._add_node(KGNode(
+                    id          = nid,
+                    node_type   = node_def.get("type", "concept"),
+                    severity    = node_def.get("severity"),
+                    languages   = node_def.get("languages", []),
+                    kb_queries  = node_def.get("kb_queries", {}),
+                    source_file = md_path.name,
+                ))
+                total_nodes += 1
+
+            for rel in front.get("kg_relations", []):
+                if isinstance(rel, list) and len(rel) == 3:
+                    subj, relation, obj = rel
+                    self._ensure_node(subj)
+                    self._ensure_node(obj)
+                    self._g.add_edge(subj, obj,
+                                     relation=relation,
+                                     source_file=md_path.name)
+                    total_edges += 1
+
+            # Fusionner le pattern_map sans écraser les patterns existants
+            for lang, patterns in front.get("pattern_map", {}).items():
+                if lang not in pattern_map:
+                    pattern_map[lang] = {}
+                if isinstance(patterns, dict):
+                    pattern_map[lang].update(patterns)
+
+            self._g.graph["pattern_map"] = pattern_map
+
+            logger.debug(
+                "KG single_file reload : %s → +%d nœuds +%d arêtes",
+                md_path.name, total_nodes, total_edges,
+            )
+
+        except Exception as e:
+            logger.debug("build_from_kb_single_file erreur %s : %s", md_path.name, e)
+
+        return total_nodes
+
+
 
     def build_from_project_indexer(self, project_indexer) -> int:
         """
@@ -489,6 +554,100 @@ class SemanticLinker:
         "EmailSending":   "Communication",
     }
 
+    # ── Queries ChromaDB par concept ──────────────────────────────────────────
+    # Ces queries sont injectées dans les nœuds concept/domain du KG.
+    # Quand n_hop_retrieval traverse entity → HANDLES → concept → IS_CONCEPT_OF → domain,
+    # il trouve ces queries et les soumet à ChromaDB.
+    # AVANT : kb_queries={} → 0 n-hop résultats
+    # APRÈS : kb_queries peuplés → n-hop retourne des règles pertinentes
+    CONCEPT_KB_QUERIES: dict[str, dict[str, str]] = {
+        "Authentication": {
+            "java":       "authentication java password hashing BCrypt login security",
+            "python":     "authentication python password hashing bcrypt login security",
+            "javascript": "authentication javascript JWT token login security",
+            "typescript": "authentication typescript JWT token login security",
+        },
+        "Authorization": {
+            "java":       "authorization java roles permissions access control security",
+            "python":     "authorization python roles permissions access control",
+        },
+        "Hashing": {
+            "java":       "password hashing java BCrypt plain text insecure MD5 SHA",
+            "python":     "password hashing python bcrypt argon2 plain text insecure",
+        },
+        "DatabaseAccess": {
+            "java":       "SQL injection PreparedStatement JDBC java resource leak",
+            "python":     "SQL injection cursor execute parameterized python database",
+        },
+        "Serialization": {
+            "java":       "deserialization security java unsafe object serialization",
+            "python":     "pickle deserialization security python unsafe",
+        },
+        "FileIO": {
+            "java":       "file resource leak java FileWriter close try-with-resources",
+            "python":     "file resource leak python context manager with open",
+        },
+        "ErrorHandling": {
+            "java":       "exception swallowing java empty catch block poor error handling",
+            "python":     "exception swallowing python bare except pass error handling",
+        },
+        "Pagination": {
+            "java":       "pagination java no limit SELECT all users memory performance",
+            "python":     "pagination python no limit query all rows memory performance",
+        },
+        "Caching": {
+            "java":       "caching java performance Redis TTL invalidation",
+            "python":     "caching python performance Redis TTL invalidation",
+        },
+        "Validation": {
+            "java":       "input validation java sanitize user input injection",
+            "python":     "input validation python sanitize user input injection",
+        },
+        "Logging": {
+            "java":       "logging java sensitive data credentials password log",
+            "python":     "logging python sensitive data credentials password log",
+        },
+        "Encryption": {
+            "java":       "encryption java weak algorithm AES RSA key management",
+            "python":     "encryption python weak algorithm AES RSA key management",
+        },
+        "TokenManagement": {
+            "java":       "JWT token java expiration signature verification security",
+            "python":     "JWT token python expiration signature verification security",
+        },
+        "NetworkIO": {
+            "java":       "network java SSL TLS insecure connection timeout",
+            "python":     "network python SSL TLS insecure connection timeout",
+        },
+    }
+
+    DOMAIN_KB_QUERIES: dict[str, dict[str, str]] = {
+        "Security": {
+            "java":       "security vulnerability java OWASP injection authentication SQL",
+            "python":     "security vulnerability python OWASP injection authentication SQL",
+        },
+        "Performance": {
+            "java":       "performance java N+1 query pagination memory leak database",
+            "python":     "performance python N+1 query pagination memory database",
+        },
+        "Quality": {
+            "java":       "code quality java SRP clean code exception error handling",
+            "python":     "code quality python SRP clean code exception error handling",
+        },
+        "DataManagement": {
+            "java":       "data management java SQL resource leak connection pool",
+            "python":     "data management python SQL resource leak connection",
+        },
+        "IO": {
+            "java":       "IO resource leak java stream close try-with-resources",
+            "python":     "IO resource leak python context manager close file",
+        },
+        "Observability": {
+            "java":       "logging java audit trail sensitive data masking",
+            "python":     "logging python audit trail sensitive data masking",
+        },
+    }
+
     HEURISTIC_RULES = [
         (["login","authenticate","auth","signin","verify_token",
           "check_password","validate_user"],                "Authentication"),
@@ -554,19 +713,39 @@ class SemanticLinker:
                 concepts = self._cache.get(cache_key, [])
 
             for concept in concepts:
+                # Récupérer les kb_queries pour ce concept (peuple le nœud
+                # pour que n_hop_retrieval trouve des queries ChromaDB)
+                concept_queries = self.CONCEPT_KB_QUERIES.get(concept, {})
+
                 if not self._g.has_node(concept):
                     self._g.add_node(concept, node_type="concept",
-                                     severity=None, languages=[],
-                                     kb_queries={}, source_file=None)
+                                     severity=None, languages=list(concept_queries.keys()),
+                                     kb_queries=concept_queries, source_file=None)
+                elif concept_queries:
+                    # Enrichir un nœud existant si ses kb_queries sont vides
+                    existing = self._g.nodes[concept]
+                    if not existing.get("kb_queries"):
+                        existing["kb_queries"] = concept_queries
+                        existing["languages"]  = list(concept_queries.keys())
+
                 self._g.add_edge(node_id, concept,
                                  relation="HANDLES", source_file=file_path)
 
                 parent = self.CONCEPT_DOMAINS.get(concept)
                 if parent:
+                    domain_queries = self.DOMAIN_KB_QUERIES.get(parent, {})
                     if not self._g.has_node(parent):
                         self._g.add_node(parent, node_type="domain",
-                                         severity=None, languages=[],
-                                         kb_queries={}, source_file=None)
+                                         severity=None,
+                                         languages=list(domain_queries.keys()),
+                                         kb_queries=domain_queries,
+                                         source_file=None)
+                    elif domain_queries:
+                        existing = self._g.nodes[parent]
+                        if not existing.get("kb_queries"):
+                            existing["kb_queries"] = domain_queries
+                            existing["languages"]  = list(domain_queries.keys())
+
                     if not self._g.has_edge(concept, parent):
                         self._g.add_edge(concept, parent,
                                          relation="IS_CONCEPT_OF",
@@ -710,11 +889,29 @@ class KnowledgeGraph:
 
         if not force and self._path.exists():
             self._load()
-            logger.info("KG chargé depuis cache (%d nœuds, %d arêtes)",
-                        self._graph.number_of_nodes(),
-                        self._graph.number_of_edges())
-            self._built = True
-            return self
+            # Vérifier si le cache est obsolète (concept nodes sans kb_queries)
+            # Cela arrive après la mise à jour de SemanticLinker avec CONCEPT_KB_QUERIES
+            concept_nodes_empty = sum(
+                1 for _, d in self._graph.nodes(data=True)
+                if d.get("node_type") in ("concept", "domain")
+                and not d.get("kb_queries")
+            )
+            total_concept = sum(
+                1 for _, d in self._graph.nodes(data=True)
+                if d.get("node_type") in ("concept", "domain")
+            )
+            if total_concept > 0 and concept_nodes_empty == total_concept:
+                logger.info(
+                    "KG cache obsolète : %d nœuds concept sans kb_queries → rebuild",
+                    concept_nodes_empty,
+                )
+                force = True
+            else:
+                logger.info("KG chargé depuis cache (%d nœuds, %d arêtes)",
+                            self._graph.number_of_nodes(),
+                            self._graph.number_of_edges())
+                self._built = True
+                return self
 
         logger.info("Construction automatique du KG...")
 
@@ -913,6 +1110,39 @@ class KnowledgeGraph:
                 pass
 
         return total
+
+    # ── Self-Improving RAG — rechargement incrémental ────────────────────────
+
+    def reload_kb_file(self, md_path: Path) -> bool:
+        """
+        Recharge UN SEUL fichier .md dans le KG sans reconstruire tout.
+        Appelé par FeedbackProcessor et LearningAgent après promotion d'un fix.
+
+        Retourne True si au moins un nœud a été ajouté.
+        """
+        if not self._built:
+            logger.debug("reload_kb_file appelé avant build() — ignoré")
+            return False
+
+        n_before = self._graph.number_of_nodes()
+        e_before = self._graph.number_of_edges()
+
+        try:
+            added = self._builder.build_from_kb_single_file(md_path)
+            n_after = self._graph.number_of_nodes()
+            e_after = self._graph.number_of_edges()
+            dn = n_after - n_before
+            de = e_after - e_before
+            if dn > 0 or de > 0:
+                self._save()
+                logger.info(
+                    "KG reload_kb_file : +%d nœuds +%d arêtes depuis %s",
+                    dn, de, md_path.name,
+                )
+            return added > 0
+        except Exception as e:
+            logger.error("reload_kb_file erreur : %s", e)
+            return False
 
     # ── Détection ─────────────────────────────────────────────────────────────
 

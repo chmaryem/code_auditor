@@ -1,12 +1,13 @@
 """
 LearningAgent — Apprend du feedback développeur de façon asynchrone.
 
-Rôle UNIQUE : collecter les corrections acceptées/rejetées et enrichir
-la base de connaissances automatiquement, SANS bloquer les analyses.
+Deux modes :
+  Mode auto   : blocs CRITIQUE → auto-promus immédiatement (silencieux)
+  Mode batch  : tout le reste → accumulé → bilan unique à Ctrl+C
 
-Différence avec l'ancien FeedbackProcessor :
-  AVANT → tournait dans le thread d'analyse, bloquait 10 secondes.
-  APRÈS → thread de fond indépendant, totalement non-bloquant.
+Séquence de fin de session :
+  Ctrl+C → orchestrator.stop() → learning_agent.stop()
+         → feedback_processor.flush_session() → bilan terminal
 """
 import logging
 import threading
@@ -14,149 +15,240 @@ from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, Optional
+from services.feedback_processor import FeedbackProcessor
 
 logger = logging.getLogger(__name__)
 
 
 class LearningAgent:
-    """
-    Agent d'apprentissage non-bloquant.
 
-    Fonctionnement :
-      1. submit_feedback()  → non bloquant, met en queue
-      2. Thread de fond     → traite la queue tranquillement
-      3. Fix validé         → nouvelle règle .md dans knowledge_base/
-      4. KB rechargée       → disponible immédiatement dans ChromaDB
-    """
-
-    def __init__(self, kb_dir: Path, llm=None, vector_store=None):
-        self.kb_dir      = kb_dir
-        self._llm        = llm
-        self._store      = vector_store
-        self._queue      = Queue()
-        self._running    = False
+    def __init__(self, kb_dir: Path = None, llm=None, vector_store=None,
+                 kb_loader=None, knowledge_graph=None):
+        self.kb_dir              = kb_dir or Path("data/knowledge_base")
+        self._llm                = llm
+        self._store              = vector_store
+        self._kb_loader          = kb_loader
+        self._knowledge_graph    = knowledge_graph
+        self._feedback_processor = None
+        self._queue   = Queue()
+        self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._stats      = {"received": 0, "accepted": 0, "rejected": 0, "promoted": 0}
+        self._stats   = {"received": 0, "auto_promoted": 0,
+                         "batch_promoted": 0, "rejected": 0}
+
+    def initialize(self, llm, vector_store, kb_dir: Path,
+                   kb_loader=None, knowledge_graph=None):
+        self._llm             = llm
+        self._store           = vector_store
+        self.kb_dir           = kb_dir
+        self._kb_loader       = kb_loader
+        self._knowledge_graph = knowledge_graph
+
+        try:
+            
+            if kb_loader:
+                self._feedback_processor = FeedbackProcessor(
+                    llm             = llm,
+                    vector_store    = vector_store,
+                    kb_dir          = kb_dir,
+                    kb_loader       = kb_loader,
+                    knowledge_graph = knowledge_graph,
+                )
+                logger.info("FeedbackProcessor initialisé — Self-Improving RAG actif.")
+        except ImportError as e:
+            logger.debug("FeedbackProcessor absent : %s", e)
+        except Exception as e:
+            logger.debug("FeedbackProcessor non initialisé : %s", e)
 
     def start(self):
         self._running = True
-        self._thread  = threading.Thread(target=self._worker, name="LearningAgent", daemon=True)
+        self._thread  = threading.Thread(target=self._worker,
+                                         name="LearningAgent", daemon=True)
         self._thread.start()
-        logger.info("LearningAgent démarré.")
 
     def stop(self):
+        """
+        Arrêt propre :
+          1. Vide la queue (traite tous les blocs reçus)
+          2. Appelle flush_session() → bilan terminal pour le dev
+          3. Arrête le thread
+        """
+        # Laisser la queue se vider avant d'afficher le bilan
+        self._queue.join()
+
+        # Bilan de fin de session
+        if self._feedback_processor:
+            try:
+                self._feedback_processor.flush_session()
+                fp_stats = self._feedback_processor.get_stats()
+                self._stats["auto_promoted"]  = fp_stats.get("auto_promoted",  0)
+                self._stats["batch_promoted"] = fp_stats.get("batch_promoted", 0)
+                self._stats["rejected"]       = fp_stats.get("rejected",       0)
+            except Exception as e:
+                logger.error("flush_session erreur : %s", e)
+
         self._running = False
         if self._thread:
             self._thread.join(timeout=3)
 
-    def submit_feedback(self, block: Dict[str, Any], action: str, language: str, modified_code: str = None):
-        """Soumet un feedback. Non bloquant — retourne immédiatement."""
+    def collect_feedback(self, blocks: list, code_before: str, language: str,
+                         file_name: str, project_indexer=None, dependency_graph=None):
+        """Non-bloquant — enfile et retourne immédiatement."""
         self._stats["received"] += 1
         self._queue.put({
-            "block": block, "action": action, "language": language,
-            "modified_code": modified_code, "timestamp": datetime.now().isoformat(),
+            "blocks":      blocks,
+            "code_before": code_before,
+            "language":    language,
+            "file_name":   file_name,
+            "timestamp":   datetime.now().isoformat(),
         })
 
-    # ── Thread de fond ────────────────────────────────────────────────────────
+    def submit_feedback(self, block: Dict[str, Any], action: str,
+                        language: str, modified_code: str = None):
+        """Feedback utilisateur direct (API externe ou tests)."""
+        self._stats["received"] += 1
+        self._queue.put({"block": block, "action": action,
+                         "language": language, "modified_code": modified_code})
+
+ 
 
     def _worker(self):
         while self._running:
             try:
-                event = self._queue.get(timeout=1.0)
+                event = self._queue.get(timeout=0.5)
                 self._process(event)
+                self._queue.task_done()
             except Empty:
                 continue
             except Exception as e:
                 logger.error("LearningAgent erreur : %s", e)
+                try:
+                    self._queue.task_done()
+                except Exception:
+                    pass
 
     def _process(self, event: Dict[str, Any]):
-        action = event["action"]
-        if action == "accepted":
-            self._stats["accepted"] += 1
-            self._try_promote_to_kb(event)
+        # Chemin A : FeedbackProcessor (triage auto + accumulation batch)
+        if "blocks" in event and self._feedback_processor:
+            try:
+                self._feedback_processor.collect_feedback(
+                    blocks       = event["blocks"],
+                    code_before  = event["code_before"],
+                    language     = event["language"],
+                    file_name    = event["file_name"],
+                )
+            except Exception as e:
+                logger.debug("FeedbackProcessor.collect_feedback erreur : %s", e)
+            return
+
+        # Chemin B : feedback direct sans FeedbackProcessor
+        action = event.get("action", "")
+        block  = event.get("block", {})
+        if action in ("accepted", "modified"):
+            if action == "modified":
+                block["fixed_code"] = event.get("modified_code", "")
+            self._try_promote_to_kb(block, event.get("language", ""))
         elif action == "rejected":
             self._stats["rejected"] += 1
-            logger.debug("Correction rejetée : %s", event["block"].get("problem", ""))
-        elif action == "modified":
-            self._stats["accepted"] += 1
-            event["block"]["fixed_code"] = event.get("modified_code", "")
-            self._try_promote_to_kb(event)
 
-    def _try_promote_to_kb(self, event: Dict[str, Any]):
-        if self._llm is None or self._store is None:
+    # ── Promotion directe (chemin B) ─────────────────────────────────────────
+
+    def _try_promote_to_kb(self, block: Dict, language: str):
+        if not self._llm or not self._store:
             return
-        block    = event["block"]
-        language = event["language"]
         if self._rule_already_exists(block.get("problem", ""), language):
-            logger.debug("Règle similaire déjà dans KB — pas de doublon.")
             return
+
         rule_md = self._generalise_to_rule(block, language)
         if not rule_md:
             return
-        ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rule_file = self.kb_dir / f"auto_learned_{language}_{ts}.md"
+
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+        lang_dir = Path(self.kb_dir) / "auto_learned" / language
+        lang_dir.mkdir(parents=True, exist_ok=True)
+        rule_file = lang_dir / f"rule_{ts}.md"
         try:
             rule_file.write_text(rule_md, encoding="utf-8")
-            self._stats["promoted"] += 1
-            logger.info("Nouvelle règle KB : %s", rule_file.name)
-            print(f"\n  KB enrichie : {rule_file.name}")
+            self._stats["auto_promoted"] += 1
+            logger.info("KB enrichie (chemin B) : %s", rule_file.name)
         except Exception as e:
-            logger.error("Erreur écriture règle KB : %s", e)
+            logger.error("Écriture règle KB : %s", e)
+            return
+
+        self._reload_chromadb(rule_file)
+        self._reload_kg(rule_file)
+
+    def _reload_chromadb(self, md_path: Path):
+        if self._kb_loader is None or self._store is None:
+            return
+        try:
+            docs = self._kb_loader.process_file(md_path)
+            if docs:
+                try:
+                    self._store._collection.delete(
+                        where={"source_file": md_path.name})
+                except Exception:
+                    pass
+                self._store.add_documents(docs)
+        except Exception as e:
+            logger.error("ChromaDB reload : %s", e)
+
+    def _reload_kg(self, md_path: Path):
+        if self._knowledge_graph is None:
+            return
+        try:
+            if hasattr(self._knowledge_graph, "reload_kb_file"):
+                self._knowledge_graph.reload_kb_file(md_path)
+            else:
+                from config import config
+                self._knowledge_graph._builder.build_from_kb(config.KNOWLEDGE_BASE_DIR)
+                self._knowledge_graph._save()
+        except Exception as e:
+            logger.error("KG reload : %s", e)
 
     def _rule_already_exists(self, problem: str, language: str) -> bool:
-        if not problem or self._store is None:
+        if not problem or not self._store:
             return False
         try:
-            results = self._store.similarity_search_with_score(f"{problem} {language}", k=1)
-            if results:
-                _, score = results[0]
-                return score < 0.15
+            results = self._store.similarity_search_with_score(
+                f"{problem} {language}", k=1)
+            return bool(results) and results[0][1] < 0.35
         except Exception:
-            pass
-        return False
+            return False
 
-    def _generalise_to_rule(self, block: Dict[str, Any], language: str) -> Optional[str]:
-        prompt = f"""Un développeur a accepté cette correction de code.
-Transforme-la en une RÈGLE GÉNÉRIQUE et RÉUTILISABLE pour la base de connaissances.
+    def _generalise_to_rule(self, block: Dict, language: str) -> Optional[str]:
+        prompt = f"""Génère une règle KB réutilisable depuis ce fix.
 
-CORRECTION ACCEPTÉE :
-Problème   : {block.get('problem', '')}
-Langage    : {language}
-Code cassé : {block.get('current_code', '')[:300]}
-Code corrigé: {block.get('fixed_code', '')[:300]}
-Explication: {block.get('why', '')}
+Problème : {block.get('problem','')}
+Langage  : {language}
+Code cassé  : {block.get('current_code','')[:300]}
+Code correct: {block.get('fixed_code','')[:300]}
+Pourquoi : {block.get('why','')}
 
-Écris UN fichier .md avec ce format exact :
+Format .md (réponds uniquement avec le contenu, sans balises ```) :
 ---
-title: [nom court de la règle]
+title: [nom court]
 language: {language}
-severity: [CRITICAL/HIGH/MEDIUM/LOW]
+severity: {block.get('severity','MEDIUM')}
 kg_nodes:
-  - name: [NomDuNoeudKG]
+  - name: [NomConcept]
     type: vulnerability
+kg_relations:
+  - [NomConcept, FIXED_BY, NomDuFix]
 ---
-
 ## Problème
-[2 phrases sur le danger de ce pattern]
-
 ## Code à éviter
-```{language}
-[exemple minimal du mauvais pattern]
-```
-
 ## Code correct
-```{language}
-[exemple minimal du bon pattern]
-```
-
-## Pourquoi
-[Une phrase sur les conséquences si non corrigé]
-
-Réponds UNIQUEMENT avec le contenu .md, rien d'autre."""
+## Pourquoi"""
         try:
             response = self._llm.invoke(prompt)
             content  = response.content if hasattr(response, "content") else str(response)
-            return content.strip().lstrip("```markdown").lstrip("```").rstrip("```").strip()
+            content  = content.strip()
+            if content.startswith("```"):
+                lines   = content.splitlines()
+                content = "\n".join(lines[1:-1] if lines and lines[-1].strip() == "```"
+                                    else lines[1:])
+            return content.strip()
         except Exception as e:
             logger.error("Erreur génération règle KB : %s", e)
             return None
@@ -165,4 +257,4 @@ Réponds UNIQUEMENT avec le contenu .md, rien d'autre."""
         return dict(self._stats)
 
 
-learning_agent = LearningAgent(kb_dir=Path("data/knowledge_base"))
+learning_agent = LearningAgent()

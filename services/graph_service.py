@@ -795,3 +795,54 @@ class DependencyGraphBuilder:
 
 # ── instance globale (rétro-compatible) ──────────────────────────────────────
 dependency_builder = DependencyGraphBuilder()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers de mise à jour du graphe (migrés depuis incremental_analyzer.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from pathlib import Path as _Path
+from typing  import Optional as _Optional
+
+
+def resolve_import(imp, current_dir: _Path) -> _Optional[str]:
+    """
+    Résout un import relatif Python vers un chemin absolu de fichier.
+    Migré depuis IncrementalAnalyzer._resolve_import()
+    """
+    if not imp.module or not imp.module.startswith("."):
+        return None
+    parts = imp.module.split(".")
+    path  = current_dir
+    for p in parts:
+        path = path.parent if p == "" else path / p
+    py_file = path.with_suffix(".py")
+    return str(py_file) if py_file.exists() else None
+
+
+def update_graph(graph, file_path: _Path, parsed: dict):
+    """
+    Met à jour le graphe NetworkX après la sauvegarde d'un fichier :
+      - Supprime les anciennes arêtes sortantes du nœud
+      - Recrée les arêtes depuis les imports nouvellement parsés
+
+    Migré depuis IncrementalAnalyzer._update_graph()
+
+    Args:
+        graph     : nx.DiGraph — le graphe de dépendances du projet
+        file_path : fichier qui vient d'être modifié
+        parsed    : résultat de code_parser.parse_file() (contient "imports")
+    """
+    node_id = f"file:{file_path}"
+
+    if graph.has_node(node_id):
+        graph.remove_edges_from(list(graph.out_edges(node_id)))
+    else:
+        graph.add_node(node_id)
+
+    for imp in parsed.get("imports", []):
+        target = resolve_import(imp, file_path.parent)
+        if target:
+            t_node = f"file:{target}"
+            if not graph.has_node(t_node):
+                graph.add_node(t_node)
+            graph.add_edge(node_id, t_node, relation="imports")

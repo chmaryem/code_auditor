@@ -258,9 +258,26 @@ SECURITY SCAN MODE — EXHAUSTIVE AUDIT REQUIRED
 
 You MUST inspect each of these {len(methods)} methods individually: {method_list}
 
-MANDATORY RULE: One separate ---FIX START--- block per issue per method.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ABSOLUTE RULE — READ BEFORE ANYTHING ELSE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A compilation error (undeclared variable, missing import, wrong brace) in
+method A does NOT exempt methods B, C, D... from being fully analyzed.
+Treat EVERY method as a standalone unit. Report and fix EACH independently.
+
+UNDECLARED VARIABLE PATTERN (extremely common in Java):
+  If `connection` is used but not declared → the fix for EVERY method that
+  uses it is the same: replace with dataSource.getConnection() inside
+  try-with-resources. You MUST produce a separate ---FIX START--- block
+  for EVERY affected method showing the complete rewritten method body.
+  DO NOT produce one single block saying "declare connection field" and stop.
+  One method with undeclared connection + SQL injection = TWO blocks for
+  that method (one for undeclared var, one for SQL injection).
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MANDATORY: One separate ---FIX START--- block per issue per method.
 NEVER group issues from different methods into one block.
-NEVER stop before all methods are checked.
+NEVER stop before all {len(methods)} methods are fully checked.
 
 SECURITY checklist — CRITICAL per occurrence:
   - SQL built with string concatenation (+, format, f-string)
@@ -271,15 +288,16 @@ SECURITY checklist — CRITICAL per occurrence:
 RESOURCE MANAGEMENT checklist — HIGH per occurrence:
   - Statement / PreparedStatement not in try-with-resources
   - ResultSet not in try-with-resources
-  - Connection not from pool or never closed
+  - Connection obtained outside try-with-resources (leak on exception)
   - FileWriter / InputStream / Stream not in try-with-resources
+  - Transaction (setAutoCommit) without rollback in catch block
 
 ARCHITECTURE checklist — HIGH per occurrence:
-  - Method violating Single Responsibility (DB + email + logging + stats in one place)
+  - Method violating Single Responsibility (DB + email + logging + stats)
   - Direct DriverManager.getConnection() instead of injected DataSource
   - Business logic mixed with data access in the same method
-  - N+1 query: DB call or query inside a loop
-  - Unbounded query: SELECT * with no LIMIT / no pagination on list-returning method
+  - N+1 query: DB call or query inside a loop (nested query in while/for)
+  - Unbounded query: SELECT * with no LIMIT on list-returning method
 
 QUALITY checklist — MEDIUM or LOW:
   - Exception swallowed: empty catch / return null / return false in catch   MEDIUM
@@ -287,10 +305,11 @@ QUALITY checklist — MEDIUM or LOW:
   - Package name typo or wrong package declaration                           MEDIUM
   - Static mutable state (static List, static counter)                       MEDIUM
   - Magic numbers or magic strings not extracted to constants                LOW
-  - Utility class with public constructor (should be private)                LOW
 
-If 4 methods have SQL injection -> output 4 separate CRITICAL blocks.
-If 5 methods have resource leaks -> output 5 separate HIGH blocks.
+If 4 methods have SQL injection → 4 separate CRITICAL blocks.
+If 5 methods have resource leaks → 5 separate HIGH blocks.
+If 3 methods use undeclared `connection` → 3 separate blocks, each with
+  the FULL rewritten method using dataSource.getConnection() in try-with-resources.
 """
 
     # ── Prompt builder ────────────────────────────────────────────────────────
@@ -409,6 +428,14 @@ RULES:
 6. NO artificial limit on number of issues — report every single one found.
    Each method with SQL injection = its own block. Each resource leak = its own block.
 7. Only suggest libraries already present in the project imports. Never invent dependencies.
+7b. FIXED CODE must ALWAYS contain real, compilable source code — never only comments.
+    BAD:  // Use PreparedStatement instead  // String query = "SELECT..."
+    GOOD: try (PreparedStatement stmt = conn.prepareStatement("SELECT ... WHERE id = ?")) {{
+              stmt.setInt(1, id);
+              ...
+          }}
+    If the fix is architectural and cannot fit in one block, show the MINIMUM compilable
+    change that demonstrates the fix — even if incomplete, it must be real code.
 8. Only respond with "Code quality is good, no major issues." if there are literally
    zero issues. If you find even one issue, report it. Never truncate your analysis.
 9. For Java specifically, always check:
@@ -420,28 +447,126 @@ RULES:
    - Package declaration correctness
 10. Do not stop until every method listed in the SECURITY SCAN section has been checked.
     If you have not finished all methods, continue — do not truncate.
+11. CRITICAL — compilation errors do NOT stop the analysis of other issues.
+    If a variable is undeclared (e.g. `connection` not declared), report it as CRITICAL,
+    THEN CONTINUE analyzing every other method independently for:
+    SQL injection, resource leaks, N+1 queries, transaction issues, etc.
+    These issues exist regardless of whether the code compiles.
+    A file with 1 compilation error + 10 resource leaks = 11 separate blocks.
+    NEVER use a compilation error as a reason to skip analyzing individual methods.
+12. Treat each method as INDEPENDENT. Even if method A has a fatal error,
+    analyze method B, C, D... as if each stands alone.
+    Report every distinct issue in every method.
 
-FORMAT (one block per issue — strict):
+═══════════════════════════════════════════════════════════════
+STEP 1 — DECIDE YOUR REPAIR STRATEGY
+═══════════════════════════════════════════════════════════════
+Before writing any fix, reason about the nature and distribution of the problems.
+Then output EXACTLY this block:
 
----FIX START---
-**PROBLEM**: [Exact issue name — one line]
-**SEVERITY**: CRITICAL | HIGH | MEDIUM | LOW
-**LOCATION**: [Method name], line [exact line number]
+---DECISION---
+STRATEGY: full_class | targeted_methods | block_fix
+SCOPE: [for full_class: "entire file" | for targeted_methods: list the method names | for block_fix: "N isolated issues"]
+REASON: [one sentence explaining why this strategy is the most effective]
+---DECISION END---
 
-**CURRENT CODE**:
-```{language}
-[Copy-paste of the exact broken lines from the code above — no pseudo-code]
-```
+Use this decision tree — in ORDER of priority:
 
-**FIXED CODE**:
-```{language}
-[Complete, copy-paste ready fix — compilable, no placeholders]
-```
+  → full_class       if ANY of these is true:
+                       • An undeclared variable is used in 3+ methods (systemic)
+                       • The class uses a wrong pattern throughout (e.g. every method
+                         needs dataSource.getConnection() but uses `connection` instead)
+                       • 5+ methods need structural rewriting (not just small patches)
+                       • Fixing method A correctly requires changing method B and C
+                       → When in doubt between full_class and targeted_methods,
+                         CHOOSE full_class. A complete rewrite is always safer.
 
-**WHY**: [One sentence. The concrete consequence if not fixed.]
----FIX END---
+  → targeted_methods if ALL of these are true:
+                       • Only 2-4 specific methods have problems
+                       • The other methods are clean and correct
+                       • Each affected method can be fixed independently
+                       • No systemic undeclared variable or wrong class design
+                       IMPORTANT: If you choose targeted_methods, you MUST produce
+                       a ---METHOD START: name--- block for EVERY method you listed
+                       in SCOPE. Zero method blocks = wrong choice, use full_class.
 
-ANALYZE:"""
+  → block_fix        if: problems are genuinely small (1-2 issues, localized patches)
+                         Never use for undeclared variables or resource leaks across
+                         multiple methods.
+
+═══════════════════════════════════════════════════════════════
+STEP 2 — GENERATE THE FIX MATCHING YOUR DECISION
+═══════════════════════════════════════════════════════════════
+
+IF STRATEGY = full_class:
+  Rewrite the COMPLETE class. Every method, every line. No ellipsis, no omissions.
+
+  HARD CONSTRAINTS — violating any of these makes the solution worse than the original:
+
+  A. NEVER change any public method signature.
+     • Same method name, same parameter types, same return type.
+     • If findById() returns User, it must still return User — not Optional<User>.
+     • If findAll() takes no args, it must still take no args — no new (page, size).
+     • Other classes call these methods and will break if signatures change.
+     • ONLY exception: if the original signature is the direct cause of a CRITICAL bug.
+
+  B. NEVER create new classes inside this file.
+     • If a feature requires a class that does not exist (e.g. Order), SKIP that feature.
+     • A missing dependency is not your problem to invent — leave a TODO comment instead.
+     • One file = one public class. Period.
+
+  C. ONLY use fields and methods you can SEE in the original code.
+     • If User has fields: id, username, email, password → use EXACTLY those names.
+     • NEVER write user.passwordHash, user.orders, user.getEmail() unless they appear
+       in the original source. Wrong field names = compilation errors.
+
+  D. NEVER add new imports for classes that don't exist in the project.
+     • No java.util.Optional unless the original already imports it.
+     • No Order, no DTO classes, no new framework annotations.
+
+  E. Fix ALL of these without inventing new architecture:
+     → Replace 'connection' (undeclared) with 'dataSource.getConnection()' in try-with-resources
+     → Wrap every Statement/PreparedStatement/ResultSet/Connection in try-with-resources
+     → Replace string-concatenated SQL with PreparedStatement + setXxx()
+     → Add rollback in batchInsert: catch(SQLException e){{ conn.rollback(); throw e; }}
+
+  Format — use EXACTLY these markers, no variation:
+  ---SOLUTION START---
+  ```{language}
+  [complete class here]
+  ```
+  ---SOLUTION END---
+  CHANGES MADE:
+  - methodName: one-line description of what was fixed
+
+IF STRATEGY = targeted_methods:
+  For EACH affected method, output ONE rewrite block:
+  ---METHOD START: [methodName]---
+  ```{language}
+  [complete rewritten method — every line]
+  ```
+  ---METHOD END---
+  WHY: [one sentence per method]
+  Then list remaining issues in other methods as ---FIX START--- blocks (problem only, no code fix needed).
+
+IF STRATEGY = block_fix:
+  Output one ---FIX START--- block per issue (existing format):
+  ---FIX START---
+  **PROBLEM**: [issue]
+  **SEVERITY**: CRITICAL | HIGH | MEDIUM | LOW
+  **LOCATION**: [method], line [N]
+  **CURRENT CODE**:
+  ```{language}
+  [exact broken lines]
+  ```
+  **FIXED CODE**:
+  ```{language}
+  [compilable fix — no comments only, no pseudo-code]
+  ```
+  **WHY**: [one sentence]
+  ---FIX END---
+
+ANALYZE NOW — START WITH ---DECISION---:"""
 
         return prompt
 
@@ -519,6 +644,136 @@ ANALYZE:"""
         }
 
     # ── Plan de refactoring ───────────────────────────────────────────────────
+
+
+    # ── Solution Generator ────────────────────────────────────────────────────
+
+    def generate_complete_solution(
+        self,
+        code:              str,
+        context:           dict[str, Any],
+        analysis_text:     str,
+        knowledge_context: str = "",
+    ) -> str:
+        """
+        Génère la classe entière réécrite et fonctionnelle en utilisant
+        TOUT le contexte disponible : RAG, KG, dépendances, project indexer.
+
+        Différence vs analyze_code_with_rag() :
+          audit mode    → liste les problèmes, propose des diffs
+          solution mode → réécrit la classe COMPLÈTE, compilable, prête à copier
+
+        Appelé depuis Orchestrator quand l'analyse détecte >= 3 CRITICAL ou >= 5 HIGH.
+        """
+        file_path       = context.get("file_path",         "unknown")
+        language        = context.get("language",          "java")
+        criticality     = context.get("criticality_score", 0)
+        dependencies    = context.get("dependencies",      [])
+        dependents      = context.get("dependents",        [])
+        project_context = context.get("project_context",   "")
+        system_impact   = context.get("system_impact_section", "")
+
+        max_code = config.analysis.max_code_chars
+        code_to_send = code[:max_code]
+
+        dep_info = ""
+        if dependencies or dependents:
+            dep_info = (
+                f"\nDEPENDENCIES (DO NOT break these contracts):\n"
+                f"  This class is used by: {[Path(d).name for d in dependents[:5]]}\n"
+                f"  This class uses:       {[Path(d).name for d in dependencies[:5]]}\n"
+            )
+
+        prompt = f"""You are a SENIOR {language.upper()} developer.
+Your task: produce the COMPLETE, FULLY REWRITTEN version of this class.
+The rewritten class must compile immediately and fix EVERY problem listed below.
+
+{system_impact}
+{dep_info}
+FILE: {file_path}
+CRITICALITY: {criticality} files depend on this class.
+
+═══════════════════════════════════════════════════════════════
+ORIGINAL CODE (broken):
+═══════════════════════════════════════════════════════════════
+```{language}
+{code_to_send}
+```
+
+═══════════════════════════════════════════════════════════════
+PROBLEMS FOUND BY AUDIT (fix ALL of them):
+═══════════════════════════════════════════════════════════════
+{analysis_text[:3000]}
+
+═══════════════════════════════════════════════════════════════
+BEST PRACTICES FROM KNOWLEDGE BASE:
+═══════════════════════════════════════════════════════════════
+{knowledge_context[:1500] if knowledge_context else "(standard Java best practices apply)"}
+
+═══════════════════════════════════════════════════════════════
+PROJECT CONTEXT (do not create classes that already exist):
+═══════════════════════════════════════════════════════════════
+{project_context[:800] if project_context else ""}
+
+═══════════════════════════════════════════════════════════════
+REWRITING RULES — MANDATORY:
+═══════════════════════════════════════════════════════════════
+1. Output the COMPLETE class from `package` declaration to closing `}}`.
+   No ellipsis (...), no "// rest of code", no omissions.
+   Every method must be fully written.
+
+2. Every method that accesses the database MUST use:
+   try (Connection conn = dataSource.getConnection();
+        PreparedStatement stmt = conn.prepareStatement("...")) {{
+       // ...
+   }}  // auto-closed
+
+3. Every SQL query with user input MUST use PreparedStatement with setXxx().
+   Never concatenate user input into SQL strings.
+
+4. Passwords MUST be compared with BCrypt.checkpw() or similar.
+   Never compare plain text passwords.
+
+5. Methods returning List<T> from DB MUST include pagination (LIMIT/OFFSET or
+   accept page/size parameters).
+
+6. Transactions MUST have rollback in catch:
+   conn.setAutoCommit(false);
+   try {{ ... conn.commit(); }}
+   catch (SQLException e) {{ conn.rollback(); throw e; }}
+   finally {{ conn.setAutoCommit(true); }}
+
+7. Keep the same class name, package, and public method signatures.
+   Do NOT rename or remove public methods (other classes depend on them).
+
+8. Only use libraries already imported in the original file.
+   Add only standard Java imports (java.sql.*, javax.sql.*) if missing.
+
+9. Fix ALL compilation errors, ALL resource leaks, ALL SQL injections,
+   ALL plain-text password comparisons, ALL N+1 queries.
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FORMAT — STRICT:
+═══════════════════════════════════════════════════════════════
+---SOLUTION START---
+```{language}
+[Complete rewritten class here — EVERY method, EVERY line]
+```
+---SOLUTION END---
+
+After the block, add a short summary:
+CHANGES MADE:
+- [method name]: [what was fixed]
+- ...
+
+WRITE THE COMPLETE SOLUTION NOW:"""
+
+        try:
+            response = self.llm.invoke(prompt)
+            return response.content if hasattr(response, "content") else str(response)
+        except Exception as e:
+            logger.error("generate_complete_solution erreur : %s", e)
+            return f"Erreur génération solution : {e}"
 
     def generate_refactoring_plan(self, analysis_results: list[dict]) -> str:
         """
