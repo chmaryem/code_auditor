@@ -36,9 +36,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Ajouter après les imports existants
+from services.mcp_search_client import mcp_search_client
+
+
 logger = logging.getLogger(__name__)
 
-# ── Constantes ANSI ───────────────────────────────────────────────────────────
+#  Constantes ANSI 
 _R  = "\033[0m"
 _BD = "\033[1m"
 _DM = "\033[2m"
@@ -56,7 +60,7 @@ _SEV_COLOR = {
     "LOW":      "\033[94m",
 }
 
-# ── Seuils et critères ────────────────────────────────────────────────────────
+#  Seuils et critères ────────────────────────────────────────────────────────
 
 # Score cosinus en-dessous duquel une règle est considérée "déjà connue"
 DEDUP_THRESHOLD = 0.35   # plus permissif que 0.15 pour absorber les variations
@@ -465,6 +469,21 @@ class FeedbackProcessor:
     # ── LLM : généraliser le fix ──────────────────────────────────────────────
 
     def _generalise_to_rule(self, block: Dict, language: str, code_before: str) -> Optional[str]:
+        problem = block.get('problem', '')
+
+    # ── NOUVEAU : Recherche MCP ──────────────────────────────────────────
+        web_context = self._fetch_documentation(problem, language)
+
+    # Section doc web (optionnelle — vide si MCP indisponible)
+        web_section = ''
+        if web_context:
+          web_section = f'''
+    DOCUMENTATION OFFICIELLE (MCP Brave Search) :
+          {web_context}
+→ Intègre ces références dans la règle générée.
+'''
+        logger.info('MCP Web Search : %d chars de doc ajoutés au prompt', len(web_context))
+
         if self._llm is None:
             return None
 
@@ -474,9 +493,10 @@ class FeedbackProcessor:
         why          = block.get("why",            "")
         severity     = block.get("severity",       "MEDIUM")
 
-        prompt = f"""Tu es un expert en qualité logicielle. Génère une règle KB réutilisable.
+        prompt = f"""Génère une règle KB réutilisable depuis ce fix
 
 === Correction à généraliser ===
+{web_section}
 Langage  : {language}
 Sévérité : {severity}
 Problème : {problem}
@@ -525,6 +545,10 @@ pattern_map:
 
 ## Pourquoi
 [Explication technique]
+
+## Références
+[liens OWASP / CVE / doc officielle si trouvés]
+
 """
         try:
             response = self._llm.invoke(prompt)
@@ -550,6 +574,25 @@ pattern_map:
             return bool(results) and results[0][1] < DEDUP_THRESHOLD
         except Exception:
             return False
+        
+    def _fetch_documentation(self, problem: str, language: str) -> str:
+        """
+         Cherche doc officielle via MCP Brave Search.
+         Retourne '' si MCP indisponible (non-bloquant).
+        """
+        if not problem:
+               return ''
+
+        # Construire une requête ciblée
+        query = f'{problem} {language} OWASP best practice fix 2024'
+        logger.debug('MCP Search query : %s', query)
+
+    # Appel synchrone (FeedbackProcessor tourne dans un thread non-async)
+        result = mcp_search_client.search_sync(query, count=3)
+
+    # Limiter pour ne pas exploser le prompt (800 chars max)
+        return result[:800] if result else ''
+
 
     @staticmethod
     def _is_interactive() -> bool:

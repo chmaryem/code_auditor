@@ -151,7 +151,7 @@ class LearningAgent:
         elif action == "rejected":
             self._stats["rejected"] += 1
 
-    # ── Promotion directe (chemin B) ─────────────────────────────────────────
+    # Promotion directe (chemin B
 
     def _try_promote_to_kb(self, block: Dict, language: str):
         if not self._llm or not self._store:

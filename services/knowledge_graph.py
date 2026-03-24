@@ -46,12 +46,7 @@ from dataclasses import dataclass, field
 import networkx as nx
 
 logger = logging.getLogger(__name__)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # KGNode
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class KGNode:
     id:          str
@@ -63,9 +58,9 @@ class KGNode:
     extra:       dict        = field(default_factory=dict)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # KGBuilder — Sources 1 & 2
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 class KGBuilder:
 
@@ -1561,7 +1556,7 @@ class KnowledgeGraph:
         if not self._built:
             self.build()
 
-        # ── Cache LRU ─────────────────────────────────────────────────────────
+        #  Cache LRU
         cache_key = (modified_file, language, depth)
         if use_cache and cache_key in self._nhop_cache:
             logger.debug("N-hop cache hit pour %s", modified_file)

@@ -15,7 +15,7 @@ from validators.fix_validator import fix_validator, FixBlock
 
 
 
-# ── Parser de réponse agentique ───────────────────────────────────────────────
+# Parser de réponse agentique
 
 def parse_llm_response(raw: str) -> dict:
     """
@@ -39,7 +39,7 @@ def parse_llm_response(raw: str) -> dict:
         "raw":      raw,
     }
 
-    # ── Lire le bloc DECISION ─────────────────────────────────────────────────
+    #  Lire le bloc DECISION
     dec_m = re.search(
         r"---DECISION---\s*(.*?)\s*---DECISION END---",
         raw, re.DOTALL | re.IGNORECASE
@@ -175,7 +175,6 @@ def build_context(file_path: Path, neighborhood: Dict[str, Any],
                   project_indexer=None, change_info: Dict = None) -> Dict[str, Any]:
     """
     Construit le dictionnaire de contexte passé au LLM.
-    Migré depuis IncrementalAnalyzer._build_context() (ligne 1203-1212)
     """
     from agents.code_agent import code_agent
 
@@ -200,7 +199,7 @@ def build_context(file_path: Path, neighborhood: Dict[str, Any],
     return ctx
 
 
-# ── AnalysisAgent ─────────────────────────────────────────────────────────────
+#AnalysisAgent 
 
 class AnalysisAgent:
     """

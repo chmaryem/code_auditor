@@ -14,7 +14,7 @@ from typing import Any, Dict
 from services.code_parser import parser as _parser
 
 
-# ── ChangeAnalyzer ────────────────────────────────────────────────────────────
+#  ChangeAnalyzer 
 
 class ChangeAnalyzer:
     """
@@ -92,7 +92,7 @@ class ChangeAnalyzer:
         }.get(change_type, f"Changement important ({lines_changed} ligne(s))")
 
 
-# ── CodeAgent ─────────────────────────────────────────────────────────────────
+# CodeAgent 
 
 class CodeAgent:
     """

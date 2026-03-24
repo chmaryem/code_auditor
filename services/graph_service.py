@@ -71,12 +71,12 @@ class MultiStrategyImportResolver:
             self._name_index[stem] = set()
         self._name_index[stem].add(abs_path)
 
-        # Pour Python : "config" ET "mypackage.config"
+        
         try:
             rel = file_path.resolve().relative_to(self.project_root)
-            # Module path sans extension : src/myapp/config.py → myapp.config
+           
             parts = list(rel.with_suffix("").parts)
-            # Retirer les préfixes communs (src, main, app…)
+           
             skip = {"src", "main", "app", "lib", "source"}
             while parts and parts[0].lower() in skip:
                 parts = parts[1:]

@@ -126,7 +126,7 @@ class CodeRAGSystemAPI:
 
         logger.info("Google Gemini initialisé ✓")
 
-    # ── Retrieval RAG ─────────────────────────────────────────────────────────
+    #  Retrieval RAG 
 
     def _retrieve_relevant_knowledge(
         self,
@@ -230,7 +230,7 @@ class CodeRAGSystemAPI:
 
         return "\n\n".join(parts)
 
-    # ── Security Section ──────────────────────────────────────────────────────
+    #Security Section ──────────────────────────────────────────────────────
 
     def _build_security_section(self, code: str, language: str) -> str:
         """
@@ -240,8 +240,7 @@ class CodeRAGSystemAPI:
           - Architecture (SRP, DI, N+1, pagination)
           - Qualité (exception swallowing, static mutable state, magic numbers)
 
-        Remplace l'ancienne version qui ne couvrait que 5 patterns
-        et imposait un plafond implicite de 4 issues.
+        
         """
         if not _has_security_patterns(code, language):
             return ""

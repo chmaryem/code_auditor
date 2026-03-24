@@ -76,7 +76,7 @@ class Orchestrator:
             "by_type":       {},
         }
 
-    # ── Initialisation ────────────────────────────────────────────────────────
+    # Initialisation 
 
     def initialize(self):
         """
@@ -159,7 +159,7 @@ class Orchestrator:
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
 
-    # ── Interface publique ────────────────────────────────────────────────────
+    #Interface publique ────────────────────────────────────────────────────
 
     def handle(self, event):
         """Reçoit un Event et l'enfile."""

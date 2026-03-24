@@ -1,7 +1,7 @@
 """
 RetrieverAgent — Recherche RAG consciente du système.
 
-Contient (migrés depuis incremental_analyzer.py) :
+
   - GraphNeighborhoodExtractor : extrait le voisinage NetworkX d'un fichier
     (predecessors = appelants, successors = dépendances, impact indirect)
   - SystemAwareRAG             : 3 + N recherches ChromaDB fusionnées
@@ -38,7 +38,7 @@ class GraphNeighborhoodExtractor:
       predecessor_entities / successor_entities : {fichier: [{name, params, criticality}]}
       criticality        : nb de predecessors directs
 
-    Migré depuis incremental_analyzer.py (lignes 212-372)
+  
     """
 
     def __init__(self, graph, project_indexer):
@@ -122,7 +122,7 @@ class GraphNeighborhoodExtractor:
                 "predecessor_entities": {}, "successor_entities": {}, "criticality": 0}
 
 
-# ── SystemAwareRAG ────────────────────────────────────────────────────────────
+# SystemAwareRAG 
 
 class SystemAwareRAG:
     """
@@ -135,7 +135,6 @@ class SystemAwareRAG:
       4. Project code index — code projet similaire
       Fusion + déduplication + tri final.
 
-    Migré depuis incremental_analyzer.py (lignes 379-582)
     """
 
     # Distance L2 max retenue (Jina embeddings).
@@ -247,7 +246,7 @@ class SystemAwareRAG:
         return queries
 
 
-# ── RetrieverAgent — façade publique ─────────────────────────────────────────
+#RetrieverAgent — façade publique 
 
 class RetrieverAgent:
     """
