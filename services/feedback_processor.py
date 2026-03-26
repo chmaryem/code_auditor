@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 # Ajouter après les imports existants
-from services.mcp_search_client import mcp_search_client
+from services.web_search_client import web_search_client
 
 
 logger = logging.getLogger(__name__)
@@ -588,7 +588,7 @@ pattern_map:
         logger.debug('MCP Search query : %s', query)
 
     # Appel synchrone (FeedbackProcessor tourne dans un thread non-async)
-        result = mcp_search_client.search_sync(query, count=3)
+        result = web_search_client.search_sync(query, count=3)
 
     # Limiter pour ne pas exploser le prompt (800 chars max)
         return result[:800] if result else ''

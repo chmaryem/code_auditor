@@ -15,32 +15,16 @@ from ddgs import DDGS
 logger = logging.getLogger(__name__)
 
 
-class MCPSearchClient:
+class WEBSearchClient:
     """
     Façade unifiée : Brave MCP si clé dispo, DuckDuckGo sinon.
     Toujours non-bloquant — retourne '' en cas d'erreur.
     """
 
     def __init__(self):
-        self._api_key = os.getenv("BRAVE_API_KEY", "").strip()
-
-        # Paramètres serveur MCP (utilisés seulement si clé présente)
-        self._server_params = None
-        if self._api_key:
-            try:
-                from mcp import StdioServerParameters
-                self._server_params = StdioServerParameters(
-                    command = "npx",
-                    args    = ["-y", "@modelcontextprotocol/server-brave-search"],
-                    env     = {"BRAVE_API_KEY": self._api_key},
-                )
-            except ImportError:
-                logger.debug("Package 'mcp' absent — fallback DuckDuckGo activé")
-
         # Vérifier disponibilité DuckDuckGo
         self._ddg_available: Optional[bool] = None
 
-    # ── API publique ──────────────────────────────────────────────────────────
 
     async def search(self, query: str, count: int = 3) -> str:
         """Recherche async. Retourne '' si erreur."""
@@ -88,42 +72,13 @@ class MCPSearchClient:
             logger.debug("search_sync erreur : %s", e)
             return ""
 
-    # ── Routage interne ───────────────────────────────────────────────────────
+    #Routage interne
 
     async def _search_internal(self, query: str, count: int) -> str:
-        """Choisit le backend selon disponibilité."""
-        if self._api_key and self._server_params:
-            result = await self._search_brave_mcp(query, count)
-            if result:
-                logger.debug("MCP Brave Search : %d chars", len(result))
-                return result
-            # MCP a échoué → fallback DDG
-            logger.debug("MCP Brave échoué → fallback DuckDuckGo")
-
+        
         return await self._search_duckduckgo(query, count)
 
-    # ── Backend 1 : MCP Brave Search ─────────────────────────────────────────
-
-    async def _search_brave_mcp(self, query: str, count: int) -> str:
-        try:
-            from mcp.client.stdio import stdio_client
-            from mcp import ClientSession
-
-            async with stdio_client(self._server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    result = await session.call_tool(
-                        "brave_web_search",
-                        {"query": query, "count": count},
-                    )
-                    parts = [
-                        c.text for c in result.content
-                        if hasattr(c, "text") and c.text
-                    ]
-                    return "\n".join(parts)
-        except Exception as e:
-            logger.debug("Brave MCP erreur : %s", e)
-            return ""
+  
 
     # ── Backend 2 : DuckDuckGo (gratuit, sans clé) ───────────────────────────
 
@@ -170,5 +125,4 @@ class MCPSearchClient:
             return ""
 
 
-# Instance globale — importée par feedback_processor.py
-mcp_search_client = MCPSearchClient()
+web_search_client = WEBSearchClient()

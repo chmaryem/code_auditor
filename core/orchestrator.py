@@ -502,6 +502,23 @@ class Orchestrator:
 
         # ── ÉTAPE 11 : Self-Improving RAG ─────────────────────────────────────
         fix_blocks = parse_fix_blocks(result_text)
+        if fix_blocks and self._cache:
+           session_id = getattr(self, '_session_id', None)
+        for block in fix_blocks:
+        # Extraire le type de pattern depuis le problem
+           pattern_type = self._extract_pattern_type(block)
+        self._cache.record_pattern(
+            file_path    = str(file_path),
+            pattern_type = pattern_type,
+            severity     = block.get("severity", "MEDIUM"),
+            session_id   = session_id
+        )
+        if self._cache:
+           recurring = self._cache.get_recurring_patterns(
+           str(file_path), min_count=2
+     )
+        if recurring:
+         self._print_recurring_warning(file_path.name, recurring)
         if hasattr(self, "_learning_agent") and self._learning_agent:
             if fix_blocks:
                 try:
@@ -519,3 +536,61 @@ class Orchestrator:
         # Libérer le verrou — ce fichier peut maintenant être re-analysé
         with self._in_progress_lock:
             self._in_progress.discard(str(file_path))
+            
+    def _extract_pattern_type(self, block: dict) -> str:
+     """
+    Extrait un type de pattern normalisé depuis le problem text.
+    Ex: "SQL injection in findByUsername" → "SqlInjection"
+     """
+     problem = block.get("problem", "").lower()
+
+     # Mapping simple — extensible
+     patterns = {
+        "sql injection":         "SqlInjection",
+        "prepared statement":    "SqlInjection",
+        "resource leak":         "ResourceLeak",
+        "try-with-resources":    "ResourceLeak",
+        "resultset":             "ResourceLeak",
+        "plain text password":   "PlainTextPassword",
+        "bcrypt":                "PlainTextPassword",
+        "undeclared":            "UndeclaredVariable",
+        "null pointer":          "NullPointer",
+        "single responsibility": "SRPViolation",
+        "pagination":            "MissingPagination",
+        "n+1":                   "N1Query",
+    }
+
+     for keyword, pattern_name in patterns.items():
+        if keyword in problem:
+            return pattern_name
+
+     # Fallback : premiers 40 chars normalisés
+     import re
+     return re.sub(r'[^a-zA-Z0-9]', '', problem[:40].title())
+
+    def _print_recurring_warning(
+     self,
+     file_name: str,
+     recurring: list
+    ):
+     """Affiche un avertissement pour les patterns récurrents."""
+     from output.console_renderer import _YL, _RD, _R, _BD, _DM
+
+     print(f"\n  {_YL}⟳ Patterns récurrents dans {file_name} :{_R}")
+     for p in recurring[:3]:
+        color = _RD if p["severity"] == "CRITICAL" else _YL
+        days_ago = ""
+        try:
+            from datetime import datetime
+            first = datetime.fromisoformat(p["first_seen"])
+            delta = (datetime.now() - first).days
+            if delta > 0:
+                days_ago = f" depuis {delta} jour(s)"
+        except Exception:
+            pass
+
+        kb_tag = f" {_DM}[dans KB]{_R}" if p["in_kb"] else ""
+        print(
+            f"    {color}• {p['pattern']}{_R}"
+            f" — {_BD}{p['count']}x{_R}{days_ago}{kb_tag}"
+        )

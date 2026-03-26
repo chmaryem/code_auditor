@@ -1,6 +1,6 @@
 """
 CacheService — SQLite thread-safe.
-Remplace l'ancien cache_manager.py (pickle).
+
 
 Pourquoi ce changement ?
   L'ancien .pkl pouvait se corrompre si deux analyses écrivaient
@@ -50,6 +50,29 @@ class CacheService:
                     key   TEXT PRIMARY KEY,
                     value TEXT
                 );
+                -- mémoire épisodique cross-session
+            CREATE TABLE IF NOT EXISTS episode_memory (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path        TEXT NOT NULL,
+                pattern_type     TEXT NOT NULL,
+                severity         TEXT NOT NULL DEFAULT 'MEDIUM',
+                occurrence_count INTEGER DEFAULT 1,
+                first_seen       TEXT DEFAULT (datetime('now')),
+                last_seen        TEXT DEFAULT (datetime('now')),
+                last_session     TEXT,
+                promoted_to_kb   INTEGER DEFAULT 0,
+                UNIQUE(file_path, pattern_type)
+            );
+            
+            --  stats par session
+            CREATE TABLE IF NOT EXISTS session_stats (
+                session_id    TEXT PRIMARY KEY,
+                started_at    TEXT,
+                ended_at      TEXT,
+                files_analyzed INTEGER DEFAULT 0,
+                kb_rules_added INTEGER DEFAULT 0,
+                patterns_found TEXT  -- JSON list
+            );
             """)
             self._conn.commit()
 
@@ -163,7 +186,7 @@ class CacheService:
             )
             self._conn.commit()
 
-    # ── save()/load() deviennent des no-ops — SQLite est déjà durable ─────────
+    #  save()/load() deviennent des no-ops — SQLite est déjà durable
 
     def save(self):
         """Compatibilité avec l'ancien code — SQLite n'a pas besoin de flush manuel."""
@@ -184,6 +207,8 @@ class CacheService:
             "cache_file":       str(db_path),
             "cache_size_bytes": db_path.stat().st_size if db_path.exists() else 0,
         }
+        
+ 
 
     def print_stats(self):
         stats = self.get_stats()
@@ -194,7 +219,104 @@ class CacheService:
             self._conn.execute("DELETE FROM file_cache")
             self._conn.commit()
         print(" Cache effacé")
+        
+    def record_pattern(
+        self,
+        file_path:    str,
+        pattern_type: str,
+        severity:     str,
+        session_id:   str = None
+      ):
+        
+        """
+        Enregistre une occurrence de pattern détecté.
+        Si le pattern existe déjà → incrémente le compteur.
+        """
+        with self._lock:
+         self._conn.execute("""
+            INSERT INTO episode_memory
+                (file_path, pattern_type, severity, last_session)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(file_path, pattern_type) DO UPDATE SET
+                occurrence_count = occurrence_count + 1,
+                last_seen        = datetime('now'),
+                last_session     = excluded.last_session,
+                severity         = excluded.severity
+        """, (file_path, pattern_type, severity, session_id))
+        self._conn.commit()
 
+
+    def get_recurring_patterns(
+      self,
+      file_path:   str,
+      min_count:   int = 2
+    ) -> list:
+      """
+    Retourne les patterns récurrents d'un fichier.
+    Utile pour afficher : "Ce bug existe depuis 3 jours."
+    """
+      with self._lock:
+        rows = self._conn.execute("""
+            SELECT pattern_type, severity,
+                   occurrence_count, first_seen, last_seen,
+                   promoted_to_kb
+            FROM episode_memory
+            WHERE file_path = ?
+              AND occurrence_count >= ?
+            ORDER BY occurrence_count DESC
+        """, (file_path, min_count)).fetchall()
+      return [
+        {
+            "pattern":    r[0],
+            "severity":   r[1],
+            "count":      r[2],
+            "first_seen": r[3],
+            "last_seen":  r[4],
+            "in_kb":      bool(r[5])
+        }
+        for r in rows
+    ]
+      
+    def get_hotspot_files(self, top_n: int = 5) -> list:
+     """
+     Fichiers avec le plus de patterns récurrents non corrigés.
+     Utile pour le rapport de session.
+     """
+     with self._lock:
+        rows = self._conn.execute("""
+            SELECT file_path,
+                   COUNT(DISTINCT pattern_type) as pattern_count,
+                   SUM(occurrence_count)         as total_occurrences,
+                   MAX(CASE WHEN severity='CRITICAL' THEN 1 ELSE 0 END) as has_critical
+            FROM episode_memory
+            WHERE promoted_to_kb = 0
+            GROUP BY file_path
+            ORDER BY has_critical DESC, total_occurrences DESC
+            LIMIT ?
+        """, (top_n,)).fetchall()
+     return [
+        {
+            "file":        r[0],
+            "patterns":    r[1],
+            "occurrences": r[2],
+            "critical":    bool(r[3])
+        }
+        for r in rows
+    ]
+     
+    def mark_pattern_promoted(
+    self,
+    file_path:    str,
+    pattern_type: str 
+    ):
+     """Marque un pattern comme promu dans la KB."""
+     with self._lock:
+        self._conn.execute("""
+            UPDATE episode_memory
+            SET promoted_to_kb = 1
+            WHERE file_path = ? AND pattern_type = ?
+        """, (file_path, pattern_type))
+        self._conn.commit()
 
 # Alias pour compatibilité totale avec l'ancien nom
 CacheManager = CacheService
