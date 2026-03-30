@@ -150,7 +150,7 @@ def cmd_project(args):
 # ── Commande : watch ──────────────────────────────────────────────────────────
 
 def cmd_watch(args):
-    """Surveille un projet en temps réel."""
+    """Surveille un projet en temps réel + Smart Git Session Tracker."""
     try:
         import watchdog  # noqa
     except ImportError:
@@ -175,6 +175,32 @@ def cmd_watch(args):
     def on_change(file_path: Path, deleted: bool = False):
         orchestrator.handle(file_changed_event(file_path, deleted=deleted))
 
+    # ── Smart Git Session Tracker ────────────────────────────────────────────
+    # Démarre en arrière-plan — lit le cache Watch et surveille l'accumulation
+    # de bugs non commités. Notifie le développeur si le score monte.
+    git_tracker = None
+    try:
+        from smart_git.git_diff_parser import is_git_repo
+        if is_git_repo(project_path):
+            from smart_git.git_session_tracker import GitSessionTracker
+            from smart_git.git_notifier import GitNotifier
+            from config import config
+
+            cache_db    = config.CACHE_DIR / "analysis_cache.db"
+            notifier    = GitNotifier(print_lock=orchestrator._print_lock)
+            git_tracker = GitSessionTracker(
+                project_path   = project_path,
+                cache_db       = cache_db,
+                notifier       = notifier,
+                check_interval = 180,   # vérification toutes les 3 min
+            )
+            git_tracker.start()
+            info("Smart Git Tracker actif — surveillance accumulation de bugs\n")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("GitSessionTracker non démarré : %s", e)
+    # ────────────────────────────────────────────────────────────────────────
+
     watcher = FileWatcher(project_path=project_path, callback=on_change)
     try:
         watcher.watch()
@@ -182,8 +208,116 @@ def cmd_watch(args):
         pass
     finally:
         watcher.stop()
+        if git_tracker:
+            git_tracker.stop()
         orchestrator.stop()
 
+
+# ── Commande : git status ─────────────────────────────────────────────────────
+
+def cmd_git_status(args):
+    """Affiche l'état de la session courante (accumulation de bugs non commités)."""
+    from smart_git.git_session_tracker import GitSessionTracker
+    from smart_git.git_report import session_report
+    from smart_git.git_diff_parser import is_git_repo
+    from config import config
+
+    project_path = Path(args.path)
+    if not is_git_repo(project_path):
+        err(f"Pas un dépôt Git : {project_path}")
+        return
+
+    cache_db = config.CACHE_DIR / "analysis_cache.db"
+    tracker  = GitSessionTracker(project_path=project_path, cache_db=cache_db)
+    snapshot = tracker.force_check()
+
+    if snapshot:
+        print(session_report(snapshot))
+        if snapshot.files_unanalyzed:
+            info(f"{len(snapshot.files_unanalyzed)} fichier(s) sans analyse Watch.")
+            info("Conseil : python main.py watch <projet> pour analyser en temps réel.")
+    else:
+        err("Impossible de calculer le score de session.")
+
+
+# ── Commande : git branch ──────────────────────────────────────────────────────
+
+def cmd_git_branch(args):
+    """Analyse une branche feature vs sa base et donne un verdict de merge."""
+    from smart_git.git_branch_analyzer import GitBranchAnalyzer
+    from smart_git.git_report import branch_report, save_branch_report_json
+    from smart_git.git_diff_parser import is_git_repo
+    from config import config
+
+    project_path = Path(args.path)
+    if not is_git_repo(project_path):
+        err(f"Pas un dépôt Git : {project_path}")
+        return
+
+    branch   = getattr(args, "branch", "HEAD")
+    base     = getattr(args, "base",   "main")
+    save_json = getattr(args, "report", False)
+
+    hdr(f"ANALYSE BRANCHE — {branch} vs {base}")
+
+    cache_db = config.CACHE_DIR / "analysis_cache.db"
+    analyzer = GitBranchAnalyzer(project_path=project_path, cache_db=cache_db)
+
+    try:
+        report = analyzer.analyze(branch=branch, base=base)
+    except RuntimeError as e:
+        err(str(e))
+        return
+
+    print(branch_report(report))
+
+    if save_json:
+        out_dir  = config.CACHE_DIR.parent / "git_reports"
+        out_path = save_branch_report_json(report, out_dir)
+        ok(f"Rapport JSON sauvegardé : {out_path}")
+
+
+# ── Commande : git commit ──────────────────────────────────────────────────────
+
+def cmd_git(args):
+    """Analyse les fichiers modifiés dans un commit Git donné."""
+    from core.orchestrator import Orchestrator
+    from core.events import git_commit_event
+    from smart_git.git_diff_parser import get_changed_files, get_current_commit_hash, is_git_repo
+
+    project_path = Path(args.path)
+    if not is_git_repo(project_path):
+        err(f"Pas un dépôt Git : {project_path}")
+        return
+
+    commit      = getattr(args, "commit", "HEAD")
+    changed     = get_changed_files(commit=commit, project_path=project_path)
+    commit_hash = get_current_commit_hash(project_path)
+
+    if not changed:
+        ok("Aucun fichier modifié dans ce commit.")
+        return
+
+    hdr(f"ANALYSE GIT — commit {commit_hash}")
+    info(f"{len(changed)} fichier(s) modifié(s)\n")
+
+    orchestrator = Orchestrator(project_path)
+    orchestrator.initialize()
+    orchestrator.handle(git_commit_event(commit_hash, changed, repo_path=project_path))
+    orchestrator.stop()
+
+
+# ── Commande : hook ───────────────────────────────────────────────────────────
+
+def cmd_hook(args):
+    """Installe ou désinstalle le pre-commit Git hook."""
+    from smart_git.git_hook import install_hook, uninstall_hook
+    project_path = Path(args.path)
+    if getattr(args, "uninstall", False):
+        uninstall_hook(project_path)
+    else:
+        strict = not getattr(args, "no_strict", False)
+        install_hook(project_path, strict=strict)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -213,12 +347,23 @@ Exemples :
     sp = sub.add_parser("watch",   help="Surveiller en temps réel")
     sp.add_argument("path")
 
-    sp = sub.add_parser("git",     help="Analyser le dernier commit Git")
+    sp = sub.add_parser("git",        help="Analyser un commit Git donné")
     sp.add_argument("path")
-    sp.add_argument("--commit", default="HEAD")
+    sp.add_argument("--commit", default="HEAD", help="Hash du commit (défaut: HEAD)")
 
-    sp = sub.add_parser("hook",    help="Installer le pre-commit hook Git")
+    sp = sub.add_parser("git-status", help="Afficher l'état de la session (bugs accumulés non commités)")
     sp.add_argument("path")
+
+    sp = sub.add_parser("git-branch", help="Analyser une branche avant merge")
+    sp.add_argument("path")
+    sp.add_argument("--branch", default="HEAD", help="Branche à analyser (défaut: HEAD)")
+    sp.add_argument("--base",   default="main",  help="Branche de base (défaut: main)")
+    sp.add_argument("--report", action="store_true", help="Sauvegarder le rapport en JSON")
+
+    sp = sub.add_parser("hook",       help="Installer/désinstaller le pre-commit hook Git")
+    sp.add_argument("path")
+    sp.add_argument("--uninstall",  action="store_true", help="Désinstaller le hook")
+    sp.add_argument("--no-strict",  action="store_true", help="Mode non-strict (avertit sans bloquer)")
 
     return p
 
@@ -229,7 +374,9 @@ def main():
     if not args.command:
         parser.print_help()
         return
-    {"file": cmd_file, "project": cmd_project, "watch": cmd_watch,}[args.command](args)
+    {"file": cmd_file, "project": cmd_project, "watch": cmd_watch,
+     "git": cmd_git, "git-status": cmd_git_status,
+     "git-branch": cmd_git_branch, "hook": cmd_hook}[args.command](args)
 
 
 if __name__ == "__main__":

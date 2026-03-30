@@ -48,10 +48,15 @@ def file_changed_event(file_path: Path, deleted: bool = False) -> Event:
     etype = EventType.FILE_DELETED if deleted else EventType.FILE_CHANGED
     return Event(type=etype, payload={"file_path": str(file_path)}, source="file_watcher")
 
-def git_commit_event(commit_hash: str, changed_files: list) -> Event:
+def git_commit_event(commit_hash: str, changed_files: list,
+                     repo_path: Path = None) -> Event:
     return Event(
         type    = EventType.GIT_COMMIT,
-        payload = {"commit_hash": commit_hash, "changed_files": changed_files},
+        payload = {
+            "commit_hash":   commit_hash,
+            "changed_files": changed_files,
+            "repo_path":     repo_path or Path("."),
+        },
         source  = "git_hook",
     )
 

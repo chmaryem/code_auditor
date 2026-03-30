@@ -131,14 +131,33 @@ class GraphNeighborhoodExtractor:
             file_crit = file_info.get("criticality", 0)
             rich = []
             for e in entities:
-                if e.get("type") not in ("method", "function", "class"):
+                # Défensif : e peut être un dict (depuis project_indexer cache)
+                # ou un CodeEntity (depuis code_agent.parse) — jamais une string
+                if isinstance(e, str):
                     continue
-                raw_params = e.get("parameters", [])
-                params_str = ", ".join(raw_params[:6])
-                if len(raw_params) > 6:
-                    params_str += ", ..."
+                # Accès unifié dict / CodeEntity
+                if isinstance(e, dict):
+                    etype      = e.get("type", "")
+                    ename      = e.get("name", "")
+                    raw_params = e.get("parameters", []) or []
+                else:
+                    etype      = getattr(e, "type", "")
+                    ename      = getattr(e, "name", "")
+                    raw_params = getattr(e, "parameters", []) or []
+
+                if etype not in ("method", "function", "class"):
+                    continue
+
+                # raw_params peut être une string ou une liste selon la source
+                if isinstance(raw_params, str):
+                    params_str = raw_params[:80]
+                else:
+                    params_str = ", ".join(str(p) for p in raw_params[:6])
+                    if len(raw_params) > 6:
+                        params_str += ", ..."
+
                 rich.append({
-                    "name":        e.get("name", ""),
+                    "name":        ename,
                     "params":      params_str,
                     "criticality": file_crit,
                 })
@@ -516,7 +535,9 @@ class SystemAwareRAG:
             sigs = [
                 f"{e['name']}({e['params']})" if e.get("params") else e["name"]
                 for ents in pred_entities.values()
+                if isinstance(ents, list)          # garde : ents doit être une liste
                 for e in ents[:5]
+                if isinstance(e, dict)             # garde : e doit être un dict
             ]
             if sigs:
                 queries.append(
@@ -530,7 +551,9 @@ class SystemAwareRAG:
             sigs = [
                 f"{e['name']}({e['params']})" if e.get("params") else e["name"]
                 for ents in succ_entities.values()
+                if isinstance(ents, list)          # garde : ents doit être une liste
                 for e in ents[:5]
+                if isinstance(e, dict)             # garde : e doit être un dict
             ]
             if sigs:
                 queries.append(

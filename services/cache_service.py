@@ -73,6 +73,19 @@ class CacheService:
                 kb_rules_added INTEGER DEFAULT 0,
                 patterns_found TEXT  -- JSON list
             );
+            CREATE TABLE IF NOT EXISTS git_memory (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                commit_hash      TEXT,
+                branch           TEXT,
+                author           TEXT,
+                file_path        TEXT,
+                issues_critical  INTEGER DEFAULT 0,
+                issues_high      INTEGER DEFAULT 0,
+                issues_medium    INTEGER DEFAULT 0,
+                blocked          INTEGER DEFAULT 0,   -- 1 si commit bloque
+                analyzed_at      TEXT
+);
+
             """)
             self._conn.commit()
 
@@ -317,9 +330,51 @@ class CacheService:
             WHERE file_path = ? AND pattern_type = ?
         """, (file_path, pattern_type))
         self._conn.commit()
+        
+    def save_commit_analysis(self, commit_hash: str, branch: str,
+                          author: str, file_path: str,
+                          critical: int, high: int, medium: int,
+                          blocked: bool):
+     """Persiste le resultat d'analyse d'un fichier du commit."""
+     now = datetime.now().isoformat()
+     with self._lock:
+        self._conn.execute(
+            """INSERT INTO git_memory
+               (commit_hash, branch, author, file_path,
+                issues_critical, issues_high, issues_medium,
+                blocked, analyzed_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (commit_hash, branch, author, file_path,
+             critical, high, medium, int(blocked), now)
+        )
+        self._conn.commit()
+ 
+    def get_file_history(self, file_path: str, limit: int = 10) -> list:
+      """Retourne l'historique des analyses d'un fichier."""
+      with self._lock:
+         rows = self._conn.execute(
+            """SELECT branch, issues_critical, issues_high,
+                      issues_medium, blocked, analyzed_at
+               FROM git_memory WHERE file_path = ?
+               ORDER BY analyzed_at DESC LIMIT ?""",
+            (file_path, limit)
+        ).fetchall()
+      return rows
+ 
+    def is_recurring_issue(self, file_path: str) -> bool:
+      """True si ce fichier a eu des CRITICAL dans les 2 dernieres semaines."""
+      with self._lock:
+        count = self._conn.execute(
+            """SELECT COUNT(*) FROM git_memory
+               WHERE file_path = ? AND issues_critical > 0
+               AND analyzed_at > datetime('now', '-14 days')""",
+            (file_path,)
+        ).fetchone()[0]
+      return count >= 2
 
-# Alias pour compatibilité totale avec l'ancien nom
-CacheManager = CacheService
+
+
+#CacheManager = CacheService
 
 # Instance globale
 cache_service = CacheService()

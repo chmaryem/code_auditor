@@ -1311,16 +1311,21 @@ class KnowledgeGraph:
         rules = AST_RULES.get(language.lower(), [])
 
         for entity in entities:
-            name      = (entity.name if hasattr(entity, "name")
-                         else entity.get("name", "")).lower()
-            etype     = (entity.type if hasattr(entity, "type")
-                         else entity.get("type", ""))
-            ret_type  = (entity.return_type if hasattr(entity, "return_type")
-                         else entity.get("return_type") or "")
-            decorators = (entity.decorators if hasattr(entity, "decorators")
-                          else entity.get("decorators") or [])
-            params     = (entity.parameters if hasattr(entity, "parameters")
-                          else entity.get("parameters") or [])
+            if isinstance(entity, str):
+                continue
+
+            if isinstance(entity, dict):
+                name       = entity.get("name",       "").lower()
+                etype      = entity.get("type",       "")
+                ret_type   = entity.get("return_type") or ""
+                decorators = entity.get("decorators") or []
+                params     = entity.get("parameters") or []
+            else:
+                name       = getattr(entity, "name",        "").lower()
+                etype      = getattr(entity, "type",        "")
+                ret_type   = getattr(entity, "return_type", "") or ""
+                decorators = getattr(entity, "decorators",  []) or []
+                params     = getattr(entity, "parameters",  []) or []
 
             for rule in rules:
                 # Vérifier le type d'entité

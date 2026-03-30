@@ -421,6 +421,8 @@ If the code looks mostly correct, respond with block_fix and 0 issues.
             if criticality > 3
             else "Breaking changes acceptable with justification."
         )
+        
+        
 
         # ── Prompt final ──────────────────────────────────────────────────────
         prompt = f"""You are a SENIOR code reviewer performing an EXHAUSTIVE audit.

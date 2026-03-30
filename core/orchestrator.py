@@ -60,7 +60,7 @@ class Orchestrator:
         self._last_hash: Dict[str, str] = {}
         self._file_contents: Dict[str, str] = {}
         # Fichiers en cours d'analyse — évite les doublons dans la queue
-        self._in_progress: set = set()
+        self._in_progress: Dict[str, float] = {}   # path → timestamp
         self._in_progress_lock = threading.Lock()
         # Fichiers qui ont reçu une solution full_class cette session
         # Format : {str(file_path): content_hash_de_la_solution}
@@ -170,7 +170,24 @@ class Orchestrator:
             self.queue_analysis(event.file_path, deleted=True)
         elif event.type == EventType.GIT_COMMIT:
             for fi in event.payload.get("changed_files", []):
-                p = Path(fi.get("path", ""))
+                # fi peut être un dict {"path": "...", "status": "M"}
+                # ou une string brute selon la source (git_diff_parser vs autre)
+                if isinstance(fi, dict):
+                    raw_path = fi.get("path", "")
+                    status   = fi.get("status", "M")
+                elif isinstance(fi, str):
+                    raw_path = fi
+                    status   = "M"
+                else:
+                    continue
+
+                if not raw_path or status == "D":
+                    continue
+
+                # Résoudre le chemin relatif → absolu si nécessaire
+                p = Path(raw_path)
+                if not p.is_absolute():
+                    p = event.payload.get("repo_path", Path(".")) / p
                 if p.exists():
                     self.queue_analysis(p, deleted=False)
 
@@ -181,12 +198,15 @@ class Orchestrator:
         # Bloquer si ce fichier est déjà dans la queue ou en cours d'analyse
         file_key = str(file_path)
         with self._in_progress_lock:
-            if file_key in self._in_progress:
-                logger.debug("Doublon ignoré (déjà en cours) : %s", file_path.name)
+            now  = time.time()
+            last = self._in_progress.get(file_key, 0)
+            if now - last < 2.0:
+                logger.debug("Doublon ignoré (%dms) : %s",
+                             int((now - last) * 1000), file_path.name)
                 return
             if self._cache and not self._cache.has_file_changed(file_path):
                 return
-            self._in_progress.add(file_key)
+            self._in_progress[file_key] = now
         self._queue.put({"file_path": file_path, "deleted": False})
 
     def stop(self):
@@ -220,17 +240,43 @@ class Orchestrator:
 
     def _worker_loop(self):
         while self._is_running:
+            task = None
             try:
                 task = self._queue.get(timeout=1)
+
+                # Garde défensive — une string peut arriver si un composant externe
+                # (ex: GitSessionTracker) enfile directement dans la queue.
+                if not isinstance(task, dict):
+                    logger.warning(
+                        "Worker : tâche ignorée (type inattendu %s : %r)",
+                        type(task).__name__, str(task)[:80],
+                    )
+                    self._queue.task_done()
+                    continue
+
+                file_path = task.get("file_path")
+                if file_path is None:
+                    logger.warning("Worker : tâche sans file_path ignorée : %r", task)
+                    self._queue.task_done()
+                    continue
+
                 if task.get("deleted"):
-                    self._handle_deletion(task["file_path"])
+                    self._handle_deletion(file_path)
                 else:
-                    self._analyze_file(task["file_path"])
+                    self._analyze_file(file_path)
+
                 self._queue.task_done()
+
             except Empty:
                 pass
             except Exception as e:
                 logger.error("Worker erreur : %s", e)
+                # Libérer la tâche pour éviter de bloquer queue.join()
+                if task is not None:
+                    try:
+                        self._queue.task_done()
+                    except Exception:
+                        pass
 
     # ── Suppression ───────────────────────────────────────────────────────────
 
@@ -287,7 +333,7 @@ class Orchestrator:
         except Exception as e:
             print(f" Erreur lecture : {e}\n")
             with self._in_progress_lock:
-                self._in_progress.discard(str(file_path))
+                self._in_progress.pop(str(file_path), None)
             return
 
         # file_key défini ici — utilisé dans étape 8.6, affichage et cache
@@ -308,7 +354,7 @@ class Orchestrator:
                     file_path, {"analysis": "RAS — changement mineur", "relevant_knowledge": []}, [], [])
             self._file_contents[str(file_path)] = new_content
             with self._in_progress_lock:
-                self._in_progress.discard(str(file_path))
+                self._in_progress.pop(str(file_path), None)
             return
 
         print(" Analyse System-Aware lancée...")
@@ -367,8 +413,11 @@ class Orchestrator:
         print(f" RAG System-Aware ({language})...", flush=True)
 
         # Injecter les entités pour detect_patterns (project_indexer prioritaire)
-        file_info = (self._project_indexer.context.files.get(str(file_path), {})
-                     if self._project_indexer and self._project_indexer.context else {})
+        file_info = {}
+        if (self._project_indexer and self._project_indexer.context and
+            hasattr(self._project_indexer.context, 'files') and
+            isinstance(self._project_indexer.context.files, dict)):
+            file_info = self._project_indexer.context.files.get(str(file_path), {})
         neighborhood["_parsed_entities"] = (
             file_info.get("entities", []) or parsed.get("entities", []))
         neighborhood["language"] = language
@@ -502,23 +551,40 @@ class Orchestrator:
 
         # ── ÉTAPE 11 : Self-Improving RAG ─────────────────────────────────────
         fix_blocks = parse_fix_blocks(result_text)
+
+        # Mémoire épisodique — enregistrer chaque pattern détecté
         if fix_blocks and self._cache:
-           session_id = getattr(self, '_session_id', None)
-        for block in fix_blocks:
-        # Extraire le type de pattern depuis le problem
-           pattern_type = self._extract_pattern_type(block)
-        self._cache.record_pattern(
-            file_path    = str(file_path),
-            pattern_type = pattern_type,
-            severity     = block.get("severity", "MEDIUM"),
-            session_id   = session_id
-        )
+            session_id = getattr(self, "_session_id", None)
+            for block in fix_blocks:
+                # Vérifier que block est bien un dictionnaire
+                if not isinstance(block, dict):
+                    logger.debug("Bloc ignoré : type inattendu %s", type(block).__name__)
+                    continue
+                # block est un dict {"problem": ..., "severity": ..., ...}
+                # _extract_pattern_type attend un dict → appel correct
+                pattern_type = self._extract_pattern_type(block)
+                try:
+                    self._cache.record_pattern(
+                        file_path    = str(file_path),
+                        pattern_type = pattern_type,
+                        severity     = block.get("severity", "MEDIUM"),
+                        session_id   = session_id,
+                    )
+                except Exception as e:
+                    logger.debug("record_pattern erreur : %s", e)
+
+        # Afficher les patterns récurrents si pertinent
         if self._cache:
-           recurring = self._cache.get_recurring_patterns(
-           str(file_path), min_count=2
-     )
-        if recurring:
-         self._print_recurring_warning(file_path.name, recurring)
+            try:
+                recurring = self._cache.get_recurring_patterns(
+                    str(file_path), min_count=2
+                )
+                if recurring:
+                    self._print_recurring_warning(file_path.name, recurring)
+            except Exception as e:
+                logger.debug("get_recurring_patterns erreur : %s", e)
+
+        # LearningAgent — auto-amélioration KB (non-bloquant)
         if hasattr(self, "_learning_agent") and self._learning_agent:
             if fix_blocks:
                 try:
@@ -535,7 +601,7 @@ class Orchestrator:
 
         # Libérer le verrou — ce fichier peut maintenant être re-analysé
         with self._in_progress_lock:
-            self._in_progress.discard(str(file_path))
+            self._in_progress.pop(str(file_path), None)
             
     def _extract_pattern_type(self, block: dict) -> str:
      """

@@ -577,15 +577,14 @@ pattern_map:
         
     def _fetch_documentation(self, problem: str, language: str) -> str:
         """
-         Cherche doc officielle via MCP Brave Search.
-         Retourne '' si MCP indisponible (non-bloquant).
+         Cherche doc officielle.
         """
         if not problem:
                return ''
 
         # Construire une requête ciblée
         query = f'{problem} {language} OWASP best practice fix 2024'
-        logger.debug('MCP Search query : %s', query)
+        logger.debug('WEB Search query : %s', query)
 
     # Appel synchrone (FeedbackProcessor tourne dans un thread non-async)
         result = web_search_client.search_sync(query, count=3)
