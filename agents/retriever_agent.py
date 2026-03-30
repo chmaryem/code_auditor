@@ -126,7 +126,9 @@ class GraphNeighborhoodExtractor:
         context_files = self.project_indexer.context.files
         for fp in file_paths:
             file_name = Path(fp).name
-            file_info = context_files.get(fp, {})
+            cached_value = context_files.get(fp, {})
+            # Defensive: ensure file_info is a dict, not a string (cache corruption)
+            file_info = cached_value if isinstance(cached_value, dict) else {}
             entities  = file_info.get("entities", [])
             file_crit = file_info.get("criticality", 0)
             rich = []

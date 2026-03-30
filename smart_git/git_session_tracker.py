@@ -93,7 +93,7 @@ class FileRisk:
     bugs_medium:   int = 0
     bugs_low:      int = 0
     score:         float = 0.0
-    has_analysis:  bool = False   # False → fichier modifié mais pas encore analysé
+    has_analysis:  bool = False   
 
     @property
     def total_bugs(self) -> int:
@@ -373,7 +373,7 @@ class GitSessionTracker:
             logger.debug("SQLite read erreur pour %s : %s", file_path, e)
             return None
 
-    # ── Notification avec hysteresis ─────────────────────────────────────────
+    #  Notification avec hysteresis
 
     def _maybe_notify(self, snapshot: SessionSnapshot):
         """
@@ -406,7 +406,7 @@ class GitSessionTracker:
             except Exception as e:
                 logger.debug("GitNotifier.notify erreur : %s", e)
 
-    # ── Accesseurs utiles ─────────────────────────────────────────────────────
+    # Accesseurs utiles
 
     def set_notifier(self, notifier) -> None:
         """Injecte le notifier après construction (évite import circulaire)."""
@@ -417,9 +417,8 @@ class GitSessionTracker:
         return self._last_level
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # Fonctions utilitaires pures
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _time_multiplier(minutes: int) -> float:
     """

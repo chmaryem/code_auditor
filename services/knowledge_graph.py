@@ -249,12 +249,15 @@ class KGBuilder:
         context_files = project_indexer.context.files
         total = 0
 
-        for file_path_str, file_info in context_files.items():
+        for file_path_str, cached_value in context_files.items():
+            # Defensive: ensure file_info is a dict, not a string (cache corruption)
+            file_info = cached_value if isinstance(cached_value, dict) else {}
             try:
                 file_path   = Path(file_path_str)
                 file_id     = file_path.name
                 language    = file_info.get("language", "unknown")
                 entities    = file_info.get("entities", [])
+                imports     = file_info.get("imports",  [])
                 imports     = file_info.get("imports", [])
                 criticality = file_info.get("criticality", 0)
 
@@ -980,7 +983,9 @@ class KnowledgeGraph:
         try:
             if project_indexer and project_indexer.context:
                 # ── Priorité 1 : project_indexer (zéro re-parsing) ───────────
-                file_info = project_indexer.context.files.get(str(file_path), {})
+                cached_value = project_indexer.context.files.get(str(file_path), {})
+                # Defensive: ensure file_info is a dict, not a string (cache corruption)
+                file_info = cached_value if isinstance(cached_value, dict) else {}
                 if file_info:
                     entities    = file_info.get("entities", [])
                     language    = file_info.get("language", "unknown")
@@ -999,8 +1004,15 @@ class KnowledgeGraph:
                     # Recréer les entités
                     current_class = None
                     for entity in entities:
-                        name  = entity.get("name", "")
-                        etype = entity.get("type", "")
+                        # Defensive: handle both dict (from cache) and CodeEntity (from parser)
+                        if isinstance(entity, dict):
+                            name  = entity.get("name", "")
+                            etype = entity.get("type", "")
+                            params = entity.get("parameters", [])
+                        else:
+                            name  = getattr(entity, "name", "")
+                            etype = getattr(entity, "type", "")
+                            params = getattr(entity, "parameters", [])
                         if not name:
                             continue
                         node_type = ("entity_class"
@@ -1012,7 +1024,7 @@ class KnowledgeGraph:
                             languages=[language],
                             source_file=str(file_path),
                             extra={"entity_type": etype,
-                                   "parameters": entity.get("parameters", []),
+                                   "parameters": params,
                                    "criticality": criticality},
                         ))
                         self._graph.add_edge(file_id, node_id,

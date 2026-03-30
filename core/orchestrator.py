@@ -417,7 +417,9 @@ class Orchestrator:
         if (self._project_indexer and self._project_indexer.context and
             hasattr(self._project_indexer.context, 'files') and
             isinstance(self._project_indexer.context.files, dict)):
-            file_info = self._project_indexer.context.files.get(str(file_path), {})
+            cached_value = self._project_indexer.context.files.get(str(file_path), {})
+            # Defensive: ensure file_info is a dict, not a string (cache corruption)
+            file_info = cached_value if isinstance(cached_value, dict) else {}
         neighborhood["_parsed_entities"] = (
             file_info.get("entities", []) or parsed.get("entities", []))
         neighborhood["language"] = language
@@ -430,7 +432,7 @@ class Orchestrator:
         )
         print(f"   • {len(relevant_docs)} chunk(s) RAG (KB rules + project code)")
 
-        # ── ÉTAPE 8 : Contexte enrichi ────────────────────────────────────────
+        #  ÉTAPE 8 : Contexte enrichi 
         context = build_context(
             file_path       = file_path,
             neighborhood    = neighborhood,
@@ -438,7 +440,7 @@ class Orchestrator:
             change_info     = change_info,
         )
 
-        # ── ÉTAPE 8.5 : Lire l'ancien résultat (pour le delta) ─────────────
+        #  ÉTAPE 8.5 : Lire l'ancien résultat (pour le delta)
         previous_analysis = ""
         if self._cache:
             cached = self._cache.get_cached_analysis(file_path)
