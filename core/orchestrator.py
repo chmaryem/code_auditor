@@ -68,6 +68,9 @@ class Orchestrator:
         # pour que Gemini ne produise pas une seconde réécriture complète.
         self._solution_applied: Dict[str, str] = {}
 
+        # Nombre max de dépendants analysés après chaque save (évite d'exploser le quota LLM)
+        self._max_deps_per_analysis: int = 2
+
         self._stats = {
             "analyzed":      0,
             "skipped_hash":  0,
@@ -558,19 +561,16 @@ class Orchestrator:
                     previous_analysis=previous_analysis,
                 )
 
-        # ── ÉTAPE 11 : Self-Improving RAG ─────────────────────────────────────
+        # ── ÉTAPE 11 : Self-Improving RAG ────────────────────────────────────
         fix_blocks = parse_fix_blocks(result_text)
 
         # Mémoire épisodique — enregistrer chaque pattern détecté
         if fix_blocks and self._cache:
             session_id = getattr(self, "_session_id", None)
             for block in fix_blocks:
-                # Vérifier que block est bien un dictionnaire
                 if not isinstance(block, dict):
                     logger.debug("Bloc ignoré : type inattendu %s", type(block).__name__)
                     continue
-                # block est un dict {"problem": ..., "severity": ..., ...}
-                # _extract_pattern_type attend un dict → appel correct
                 pattern_type = self._extract_pattern_type(block)
                 try:
                     self._cache.record_pattern(
@@ -608,64 +608,236 @@ class Orchestrator:
                 except Exception as e:
                     logger.debug("Feedback Loop erreur : %s", e)
 
+        # ── ÉTAPE 12 : Analyse proactive des fichiers dépendants ──────────────
+        # On analyse directement les dépendants avec le contexte du changement,
+        # sans attendre que le LLM génère des FIX pour eux (approche passive).
+        # Cela couvre aussi le mode full_class où aucun bloc FIX n'est émis.
+        if preds and not context.get("post_solution_mode"):
+            self._analyze_dependents(
+                dependents        = preds,
+                changed_file_name = file_path.name,
+                change_summary    = result_text[:1500],
+                language          = language,
+            )
+
         # Libérer le verrou — ce fichier peut maintenant être re-analysé
         with self._in_progress_lock:
             self._in_progress.pop(str(file_path), None)
-            
+
+    # ── Analyse proactive des dépendants ──────────────────────────────────────
+
+    def _analyze_dependents(
+        self,
+        dependents:        List[str],
+        changed_file_name: str,
+        change_summary:    str,
+        language:          str,
+    ) -> None:
+        """
+        Analyse les fichiers qui dépendent du fichier qui vient d'être modifié.
+
+        Pourquoi on contourne has_file_changed() ici ?
+        Les dépendants n'ont PAS changé sur disque, donc le filtre de hash les bloque.
+        Mais leur COMPATIBILITÉ peut avoir changé suite au fix du fichier principal.
+        On force l'analyse en leur injectant le contexte du changement upstream.
+
+        Cette méthode est intentionnellement synchrone et bloquante pour que
+        les résultats apparaissent dans le terminal juste après l'analyse principale.
+        Elle est limitée à self._max_deps_per_analysis pour préserver le quota LLM.
+        """
+        from agents.code_agent     import code_agent
+        from agents.analysis_agent import build_context
+        from output.console_renderer import print_results, parse_fix_blocks, _CY, _R, _DM
+
+        analyzed_count = 0
+
+        for dep_path_str in dependents[:self._max_deps_per_analysis]:
+            dep_path = Path(dep_path_str)
+            if not dep_path.exists():
+                continue
+
+            dep_key = str(dep_path)
+
+            # Éviter de ré-analyser si déjà en cours (délai plus long que pour les saves normaux)
+            with self._in_progress_lock:
+                now  = time.time()
+                last = self._in_progress.get(dep_key, 0)
+                if now - last < 10.0:
+                    logger.debug("Dépendant ignoré (en cours) : %s", dep_path.name)
+                    continue
+                self._in_progress[dep_key] = now
+
+            try:
+                dep_content = dep_path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                logger.debug("Lecture dépendant %s : %s", dep_path.name, e)
+                with self._in_progress_lock:
+                    self._in_progress.pop(dep_key, None)
+                continue
+
+            print(f"\n{'─'*70}")
+            print(f" 🔗 Dépendant : {dep_path.name}  ← {changed_file_name} vient de changer")
+
+            # Parsing
+            parsed_dep = code_agent.parse(dep_path)
+            if isinstance(parsed_dep, str):
+                parsed_dep = {"entities": [], "imports": []}
+            if parsed_dep.get("error"):
+                logger.debug("Parsing dépendant %s : %s", dep_path.name, parsed_dep["error"])
+                with self._in_progress_lock:
+                    self._in_progress.pop(dep_key, None)
+                continue
+
+            # Voisinage + RAG
+            neighborhood_dep = self._retriever_agent.get_neighborhood(dep_path)
+            if isinstance(neighborhood_dep, str):
+                neighborhood_dep = {}
+            dep_lang = code_agent.detect_language(dep_path)
+            neighborhood_dep["language"] = dep_lang
+            neighborhood_dep["_parsed_entities"] = parsed_dep.get("entities", [])
+
+            relevant_docs, rag_scores = self._retriever_agent.retrieve_system_aware(
+                current_code      = dep_content,
+                neighborhood      = neighborhood_dep,
+                current_file_name = dep_path.name,
+                networkx_graph    = self._dependency_graph,
+            )
+
+            # Contexte enrichi avec info sur le changement upstream
+            context_dep = build_context(
+                file_path       = dep_path,
+                neighborhood    = neighborhood_dep,
+                project_indexer = self._project_indexer,
+            )
+            if isinstance(context_dep, str):
+                context_dep = {}
+
+            context_dep["upstream_change"] = (
+                f"IMPORTANT: {changed_file_name} was just refactored. "
+                f"Verify that THIS file still compiles and works correctly with it.\n"
+                f"Summary of changes in {changed_file_name}:\n{change_summary[:800]}"
+            )
+            # Bloquer full_class sur les dépendants — on cherche seulement les incompatibilités
+            context_dep["post_solution_mode"] = True
+            context_dep["post_solution_hint"] = (
+                f"{changed_file_name} was refactored. Check for: broken imports, "
+                f"wrong method calls, signature mismatches, compilation errors caused "
+                f"by the upstream change. Use block_fix only. "
+                f"If everything is compatible, say so clearly with 0 fix blocks."
+            )
+
+            print(f"  {_DM}↩  Mode compatibilité — vérifie l'impact de {changed_file_name}{_R}")
+
+            # Analyse LLM
+            try:
+                analysis_dep = self._analysis_agent.analyze(
+                    code    = dep_content,
+                    context = context_dep,
+                    docs    = relevant_docs,
+                    scores  = rag_scores,
+                )
+            except Exception as e:
+                logger.error("Analyse dépendant %s : %s", dep_path.name, e)
+                with self._in_progress_lock:
+                    self._in_progress.pop(dep_key, None)
+                continue
+
+            if isinstance(analysis_dep, str):
+                analysis_dep = {"analysis": analysis_dep, "relevant_knowledge": [], "validated_blocks": []}
+
+            result_text_dep = analysis_dep.get("analysis", "")
+
+            # Cache — le pre-commit hook lira ce résultat
+            if self._cache:
+                self._cache.update_file_cache(dep_path, analysis_dep, [], [])
+
+            # Affichage
+            with self._print_lock:
+                print_results(
+                    text           = result_text_dep,
+                    file_name      = dep_path.name,
+                    context        = context_dep,
+                    elapsed        = 0.0,
+                    analyzed_count = self._stats["analyzed"],
+                    score          = 0,
+                    impacted       = [],
+                )
+
+            # Self-Improving RAG pour le dépendant aussi
+            fix_blocks_dep = parse_fix_blocks(result_text_dep)
+            if fix_blocks_dep and hasattr(self, "_learning_agent") and self._learning_agent:
+                try:
+                    self._learning_agent.collect_feedback(
+                        blocks      = fix_blocks_dep,
+                        code_before = dep_content,
+                        language    = dep_lang,
+                        file_name   = dep_path.name,
+                    )
+                except Exception as e:
+                    logger.debug("Feedback dépendant %s : %s", dep_path.name, e)
+
+            analyzed_count += 1
+
+            with self._in_progress_lock:
+                self._in_progress.pop(dep_key, None)
+
+        if analyzed_count > 0:
+            print(f"\n  ✓ {analyzed_count} dépendant(s) analysé(s) suite au changement de {changed_file_name}\n")
+
     def _extract_pattern_type(self, block: dict) -> str:
-     """
-    Extrait un type de pattern normalisé depuis le problem text.
-    Ex: "SQL injection in findByUsername" → "SqlInjection"
-     """
-     problem = block.get("problem", "").lower()
+        """
+        Extrait un type de pattern normalisé depuis le problem text.
+        Ex: "SQL injection in findByUsername" → "SqlInjection"
+        """
+        problem = block.get("problem", "").lower()
 
-     # Mapping simple — extensible
-     patterns = {
-        "sql injection":         "SqlInjection",
-        "prepared statement":    "SqlInjection",
-        "resource leak":         "ResourceLeak",
-        "try-with-resources":    "ResourceLeak",
-        "resultset":             "ResourceLeak",
-        "plain text password":   "PlainTextPassword",
-        "bcrypt":                "PlainTextPassword",
-        "undeclared":            "UndeclaredVariable",
-        "null pointer":          "NullPointer",
-        "single responsibility": "SRPViolation",
-        "pagination":            "MissingPagination",
-        "n+1":                   "N1Query",
-    }
+        # Mapping simple — extensible
+        patterns = {
+            "sql injection":         "SqlInjection",
+            "prepared statement":    "SqlInjection",
+            "resource leak":         "ResourceLeak",
+            "try-with-resources":    "ResourceLeak",
+            "resultset":             "ResourceLeak",
+            "plain text password":   "PlainTextPassword",
+            "bcrypt":                "PlainTextPassword",
+            "undeclared":            "UndeclaredVariable",
+            "null pointer":          "NullPointer",
+            "single responsibility": "SRPViolation",
+            "pagination":            "MissingPagination",
+            "n+1":                   "N1Query",
+        }
 
-     for keyword, pattern_name in patterns.items():
-        if keyword in problem:
-            return pattern_name
+        for keyword, pattern_name in patterns.items():
+            if keyword in problem:
+                return pattern_name
 
-     # Fallback : premiers 40 chars normalisés
-     import re
-     return re.sub(r'[^a-zA-Z0-9]', '', problem[:40].title())
+        # Fallback : premiers 40 chars normalisés
+        import re
+        return re.sub(r'[^a-zA-Z0-9]', '', problem[:40].title())
 
     def _print_recurring_warning(
-     self,
-     file_name: str,
-     recurring: list
+        self,
+        file_name: str,
+        recurring: list,
     ):
-     """Affiche un avertissement pour les patterns récurrents."""
-     from output.console_renderer import _YL, _RD, _R, _BD, _DM
+        """Affiche un avertissement pour les patterns récurrents."""
+        from output.console_renderer import _YL, _RD, _R, _BD, _DM
 
-     print(f"\n  {_YL}⟳ Patterns récurrents dans {file_name} :{_R}")
-     for p in recurring[:3]:
-        color = _RD if p["severity"] == "CRITICAL" else _YL
-        days_ago = ""
-        try:
-            from datetime import datetime
-            first = datetime.fromisoformat(p["first_seen"])
-            delta = (datetime.now() - first).days
-            if delta > 0:
-                days_ago = f" depuis {delta} jour(s)"
-        except Exception:
-            pass
+        print(f"\n  {_YL}⟳ Patterns récurrents dans {file_name} :{_R}")
+        for p in recurring[:3]:
+            color = _RD if p["severity"] == "CRITICAL" else _YL
+            days_ago = ""
+            try:
+                from datetime import datetime
+                first = datetime.fromisoformat(p["first_seen"])
+                delta = (datetime.now() - first).days
+                if delta > 0:
+                    days_ago = f" depuis {delta} jour(s)"
+            except Exception:
+                pass
 
-        kb_tag = f" {_DM}[dans KB]{_R}" if p["in_kb"] else ""
-        print(
-            f"    {color}• {p['pattern']}{_R}"
-            f" — {_BD}{p['count']}x{_R}{days_ago}{kb_tag}"
-        )
+            kb_tag = f" {_DM}[dans KB]{_R}" if p["in_kb"] else ""
+            print(
+                f"    {color}• {p['pattern']}{_R}"
+                f" — {_BD}{p['count']}x{_R}{days_ago}{kb_tag}"
+            )

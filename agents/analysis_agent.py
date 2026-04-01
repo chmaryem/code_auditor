@@ -108,6 +108,75 @@ def parse_llm_response(raw: str) -> dict:
     return result
 
 
+def parse_dependent_fixes(raw: str, main_file: str) -> list[dict]:
+    """
+    Parse les corrections pour fichiers dépendants depuis la réponse LLM.
+    
+    Le LLM peut générer des ---FIX START--- blocks pour des fichiers dépendants
+    quand il détecte que le fix du fichier principal nécessite des changements
+    dans les fichiers qui l'appellent.
+    
+    Args:
+        raw: Réponse textuelle du LLM
+        main_file: Nom du fichier principal analysé (ex: UserService.java)
+        
+    Returns:
+        Liste de dicts avec: file_path, location, problem, severity, fixed_code
+    """
+    import re
+    from pathlib import Path
+    
+    dependent_fixes = []
+    main_file_name = Path(main_file).name
+    
+    # Parse tous les blocs FIX
+    parts = re.split(r'-{3,}\s*FIX START\s*-{3,}', raw, flags=re.IGNORECASE)
+    
+    for raw_block in parts[1:]:
+        end = re.search(r'-{3,}\s*FIX END\s*-{3,}', raw_block, re.IGNORECASE)
+        if end:
+            raw_block = raw_block[:end.start()]
+        
+        def _f(name):
+            m = re.search(r'\*\*' + re.escape(name) + r'\*\*\s*:?\s*(.+?)(?=\n\s*\*\*|\Z)',
+                          raw_block, re.DOTALL | re.IGNORECASE)
+            return m.group(1).strip() if m else ""
+        
+        def _code(section):
+            m = re.search(r'\*\*' + re.escape(section) + r'\*\*.*?```\w*\n(.*?)```',
+                          raw_block, re.DOTALL | re.IGNORECASE)
+            return m.group(1).rstrip() if m else ""
+        
+        location = _f("LOCATION")
+        if not location:
+            continue
+            
+        # Extraction du fichier depuis la location
+        # Format attendu: "UserController.java:42" ou "UserController.java (method), line 42"
+        file_match = re.search(r'^([\w.]+\.\w+)', location)
+        if not file_match:
+            continue
+            
+        dep_file = file_match.group(1)
+        
+        # Si c'est un fichier différent du fichier principal, c'est un fix dépendant
+        if dep_file != main_file_name:
+            problem = _f("PROBLEM")
+            sev_raw = _f("SEVERITY").upper().split()[0] if _f("SEVERITY") else "MEDIUM"
+            
+            dependent_fixes.append({
+                "file_path": dep_file,
+                "location": location,
+                "problem": problem,
+                "severity": sev_raw if sev_raw in {"CRITICAL","HIGH","MEDIUM","LOW"} else "MEDIUM",
+                "fixed_code": _code("FIXED CODE"),
+                "current_code": _code("CURRENT CODE"),
+                "why": _f("WHY"),
+            })
+    
+    return dependent_fixes
+
+
 # ── Section [IMPACT SUR LE SYSTÈME] ──────────────────────────────────────────
 
 def build_system_impact_section(file_name: str, neighborhood: Dict[str, Any]) -> str:

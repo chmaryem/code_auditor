@@ -387,6 +387,20 @@ If 3 methods use undeclared `connection` → 3 separate blocks, each with
                 + (f"- Breaking changes will affect {criticality} other files!\n"
                    if criticality > 0 else "")
             )
+            
+            # Include dependent files content for cross-file analysis
+            if dependents:
+                dependency_info += "\nDEPENDENT FILES CONTENT (files that call this one):\n"
+                for dep_path in dependents[:3]:  # Limit to first 3 dependents
+                    try:
+                        dep_file = Path(dep_path)
+                        if dep_file.exists():
+                            dep_content = dep_file.read_text(encoding="utf-8", errors="replace")[:2000]
+                            dependency_info += f"\n--- {dep_file.name} ---\n{dep_content}\n"
+                    except Exception:
+                        pass
+                if len(dependents) > 3:
+                    dependency_info += f"\n... and {len(dependents) - 3} more dependent files\n"
 
         # Flag post-solution — interdit une seconde réécriture full_class
         post_solution_hint = ""
@@ -399,6 +413,23 @@ If 3 methods use undeclared `connection` → 3 separate blocks, each with
 CONSEQUENCE: In STEP 1 (DECIDE YOUR REPAIR STRATEGY), you MUST choose
 block_fix or targeted_methods. full_class is FORBIDDEN for this analysis.
 If the code looks mostly correct, respond with block_fix and 0 issues.
+"""
+
+        # Contexte upstream — quand ce fichier est un dépendant d'un fichier qui vient de changer
+        upstream_hint = ""
+        if context.get("upstream_change"):
+            upstream_hint = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║  UPSTREAM CHANGE DETECTED — COMPATIBILITY CHECK                  ║
+╚══════════════════════════════════════════════════════════════════╝
+{context["upstream_change"]}
+
+YOUR TASK FOR THIS FILE:
+1. Check that every call to {context.get("upstream_change", "").split()[1] if context.get("upstream_change") else "the changed file"} still uses the correct method signatures.
+2. Check that every import from that file still resolves correctly.
+3. Check for any compilation errors caused by the upstream change.
+4. If this file is unaffected, say so explicitly with 0 fix blocks.
+DO NOT rewrite the entire class. Use block_fix only for real incompatibilities found.
 """
 
         # Focus area
@@ -427,7 +458,7 @@ If the code looks mostly correct, respond with block_fix and 0 issues.
         # ── Prompt final ──────────────────────────────────────────────────────
         prompt = f"""You are a SENIOR code reviewer performing an EXHAUSTIVE audit.
 Your mission: find and report EVERY issue in the code below — do not skip, do not group, do not stop early.
-{post_solution_hint}{project_ctx_compressed}
+{post_solution_hint}{upstream_hint}{project_ctx_compressed}
 {context.get("system_impact_section", "")}
 {dependency_info}{focus_area}{security_section}
 CODE TO ANALYZE:
@@ -456,6 +487,11 @@ RULES:
 5. {breaking_changes_rule}
 6. NO artificial limit on number of issues — report every single one found.
    Each method with SQL injection = its own block. Each resource leak = its own block.
+6b. DEPENDENT FILES: If this file is used by other files (see DEPENDENCY CONTEXT above),
+    you MUST also check if your fix for this file requires changes in those dependent files.
+    If a public method signature changes, or if you fix a bug that callers were working around,
+    generate ---FIX START--- blocks for the DEPENDENT files too, with file path in LOCATION.
+    Example: LOCATION: UserController.java:42 (calling method, line 42)
 7. Only suggest libraries already present in the project imports. Never invent dependencies.
 7b. FIXED CODE must ALWAYS contain real, compilable source code — never only comments.
     BAD:  // Use PreparedStatement instead  // String query = "SELECT..."
