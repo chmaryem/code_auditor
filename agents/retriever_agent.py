@@ -298,6 +298,8 @@ class SystemAwareRAG:
 
         if self._kg:
             parsed_entities = neighborhood.get("_parsed_entities", [])
+            if isinstance(parsed_entities, str):
+                parsed_entities = []
 
             # Détecter les patterns présents dans le code
             detected_with_scores = self._kg.detect_patterns(

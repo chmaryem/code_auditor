@@ -249,15 +249,12 @@ class KGBuilder:
         context_files = project_indexer.context.files
         total = 0
 
-        for file_path_str, cached_value in context_files.items():
-            # Defensive: ensure file_info is a dict, not a string (cache corruption)
-            file_info = cached_value if isinstance(cached_value, dict) else {}
+        for file_path_str, file_info in context_files.items():
             try:
                 file_path   = Path(file_path_str)
                 file_id     = file_path.name
                 language    = file_info.get("language", "unknown")
                 entities    = file_info.get("entities", [])
-                imports     = file_info.get("imports",  [])
                 imports     = file_info.get("imports", [])
                 criticality = file_info.get("criticality", 0)
 
@@ -1004,15 +1001,8 @@ class KnowledgeGraph:
                     # Recréer les entités
                     current_class = None
                     for entity in entities:
-                        # Defensive: handle both dict (from cache) and CodeEntity (from parser)
-                        if isinstance(entity, dict):
-                            name  = entity.get("name", "")
-                            etype = entity.get("type", "")
-                            params = entity.get("parameters", [])
-                        else:
-                            name  = getattr(entity, "name", "")
-                            etype = getattr(entity, "type", "")
-                            params = getattr(entity, "parameters", [])
+                        name  = entity.get("name", "")
+                        etype = entity.get("type", "")
                         if not name:
                             continue
                         node_type = ("entity_class"
@@ -1024,7 +1014,7 @@ class KnowledgeGraph:
                             languages=[language],
                             source_file=str(file_path),
                             extra={"entity_type": etype,
-                                   "parameters": params,
+                                   "parameters": entity.get("parameters", []),
                                    "criticality": criticality},
                         ))
                         self._graph.add_edge(file_id, node_id,
@@ -1045,7 +1035,7 @@ class KnowledgeGraph:
                     linker.link_entities(entities, str(file_path), language)
 
             else:
-                # ── Fallback : code_parser ────────────────────────────────────
+                # Fallback : code_parser
                 from services.code_parser import parser as code_parser
                 parsed = code_parser.parse_file(file_path)
                 if "error" not in parsed:
@@ -1076,8 +1066,10 @@ class KnowledgeGraph:
         linker = SemanticLinker(self._graph, llm)
         total  = 0
 
-        for file_path_str, file_info in project_indexer.context.files.items():
+        for file_path_str, cached_value in project_indexer.context.files.items():
             try:
+                # Defensive: ensure file_info is a dict, not a string (cache corruption)
+                file_info = cached_value if isinstance(cached_value, dict) else {}
                 entities = file_info.get("entities", [])
                 language = file_info.get("language", "unknown")
                 if entities:
@@ -1087,8 +1079,6 @@ class KnowledgeGraph:
                              Path(file_path_str).name, e)
 
         return total
-
-    def _run_semantic_linking(self, project_path: Path, llm=None) -> int:
         """Fallback — utilisé si project_indexer absent."""
         try:
             from services.code_parser import parser as code_parser
@@ -1484,7 +1474,11 @@ class KnowledgeGraph:
 
             # Collecter la kb_query de ce nœud
             node_data  = self._graph.nodes.get(current, {})
+            if isinstance(node_data, str):
+                continue
             kb_queries = node_data.get("kb_queries", {})
+            if isinstance(kb_queries, str):
+                kb_queries = {}
             query = (kb_queries.get(lang)
                      or kb_queries.get("java")
                      or kb_queries.get("python"))

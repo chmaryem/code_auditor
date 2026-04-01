@@ -19,17 +19,6 @@ Principes de design :
 
   4. Formaté comme le reste du système : même palette ANSI que console_renderer.py.
 
-Exemple de sortie WARN :
-  ┌─────────────────────────────────────────────────────┐
-  │  ⚡ Session Watch — 3 fichiers avec problèmes détectés │
-  │  Temps depuis le dernier commit : 47 min             │
-  ├──────────────────────┬──────────┬────────────────────┤
-  │ Fichier              │ Bugs     │ Sévérité max       │
-  ├──────────────────────┼──────────┼────────────────────┤
-  │ UserService.java     │ 3        │ 🔴 CRITICAL        │
-  │ UserController.java  │ 1        │ 🟠 HIGH            │
-  └──────────────────────┴──────────┴────────────────────┘
-  → Recommandation : corriger les CRITICAL avant le prochain commit.
 """
 from __future__ import annotations
 
@@ -69,17 +58,7 @@ _LEVEL_COLOR = {
 
 
 class GitNotifier:
-    """
-    Affiche les alertes de session dans le terminal.
-
-    Usage :
-        notifier = GitNotifier(print_lock=orchestrator._print_lock)
-        tracker  = GitSessionTracker(..., notifier=notifier)
-
-    Le print_lock évite que les notifications s'entremêlent
-    avec les sorties du mode Watch (solutions, résultats d'analyse...).
-    """
-
+   
     def __init__(self, print_lock: threading.Lock = None):
         # Si aucun lock fourni, on en crée un local (mode standalone)
         self._lock = print_lock or threading.Lock()
@@ -118,7 +97,7 @@ class GitNotifier:
                 print(f"     {_DM}... +{len(file_names)-5} autre(s){_R}")
             print(f"  {_DM}Conseil : le mode watch analyse automatiquement à chaque Ctrl+S.{_R}\n")
 
-    # ── Niveaux de notification ───────────────────────────────────────────────
+    #  Niveaux de notification
 
     def _notify_clean(self, snapshot: "SessionSnapshot") -> None:
         """

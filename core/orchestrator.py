@@ -361,6 +361,8 @@ class Orchestrator:
 
         # ── ÉTAPE 4 : Parsing AST ─────────────────────────────────────────────
         parsed = code_agent.parse(file_path)
+        if isinstance(parsed, str):
+            parsed = {"error": parsed, "entities": [], "imports": []}
         if parsed.get("error"):
             print(f" Erreur parsing : {parsed['error']}\n"); return
         entities = len(parsed.get("entities", []))
@@ -393,6 +395,8 @@ class Orchestrator:
 
         # ── ÉTAPE 6 : Voisinage ───────────────────────────────────────────────
         neighborhood = self._retriever_agent.get_neighborhood(file_path)
+        if isinstance(neighborhood, str):
+            neighborhood = {}
         preds    = neighborhood["predecessors"]
         succs    = neighborhood["successors"]
         indirect = neighborhood["indirect_impacted"]
@@ -410,7 +414,6 @@ class Orchestrator:
 
         # ── ÉTAPE 7 : SystemAwareRAG ──────────────────────────────────────────
         language = code_agent.detect_language(file_path)
-        print(f" RAG System-Aware ({language})...", flush=True)
 
         # Injecter les entités pour detect_patterns (project_indexer prioritaire)
         file_info = {}
@@ -420,10 +423,11 @@ class Orchestrator:
             cached_value = self._project_indexer.context.files.get(str(file_path), {})
             # Defensive: ensure file_info is a dict, not a string (cache corruption)
             file_info = cached_value if isinstance(cached_value, dict) else {}
+        
         neighborhood["_parsed_entities"] = (
             file_info.get("entities", []) or parsed.get("entities", []))
         neighborhood["language"] = language
-
+        
         relevant_docs, rag_scores = self._retriever_agent.retrieve_system_aware(
             current_code      = new_content,
             neighborhood      = neighborhood,
@@ -439,6 +443,8 @@ class Orchestrator:
             project_indexer = self._project_indexer,
             change_info     = change_info,
         )
+        if isinstance(context, str):
+            context = {}
 
         #  ÉTAPE 8.5 : Lire l'ancien résultat (pour le delta)
         previous_analysis = ""
@@ -463,10 +469,11 @@ class Orchestrator:
             print(f"  {_DM}↩  Mode post-solution — block_fix uniquement{_R}", flush=True)
 
         # ── ÉTAPE 9 : LLM ────────────────────────────────────────────────────
-        print(" Analyse LLM (System-Aware)...", flush=True)
         analysis = self._analysis_agent.analyze(
             code=new_content, context=context,
             docs=relevant_docs, scores=rag_scores)
+        if isinstance(analysis, str):
+            analysis = {"analysis": analysis, "relevant_knowledge": [], "validated_blocks": []}
 
         # ── ÉTAPE 10 : Cache ──────────────────────────────────────────────────
         if self._cache:

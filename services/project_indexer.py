@@ -194,12 +194,17 @@ class ProjectIndexer:
         if row is None:
             return False
         try:
+            files_data = json.loads(row[4])
+            # Defensive: ensure files is a dict, not a string (cache corruption)
+            if isinstance(files_data, str):
+                logger.warning("Cache corruption: files_data is a string, resetting")
+                files_data = {}
             self.context = ProjectContext(
                 total_files       = row[0],
                 total_entities    = row[1],
                 languages         = json.loads(row[2]),
                 packages          = json.loads(row[3]),
-                files             = json.loads(row[4]),
+                files             = files_data,
                 architecture_info = json.loads(row[5]),
             )
             print(f" Index chargé depuis cache : {self.context.total_files} fichiers\n")

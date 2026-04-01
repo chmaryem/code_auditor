@@ -25,9 +25,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helper interne
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 def _run_git(args: list, cwd: Path = None) -> Optional[str]:
     """
@@ -56,9 +55,9 @@ def _extract_int(text: str, pattern: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # Fonctions existantes — inchangées
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 def get_changed_files(commit: str = "HEAD", project_path: Path = None) -> List[Dict[str, str]]:
     """
@@ -124,9 +123,9 @@ def is_git_repo(project_path: Path) -> bool:
     return _run_git(["rev-parse", "--git-dir"], cwd=project_path) is not None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # Nouvelles fonctions — Smart Git System
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 def get_uncommitted_files(project_path: Path = None) -> List[Dict[str, str]]:
     """
@@ -137,8 +136,7 @@ def get_uncommitted_files(project_path: Path = None) -> List[Dict[str, str]]:
     elle donne exactement l'ensemble des fichiers "à risque"
     dans la session de développement courante.
 
-    Format retourné :
-        [{"path": "src/UserService.java", "status": "M", "staged": True/False}, ...]
+    
 
     Pourquoi deux git diff ?
       'git diff HEAD'          → fichiers modifiés mais PAS encore stagés

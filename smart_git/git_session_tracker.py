@@ -52,21 +52,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ── Constantes configurables ──────────────────────────────────────────────────
-CHECK_INTERVAL = 180        # secondes entre deux vérifications (3 min)
+
+CHECK_INTERVAL = 180       
 SEVERITY_WEIGHTS = {
     "CRITICAL": 10,
     "HIGH":      3,
     "MEDIUM":    1,
     "LOW":       0,
 }
-TIME_MULTIPLIERS = [        # (minutes_seuil, multiplicateur)
+TIME_MULTIPLIERS = [       
     (120, 2.0),
     (60,  1.5),
     (30,  1.2),
     (0,   1.0),
 ]
-LEVEL_THRESHOLDS = {        # niveau → score minimum
+LEVEL_THRESHOLDS = {      
     "CRITICAL": 35,
     "WARN":     15,
     "WATCH":     1,
@@ -75,9 +75,9 @@ LEVEL_THRESHOLDS = {        # niveau → score minimum
 WATCHED_EXTENSIONS = {".java", ".py", ".ts", ".js", ".tsx", ".jsx"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # Structures de données
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class FileRisk:
@@ -86,7 +86,7 @@ class FileRisk:
     Produit par _assess_file_risk() en croisant git diff + cache SQLite.
     """
     path:          str
-    status:        str            # M / A / D
+    status:        str          
     staged:        bool
     bugs_critical: int = 0
     bugs_high:     int = 0
@@ -158,7 +158,7 @@ class GitSessionTracker:
         self,
         project_path:   Path,
         cache_db:       Path,
-        notifier=None,                  # GitNotifier — injecté pour éviter import circulaire
+        notifier=None,                
         check_interval: int = CHECK_INTERVAL,
     ):
         self.project_path   = project_path
@@ -240,7 +240,7 @@ class GitSessionTracker:
             logger.error("GitSessionTracker._run_check erreur : %s", e)
             return None
 
-    # ── Calcul du score ───────────────────────────────────────────────────────
+    # Calcul du score ───────────────────────────────────────────────────────
 
     def calculate_session_score(self) -> SessionSnapshot:
         """
@@ -268,7 +268,7 @@ class GitSessionTracker:
         uncommitted = [
             f for f in uncommitted
             if Path(f["path"]).suffix.lower() in WATCHED_EXTENSIONS
-            and f["status"] != "D"   # ignorer les fichiers supprimés
+            and f["status"] != "D" 
         ]
 
         # Étape 2 : stats globales de session

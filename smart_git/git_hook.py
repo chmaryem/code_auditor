@@ -1,22 +1,5 @@
 """
 git_hook.py — Pre-commit hook intelligent (Smart Git System).
-
-Différence fondamentale avec l'ancien hook :
-  AVANT : analysait les fichiers stagés avec le LLM à chaque commit
-          → 30-45 secondes de délai, quota Gemini consommé au mauvais moment
-  
-  MAINTENANT : lit le score déjà calculé par GitSessionTracker depuis SQLite
-               → < 1 seconde, 0 appel LLM, résultat toujours disponible
-
-Logique de décision :
-  1. Les fichiers stagés sont-ils dans le cache SQLite ? (analyse Watch disponible)
-  2. Quel est le score de risque pour ces fichiers spécifiquement ?
-  3. Appliquer les règles de commit selon le score.
-
-Règles configurables dans config.py :
-  GIT_HOOK_STRICT_MODE = True   → bloque si score ≥ 35 (CRITICAL)
-  GIT_HOOK_WARN_SCORE  = 15     → avertissement si score ≥ 15 (WARN)
-
 Installation du hook :
   python git/git_hook.py --install --project C:\\monprojet
 
@@ -26,6 +9,7 @@ Désinstallation :
 Contournement (si urgence) :
   git commit --no-verify    → court-circuite le hook (toujours possible)
 """
+
 from __future__ import annotations
 
 import re
@@ -33,19 +17,19 @@ import sqlite3
 import sys
 from pathlib import Path
 
-# Ajouter la racine du projet au sys.path pour les imports
+
 _project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(_project_root))
 
-# ── Constantes ────────────────────────────────────────────────────────────────
-STRICT_MODE     = True    # False → jamais bloquant, warnings seulement
-WARN_THRESHOLD  = 15      # score → avertissement (niveau WARN)
-BLOCK_THRESHOLD = 35      # score → blocage (niveau CRITICAL, strict mode seulement)
+
+STRICT_MODE     = True  
+WARN_THRESHOLD  = 15      
+BLOCK_THRESHOLD = 35     
 
 SEVERITY_WEIGHTS = {"CRITICAL": 10, "HIGH": 3, "MEDIUM": 1, "LOW": 0}
 WATCHED_EXTENSIONS = {".java", ".py", ".ts", ".js", ".tsx", ".jsx"}
 
-# ── Couleurs ANSI ─────────────────────────────────────────────────────────────
+#Couleurs ANSI
 _R  = "\033[0m"
 _B  = "\033[1m"
 _GR = "\033[92m"
@@ -55,24 +39,10 @@ _CY = "\033[96m"
 _DM = "\033[2m"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # Hook principal
-# ─────────────────────────────────────────────────────────────────────────────
-
 def run_pre_commit_hook(project_path: Path) -> int:
-    """
-    Point d'entrée du pre-commit hook.
-
-    Retourne :
-      0 → commit autorisé (propre ou score acceptable)
-      1 → commit BLOQUÉ (mode strict + score CRITICAL)
-
-    La logique est :
-      1. Récupérer les fichiers stagés (git diff --cached)
-      2. Pour chaque fichier, lire l'analyse depuis SQLite
-      3. Calculer le score de risque global
-      4. Afficher le rapport et décider
-    """
+    
     from smart_git.git_diff_parser import get_staged_files, is_git_repo
 
     print(f"\n  {_CY}{_B}Code Auditor — Vérification pre-commit{_R}\n")
@@ -114,10 +84,7 @@ def _read_analyses_from_cache(
     project_path: Path,
     files: list,
 ) -> dict:
-    """
-    Lit les analyses depuis SQLite pour les fichiers stagés.
-    Retourne {file_path_str: analysis_text} — None si absent du cache.
-    """
+   
     result = {}
     if not cache_db.exists():
         return result
@@ -138,12 +105,7 @@ def _read_analyses_from_cache(
 
 
 def _calculate_commit_score(files: list, analyses: dict) -> tuple:
-    """
-    Calcule le score de risque du commit et prépare les rapports par fichier.
-
-    Retourne (score_total, file_reports)
-    file_reports = [{path, bugs_critical, bugs_high, bugs_medium, score, analyzed}, ...]
-    """
+   
     total_score  = 0.0
     file_reports = []
 
@@ -179,15 +141,13 @@ def _render_and_decide(
     code_files: list,
     analyses: dict,
 ) -> int:
-    """
-    Affiche le rapport de commit et retourne le code de sortie (0 ou 1).
-    """
+   
     nb_analyzed    = sum(1 for r in file_reports if r["analyzed"])
     nb_unanalyzed  = len(file_reports) - nb_analyzed
 
     print(f"  {_B}{len(code_files)} fichier(s) analysé(s){_R}  ·  Score de risque : {_B}{score:.0f}{_R}")
 
-    # ── Tableau par fichier ───────────────────────────────────────────────────
+    # Tableau par fichier 
     print(f"  {'─' * 58}")
     print(f"  {'Fichier':<30}  {'C':>3}  {'H':>3}  {'M':>3}  {'Score':>6}")
     print(f"  {'─' * 58}")
@@ -240,9 +200,9 @@ def _render_and_decide(
     return 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # Installation / désinstallation du hook
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 def install_hook(project_path: Path, strict: bool = True) -> None:
     """
@@ -282,9 +242,9 @@ def uninstall_hook(project_path: Path) -> None:
         print(f"  {_DM}Aucun hook Code Auditor trouvé à désinstaller.{_R}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # Point d'entrée CLI
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 if __name__ == "__main__":
     import argparse
