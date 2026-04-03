@@ -18,8 +18,6 @@ from config import config
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # KNOWLEDGE GRAPH — Phase 1
 #
 # Remplace _SECURITY_PATTERNS hardcodé par le KnowledgeGraph.
@@ -32,7 +30,7 @@ logger = logging.getLogger(__name__)
 #         → modifiable via les fichiers .md et PATTERN_TO_KG_NODE
 #         → retourne les NŒUDS KG précis (SQL_Injection, Resource_Leak...)
 #         → ces nœuds seront utilisés pour enrichir les requêtes RAG
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 from services.knowledge_graph import knowledge_graph
 
@@ -45,9 +43,8 @@ def _has_security_patterns(code: str, language: str) -> bool:
     return knowledge_graph.has_pattern(code, language)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CodeRAGSystemAPI
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 class CodeRAGSystemAPI:
 
@@ -57,7 +54,7 @@ class CodeRAGSystemAPI:
         self.llm:          ChatGoogleGenerativeAI | None = None
         self._initialize()
 
-    # ── Initialisation ────────────────────────────────────────────────────────
+    # Initialisation 
 
     def _initialize(self) -> None:
         """Initialise les 3 composants : Embeddings → ChromaDB → Google Gemini."""
@@ -92,7 +89,7 @@ class CodeRAGSystemAPI:
                 "Lancez : python knowledge_loader.py",
                 config.CHROMA_COLLECTION,
             )
-            print("\n⚠️  ATTENTION : Knowledge Base vide !")
+            print("\n  ATTENTION : Knowledge Base vide !")
             print("   Lancez : python knowledge_loader.py")
             print("   (sans ça, le RAG ne trouvera aucune règle)\n")
         elif chunk_count < 50:
@@ -103,7 +100,7 @@ class CodeRAGSystemAPI:
                 "Les règles manuelles sont absentes. Lancez : python knowledge_loader.py",
                 config.CHROMA_COLLECTION, chunk_count,
             )
-            print(f"\n⚠️  KB INCOMPLÈTE : {chunk_count} chunks seulement (normal = 200+)")
+            print(f"\n  KB INCOMPLÈTE : {chunk_count} chunks seulement (normal = 200+)")
             print("   Les règles manuelles sont absentes du vector store.")
             print("   Lancez : python knowledge_loader.py  pour restaurer la KB complète")
             print("   (le système fonctionne mais le RAG sera dégradé)\n")
