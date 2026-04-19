@@ -221,16 +221,25 @@ class GitBranchAnalyzer:
         return fa
 
     def _populate_bugs(self, fa: FileAnalysis, text: str) -> None:
-        """Extrait les compteurs de bugs depuis le texte d'analyse et calcule le score."""
-        fa.bugs_critical = len(re.findall(r"\[CRITICAL\]|severity.*?CRITICAL", text, re.I))
-        fa.bugs_high     = len(re.findall(r"\[HIGH\]|severity.*?HIGH",     text, re.I))
-        fa.bugs_medium   = len(re.findall(r"\[MEDIUM\]|severity.*?MEDIUM", text, re.I))
-        fa.bugs_low      = len(re.findall(r"\[LOW\]|severity.*?LOW",       text, re.I))
-        fa.score = (
-            fa.bugs_critical * SEVERITY_WEIGHTS["CRITICAL"] +
-            fa.bugs_high     * SEVERITY_WEIGHTS["HIGH"]     +
-            fa.bugs_medium   * SEVERITY_WEIGHTS["MEDIUM"]
-        )
+        """
+        Fix 5 — Extraction structurée des compteurs de bugs.
+
+        v1 utilisait re.findall(r"severity.*?CRITICAL") qui comptait aussi
+        les commentaires du LLM ("// CRITICAL: SHA-256 is not suitable").
+        
+        v2 utilise _count_severity_from_blocks() du git_hook.py qui parse
+        uniquement les blocs ---FIX START--- / ---FIX END--- structurés.
+        
+        Fallback : si pas de blocs structurés, compte les patterns
+        [CRITICAL], [HIGH], etc. avec des marqueurs stricts.
+        """
+        from smart_git.git_hook import _count_severity_from_blocks
+
+        c, h, m, score = _count_severity_from_blocks(text)
+        fa.bugs_critical = c
+        fa.bugs_high     = h
+        fa.bugs_medium   = m
+        fa.score = score
 
     # ── Cache SQLite ──────────────────────────────────────────────────────────
 

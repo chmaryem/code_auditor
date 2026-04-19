@@ -332,7 +332,7 @@ class KGBuilder:
                     total, len(context_files))
         return total
 
-    # ── Source 2B : depuis dependency_graph NetworkX ─────────────────────────
+    #  Source 2B : depuis dependency_graph NetworkX
 
     def build_from_dependency_graph(self, nx_graph) -> int:
         """

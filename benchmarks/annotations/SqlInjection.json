@@ -1,0 +1,10 @@
+{
+  "file": "SqlInjection.java",
+  "expected_bugs": [
+    {
+      "pattern": "SqlInjection",
+      "severity": "CRITICAL",
+      "line_contains": "SELECT * FROM users WHERE id ="
+    }
+  ]
+}

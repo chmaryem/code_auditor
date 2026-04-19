@@ -24,11 +24,23 @@ def _detect_optimal_device() -> str:
 
 
 class APIConfig(BaseModel):
+    # ─────────────────────────────────────────────────────────────
+    # Multi-Provider LLM Strategy
+    # Provider 1 (Principal)  — Gemini 2.5 Flash  : quota journalier gratuit
+    # Provider 2 (Fallback 1) — Groq Llama3.3-70B : 12 000 TPM, gratuit
+    # Provider 3 (Fallback 2) — Groq Llama4-Scout : 30 000 TPM, gratuit
+    #
+    # Si quota Gemini 2.5 épuisé, changer 'model' en :
+    #   gemini-2.0-flash        — quota DIFFÉRENT de 2.5, peut fonctionner
+    #   gemini-1.5-flash        — ancien modèle, quota encore différent
+    # ─────────────────────────────────────────────────────────────
     provider:    str   = "google"
     api_key:     str   = os.getenv("GOOGLE_API_KEY", "")
-    model:       str   = "gemini-2.5-flash"
+    model:       str   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     temperature: float = 0.0
-    max_tokens: int = 32768
+    max_tokens:  int   = 32768
+
+
 
 
 class RAGConfig(BaseModel):

@@ -74,6 +74,13 @@ LEVEL_THRESHOLDS = {
 }
 WATCHED_EXTENSIONS = {".java", ".py", ".ts", ".js", ".tsx", ".jsx"}
 
+# FIX 3 — How often (seconds) to re-fire notification if level doesn't drop
+REMINDER_INTERVALS: Dict[str, int] = {
+    "WATCH":    600,   # remind every 10 min if still at WATCH
+    "WARN":     180,   # remind every 3 min  if still at WARN
+    "CRITICAL":  60,   # remind every 1 min  if still at CRITICAL
+}
+
 
 
 # Structures de données
@@ -174,6 +181,10 @@ class GitSessionTracker:
         self._last_snapshot: Optional[SessionSnapshot] = None
         # Dernier niveau notifié (hysteresis)
         self._last_level: str = "CLEAN"
+
+        # FIX 3 — reminder timers
+        self._level_since:         Dict[str, float] = {}
+        self._last_reminder_fired: Dict[str, float] = {}
 
     # ── Interface publique ────────────────────────────────────────────────────
 
@@ -336,19 +347,13 @@ class GitSessionTracker:
 
         risk.has_analysis = True
 
-        # Parser les sévérités depuis le texte d'analyse stocké
-        # L'analyse suit le format : [SÉVÉRITÉ] ... ---FIX START--- ... ---FIX END---
-        risk.bugs_critical = len(re.findall(r"\[CRITICAL\]|severity.*?CRITICAL", analysis_text, re.I))
-        risk.bugs_high     = len(re.findall(r"\[HIGH\]|severity.*?HIGH", analysis_text, re.I))
-        risk.bugs_medium   = len(re.findall(r"\[MEDIUM\]|severity.*?MEDIUM", analysis_text, re.I))
-        risk.bugs_low      = len(re.findall(r"\[LOW\]|severity.*?LOW", analysis_text, re.I))
-
-        # Score brut du fichier (avant facteur temps global)
-        risk.score = (
-            risk.bugs_critical * SEVERITY_WEIGHTS["CRITICAL"] +
-            risk.bugs_high     * SEVERITY_WEIGHTS["HIGH"]     +
-            risk.bugs_medium   * SEVERITY_WEIGHTS["MEDIUM"]
-        )
+        # FIX 1 — Use structured block counting (same as git_hook.py v3)
+        from smart_git.git_hook import _count_severity_from_blocks
+        c, h, m, score = _count_severity_from_blocks(analysis_text)
+        risk.bugs_critical = c
+        risk.bugs_high     = h
+        risk.bugs_medium   = m
+        risk.score         = score
         return risk
 
     def _read_analysis_from_cache(self, file_path: str) -> Optional[str]:
@@ -373,38 +378,60 @@ class GitSessionTracker:
             logger.debug("SQLite read erreur pour %s : %s", file_path, e)
             return None
 
-    #  Notification avec hysteresis
+    #  Notification avec hysteresis + FIX 3 reminder timer
 
     def _maybe_notify(self, snapshot: SessionSnapshot):
         """
-        Notifie le GitNotifier seulement si le niveau a changé de façon significative.
+        Notifie le GitNotifier sur changement de niveau (hysteresis)
+        OU quand le reminder interval expire au même niveau.
 
         Règles d'hysteresis :
-          - Monte de CLEAN → WATCH  : notifier (info)
-          - Monte de WATCH → WARN   : notifier (avertissement)
-          - Monte de WARN  → CRITICAL : notifier (urgent)
-          - Descend                 : notifier seulement si → CLEAN (commit effectué)
-          - Même niveau             : ne pas notifier (évite le spam)
+          - Monte        : notifier toujours
+          - Descend      : notifier seulement si → CLEAN
+          - Même niveau  : fire reminder si interval expiré (FIX 3)
         """
         new_level  = snapshot.level
         prev_level = self._last_level
+        now        = time.time()
 
         levels_order = ["CLEAN", "WATCH", "WARN", "CRITICAL"]
         new_idx  = levels_order.index(new_level)
         prev_idx = levels_order.index(prev_level)
 
-        should_notify = False
+        # Level change logic (original hysteresis)
+        level_changed = False
         if new_idx > prev_idx:
-            should_notify = True   # montée → toujours notifier
+            level_changed = True
         elif new_idx < prev_idx and new_level == "CLEAN":
-            should_notify = True   # retour à CLEAN (commit effectué)
+            level_changed = True
 
-        if should_notify:
+        if level_changed:
             self._last_level = new_level
+            self._level_since[new_level]         = now
+            self._last_reminder_fired[new_level] = now
             try:
                 self._notifier.notify(snapshot)
             except Exception as e:
                 logger.debug("GitNotifier.notify erreur : %s", e)
+            return
+
+        # FIX 3 — Reminder: same level, check if interval expired
+        if new_level in ("WATCH", "WARN", "CRITICAL") and new_level == prev_level:
+            interval   = REMINDER_INTERVALS.get(new_level, 999999)
+            last_fired = self._last_reminder_fired.get(new_level, 0)
+
+            if now - last_fired >= interval:
+                self._last_reminder_fired[new_level] = now
+                entered_at = self._level_since.get(new_level, now)
+                minutes_at_level = int((now - entered_at) / 60)
+
+                try:
+                    self._notifier.notify_reminder(snapshot, minutes_at_level)
+                except AttributeError:
+                    # Fallback if notifier doesn't have notify_reminder
+                    self._notifier.notify(snapshot)
+                except Exception as e:
+                    logger.debug("GitNotifier.notify_reminder erreur : %s", e)
 
     # Accesseurs utiles
 

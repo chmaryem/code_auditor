@@ -1,36 +1,36 @@
 """
-Orchestrator — Chef d'orchestre du projet. Remplace IncrementalAnalyzer.
+Orchestrator — Chef d'orchestre du projet (Architecture Async v2).
 
-Contient le pipeline complet migré depuis incremental_analyzer.py :
-  - initialize()      : construit graphe, KG, indexeur, branche les agents
-  - queue_analysis()  : enfile une analyse (thread-safe)
-  - _worker_loop()    : thread de fond qui consomme la queue
-  - _analyze_file()   : pipeline complet en 11 étapes (System-Aware)
-  - _handle_deletion(): nettoyage quand un fichier est supprimé
-  - stop()            : arrêt propre + statistiques
+Architecture v2 (asyncio) :
+  - L'event loop asyncio tourne dans un thread daemon unique
+  - asyncio.PriorityQueue remplace threading.Queue (FIFO → priorité)
+  - _analyze_file() est une coroutine async (LLM via asyncio.to_thread)
+  - _analyze_dependents() utilise asyncio.gather() pour paralléliser
+  - Debounce coalesce : N événements en <1s → 1 seul batch
+  - Cancellation : si un fichier est re-modifié, l'analyse en cours est annulée
 
-Architecture :
-  Orchestrator appelle les agents dans l'ordre :
-    code_agent       → parse + analyze_change
-    graph_service    → update_graph
-    retriever_agent  → get_neighborhood + retrieve_system_aware
-    analysis_agent   → build_context + analyze (LLM)
-    cache_service    → update
-    console_renderer → print_results
-    learning_agent   → collect_feedback (async)
+L'API publique reste identique :
+  orch = Orchestrator(project_path)
+  orch.initialize()
+  orch.handle(file_changed_event(Path("fichier.py")))
+  orch.stop()
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
-from queue import Empty, Queue
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Délai de coalesce : on attend ce temps après le dernier événement reçu
+# avant de lancer le batch d'analyses.
+_COALESCE_DELAY = 0.8  # secondes
 
 
 class Orchestrator:
@@ -52,39 +52,47 @@ class Orchestrator:
         self._dependency_graph = None
         self._project_indexer  = None
 
-        # Worker
-        self._queue          = Queue()
-        self._worker_thread: Optional[threading.Thread] = None
+        # ── Async infrastructure ──────────────────────────────────────────
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        self._queue: Optional[asyncio.PriorityQueue] = None
         self._is_running     = False
         self._print_lock     = threading.Lock()
+
+        # Cancellation : {file_key: asyncio.Task}
+        self._pending_tasks: Dict[str, asyncio.Task] = {}
+
+        # Debounce : contenu précédent et hashes
         self._last_hash: Dict[str, str] = {}
         self._file_contents: Dict[str, str] = {}
-        # Fichiers en cours d'analyse — évite les doublons dans la queue
-        self._in_progress: Dict[str, float] = {}   # path → timestamp
-        self._in_progress_lock = threading.Lock()
+
         # Fichiers qui ont reçu une solution full_class cette session
-        # Format : {str(file_path): content_hash_de_la_solution}
-        # Quand ce fichier est sauvegardé, on injecte un flag "solution déjà générée"
-        # pour que Gemini ne produise pas une seconde réécriture complète.
         self._solution_applied: Dict[str, str] = {}
 
-        # Nombre max de dépendants analysés après chaque save (évite d'exploser le quota LLM)
+        # Nombre max de dépendants analysés après chaque save
         self._max_deps_per_analysis: int = 2
+
+        # Compteur monotone pour le tri FIFO à priorité égale
+        self._seq = 0
+        self._seq_lock = threading.Lock()
 
         self._stats = {
             "analyzed":      0,
             "skipped_hash":  0,
             "skipped_minor": 0,
+            "cancelled":     0,
             "time_total":    0.0,
             "by_type":       {},
         }
 
-    # Initialisation 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Initialisation
+    # ══════════════════════════════════════════════════════════════════════════
 
     def initialize(self):
         """
         Initialise tous les composants et branche les agents.
-        Migré depuis IncrementalAnalyzer.initialize()
+        Démarre l'event loop asyncio dans un thread daemon.
         """
         from services.cache_service    import CacheService
         from services.graph_service    import dependency_builder
@@ -155,26 +163,35 @@ class Orchestrator:
             logger.debug("LearningAgent non initialisé : %s", e)
         self._learning_agent = learning_agent
 
-        print(" System-Aware RAG + Knowledge Graph + Self-Improving activés\n")
+        print(" System-Aware RAG + Knowledge Graph + Self-Improving activés")
+        print(" Architecture Async activée (asyncio.PriorityQueue)\n")
 
-        # Démarrer le worker
-        self._is_running    = True
-        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-        self._worker_thread.start()
+        # ── Démarrer l'event loop async dans un thread daemon ─────────────
+        self._is_running = True
+        self._loop_thread = threading.Thread(
+            target=self._run_event_loop, daemon=True, name="orch-async-loop"
+        )
+        self._loop_thread.start()
 
-    #Interface publique ────────────────────────────────────────────────────
+        # Attendre que l'event loop soit prête
+        for _ in range(50):  # max 5s
+            if self._loop is not None and self._loop.is_running():
+                break
+            time.sleep(0.1)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Interface publique (thread-safe, synchrone)
+    # ══════════════════════════════════════════════════════════════════════════
 
     def handle(self, event):
-        """Reçoit un Event et l'enfile."""
+        """Reçoit un Event et l'enfile dans la queue async (thread-safe)."""
         from core.events import EventType
         if event.type in (EventType.FILE_CHANGED, EventType.MANUAL_ANALYZE):
-            self.queue_analysis(event.file_path, deleted=False)
+            self.queue_analysis(event.file_path, deleted=False, priority=event.priority)
         elif event.type == EventType.FILE_DELETED:
-            self.queue_analysis(event.file_path, deleted=True)
+            self.queue_analysis(event.file_path, deleted=True, priority=event.priority)
         elif event.type == EventType.GIT_COMMIT:
             for fi in event.payload.get("changed_files", []):
-                # fi peut être un dict {"path": "...", "status": "M"}
-                # ou une string brute selon la source (git_diff_parser vs autre)
                 if isinstance(fi, dict):
                     raw_path = fi.get("path", "")
                     status   = fi.get("status", "M")
@@ -187,40 +204,70 @@ class Orchestrator:
                 if not raw_path or status == "D":
                     continue
 
-                # Résoudre le chemin relatif → absolu si nécessaire
                 p = Path(raw_path)
                 if not p.is_absolute():
                     p = event.payload.get("repo_path", Path(".")) / p
                 if p.exists():
-                    self.queue_analysis(p, deleted=False)
+                    self.queue_analysis(p, deleted=False, priority=event.priority)
 
-    def queue_analysis(self, file_path: Path, deleted: bool = False):
-        if deleted:
-            self._queue.put({"file_path": file_path, "deleted": True})
+    def queue_analysis(self, file_path: Path, deleted: bool = False,
+                       priority: int = 50):
+        """
+        Poste un événement dans la queue async (thread-safe).
+        Annule l'analyse en cours pour ce fichier si elle existe.
+        """
+        if not self._loop or not self._loop.is_running():
+            logger.warning("Event loop non démarrée — événement ignoré : %s", file_path)
             return
-        # Bloquer si ce fichier est déjà dans la queue ou en cours d'analyse
+
         file_key = str(file_path)
-        with self._in_progress_lock:
-            now  = time.time()
-            last = self._in_progress.get(file_key, 0)
-            if now - last < 2.0:
-                logger.debug("Doublon ignoré (%dms) : %s",
-                             int((now - last) * 1000), file_path.name)
-                return
-            if self._cache and not self._cache.has_file_changed(file_path):
-                return
-            self._in_progress[file_key] = now
-        self._queue.put({"file_path": file_path, "deleted": False})
+
+        # ── Cancellation : annuler l'analyse en cours pour ce fichier ─────
+        if file_key in self._pending_tasks:
+            old_task = self._pending_tasks[file_key]
+            if not old_task.done():
+                self._loop.call_soon_threadsafe(old_task.cancel)
+                self._stats["cancelled"] += 1
+                logger.info("Analyse annulée (nouveau changement) : %s", file_path.name)
+
+        # ── Compteur FIFO pour l'ordre à priorité égale ───────────────────
+        with self._seq_lock:
+            seq = self._seq
+            self._seq += 1
+
+        # ── Enqueue thread-safe ───────────────────────────────────────────
+        task_item = {
+            "file_path": file_path,
+            "deleted": deleted,
+        }
+
+        def _put():
+            if self._queue is not None:
+                self._queue.put_nowait((priority, seq, task_item))
+
+        self._loop.call_soon_threadsafe(_put)
 
     def stop(self):
+        """Arrêt propre : annule les tâches, arrête l'event loop, affiche les stats."""
         print("\n Arrêt...")
         self._is_running = False
-        if self._worker_thread:
-            self._worker_thread.join(timeout=5)
+
+        # Annuler toutes les tâches async en cours
+        if self._loop and self._loop.is_running():
+            for file_key, task in list(self._pending_tasks.items()):
+                if not task.done():
+                    self._loop.call_soon_threadsafe(task.cancel)
+
+            # Arrêter l'event loop
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
+        if self._loop_thread:
+            self._loop_thread.join(timeout=5)
+
         if self._cache:
             self._cache.save()
 
-        # LearningAgent.stop() déclenche flush_session() → bilan KB affiché ici
+        # LearningAgent.stop() déclenche flush_session()
         if hasattr(self, "_learning_agent"):
             self._learning_agent.stop()
 
@@ -228,6 +275,7 @@ class Orchestrator:
         print(f"   Analysés      : {self._stats['analyzed']}")
         print(f"   Ignorés hash  : {self._stats['skipped_hash']}")
         print(f"   Ignorés mineur: {self._stats['skipped_minor']}")
+        print(f"   Annulés       : {self._stats['cancelled']}")
         if self._stats["analyzed"] > 0:
             avg = self._stats["time_total"] / self._stats["analyzed"]
             print(f"   Temps moyen   : {avg:.1f}s")
@@ -239,49 +287,103 @@ class Orchestrator:
             if total_kb:
                 print(f"   KB enrichie   : {total_kb} règle(s) cette session")
 
-    # ── Worker ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Event Loop (thread daemon)
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def _worker_loop(self):
-        while self._is_running:
-            task = None
+    def _run_event_loop(self):
+        """Crée et démarre l'event loop asyncio dans ce thread."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._queue = asyncio.PriorityQueue()
+
+        try:
+            self._loop.run_until_complete(self._async_worker())
+        except Exception as e:
+            if self._is_running:
+                logger.error("Event loop crash : %s", e)
+        finally:
+            # Nettoyage
             try:
-                task = self._queue.get(timeout=1)
-
-                # Garde défensive — une string peut arriver si un composant externe
-                # (ex: GitSessionTracker) enfile directement dans la queue.
-                if not isinstance(task, dict):
-                    logger.warning(
-                        "Worker : tâche ignorée (type inattendu %s : %r)",
-                        type(task).__name__, str(task)[:80],
+                pending = asyncio.all_tasks(self._loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
                     )
-                    self._queue.task_done()
-                    continue
+            except Exception:
+                pass
+            self._loop.close()
 
-                file_path = task.get("file_path")
-                if file_path is None:
-                    logger.warning("Worker : tâche sans file_path ignorée : %r", task)
-                    self._queue.task_done()
-                    continue
+    async def _async_worker(self):
+        """
+        Worker async principal avec debounce coalesce.
+
+        Stratégie :
+          1. Attendre le premier événement de la queue
+          2. Après réception, attendre _COALESCE_DELAY pour collecter les suivants
+          3. Dédupliquer par fichier (le dernier événement gagne)
+          4. Lancer les analyses en parallèle via asyncio.create_task()
+        """
+        while self._is_running:
+            # ── Étape 1 : Attendre le premier événement ───────────────────
+            batch: Dict[str, dict] = {}
+            try:
+                priority, seq, task = await asyncio.wait_for(
+                    self._queue.get(), timeout=1.0
+                )
+                file_key = str(task["file_path"])
+                batch[file_key] = task
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+            # ── Étape 2 : Coalesce — collecter les événements suivants ────
+            await asyncio.sleep(_COALESCE_DELAY)
+
+            while not self._queue.empty():
+                try:
+                    p, s, extra_task = self._queue.get_nowait()
+                    extra_key = str(extra_task["file_path"])
+                    batch[extra_key] = extra_task  # Le dernier gagne
+                except asyncio.QueueEmpty:
+                    break
+
+            # ── Étape 3 : Traiter le batch ────────────────────────────────
+            if len(batch) > 1:
+                logger.info("Coalesce : %d fichier(s) dans ce batch", len(batch))
+
+            for file_key, task in batch.items():
+                if not self._is_running:
+                    break
+
+                file_path = task["file_path"]
 
                 if task.get("deleted"):
                     self._handle_deletion(file_path)
                 else:
-                    self._analyze_file(file_path)
+                    # Vérifier le cache avant de lancer l'analyse
+                    if self._cache and not self._cache.has_file_changed(file_path):
+                        self._stats["skipped_hash"] += 1
+                        continue
 
-                self._queue.task_done()
+                    # Annuler l'ancienne tâche si elle existe
+                    if file_key in self._pending_tasks:
+                        old = self._pending_tasks[file_key]
+                        if not old.done():
+                            old.cancel()
+                            self._stats["cancelled"] += 1
 
-            except Empty:
-                pass
-            except Exception as e:
-                logger.error("Worker erreur : %s", e)
-                # Libérer la tâche pour éviter de bloquer queue.join()
-                if task is not None:
-                    try:
-                        self._queue.task_done()
-                    except Exception:
-                        pass
+                    # Lancer la nouvelle analyse comme tâche async
+                    coro = self._analyze_file(file_path)
+                    t = asyncio.create_task(coro, name=f"analyze:{file_path.name}")
+                    self._pending_tasks[file_key] = t
 
-    # ── Suppression ───────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Suppression
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _handle_deletion(self, file_path: Path):
         print(f"\n {file_path.name} supprimé")
@@ -294,56 +396,47 @@ class Orchestrator:
             self._cache.save()
         print()
 
-    # ── Pipeline principal (11 étapes) ────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Pipeline principal (async) — 11 étapes
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def _analyze_file(self, file_path: Path):
+    async def _analyze_file(self, file_path: Path):
         """
-        Pipeline System-Aware complet — migré depuis IncrementalAnalyzer._analyze_file()
+        Pipeline System-Aware complet — version async.
 
-        Étape 1  : Hash check         → ignore si fichier inchangé
-        Étape 2  : Lecture            → contenu brut
-        Étape 3  : ChangeAnalyzer     → filtre changements mineurs (RAS, 0 token)
-        Étape 4  : Parsing AST        → code_agent.parse()
-        Étape 4.5: ProjectCodeIndexer → mise à jour non-bloquante (timeout 4s)
-        Étape 4.6: KG update          → mise à jour incrémentale
-        Étape 5  : update_graph       → graph_service.update_graph()
-        Étape 6  : Voisinage          → retriever_agent.get_neighborhood()
-        Étape 7  : SystemAwareRAG     → retriever_agent.retrieve_system_aware()
-        Étape 8  : Contexte           → analysis_agent.build_context()
-        Étape 9  : LLM                → analysis_agent.analyze()
-        Étape 10 : Cache + affichage
-        Étape 11 : Feedback           → learning_agent.collect_feedback()
+        Les étapes CPU-bound (hash, lecture, parsing) restent synchrones (rapides).
+        Les étapes I/O-bound (LLM, RAG reranker) sont wrappées dans asyncio.to_thread().
         """
         from agents.code_agent     import code_agent
         from agents.analysis_agent import build_context
         from services.graph_service import update_graph
         from services.knowledge_graph import knowledge_graph
-        from output.console_renderer import print_results, print_minor_change, parse_fix_blocks, print_targeted_methods, print_solution, _GR, _R, _CY, _DM
+        from output.console_renderer import (
+            print_results, print_minor_change, parse_fix_blocks,
+            print_targeted_methods, print_solution, _GR, _R, _CY, _DM
+        )
 
         start = time.time()
+        file_key = str(file_path)
+
         print(f"\n{'─'*70}")
         print(f" {file_path.name}")
 
-        # ── ÉTAPE 1 : Hash check ──────────────────────────────────────────────
+        # ── ÉTAPE 1 : Hash check ──────────────────────────────────────────
         if self._cache and not self._cache.has_file_changed(file_path):
             print("  Ignoré : Hash identique\n")
             self._stats["skipped_hash"] += 1
             return
 
-        # ── ÉTAPE 2 : Lecture ─────────────────────────────────────────────────
+        # ── ÉTAPE 2 : Lecture ─────────────────────────────────────────────
         try:
             new_content = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
             print(f" Erreur lecture : {e}\n")
-            with self._in_progress_lock:
-                self._in_progress.pop(str(file_path), None)
             return
 
-        # file_key défini ici — utilisé dans étape 8.6, affichage et cache
-        file_key = str(file_path)
-
-        # ── ÉTAPE 3 : Filtre intelligent — changements mineurs ────────────────
-        old_content = self._file_contents.get(str(file_path), "")
+        # ── ÉTAPE 3 : Filtre intelligent — changements mineurs ────────────
+        old_content = self._file_contents.get(file_key, "")
         change_info = code_agent.analyze_change(old_content, new_content)
         print(f" {change_info['reason']} (score: {change_info['score']}/100)")
 
@@ -355,15 +448,16 @@ class Orchestrator:
             if self._cache:
                 self._cache.update_file_cache(
                     file_path, {"analysis": "RAS — changement mineur", "relevant_knowledge": []}, [], [])
-            self._file_contents[str(file_path)] = new_content
-            with self._in_progress_lock:
-                self._in_progress.pop(str(file_path), None)
+            self._file_contents[file_key] = new_content
             return
 
         print(" Analyse System-Aware lancée...")
 
-        # ── ÉTAPE 4 : Parsing AST ─────────────────────────────────────────────
-        parsed = code_agent.parse(file_path)
+        # ── Checkpoint cancellation ───────────────────────────────────────
+        await asyncio.sleep(0)  # Yield pour vérifier si la tâche est annulée
+
+        # ── ÉTAPE 4 : Parsing AST ─────────────────────────────────────────
+        parsed = await asyncio.to_thread(code_agent.parse, file_path)
         if isinstance(parsed, str):
             parsed = {"error": parsed, "entities": [], "imports": []}
         if parsed.get("error"):
@@ -372,32 +466,40 @@ class Orchestrator:
         imports  = len(parsed.get("imports",  []))
         print(f"   • {entities} entité(s), {imports} import(s)")
 
-        # ── ÉTAPE 4.5 : ProjectCodeIndexer (non-bloquant, timeout 4s) ────────
+        # ── ÉTAPE 4.5 : ProjectCodeIndexer (non-bloquant, timeout 4s) ────
         if self._project_code_indexer:
-            ex = ThreadPoolExecutor(max_workers=1)
             try:
-                future = ex.submit(self._project_code_indexer.index_file,
-                                   file_path, new_content, parsed.get("entities", []))
-                future.result(timeout=4)
-            except FuturesTimeout:
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._project_code_indexer.index_file,
+                        file_path, new_content, parsed.get("entities", [])
+                    ),
+                    timeout=4.0,
+                )
+            except asyncio.TimeoutError:
                 logger.debug("ProjectCodeIndexer timeout — pipeline non bloqué")
             except Exception as e:
                 logger.debug("ProjectCodeIndexer ignoré pour %s : %s", file_path.name, e)
-            finally:
-                ex.shutdown(wait=False)
 
-        # ── ÉTAPE 4.6 : KG update incrémental ────────────────────────────────
+        # ── ÉTAPE 4.6 : KG update incrémental ────────────────────────────
         try:
-            knowledge_graph.update_file(
-                file_path=file_path, project_indexer=self._project_indexer, llm=None)
+            await asyncio.to_thread(
+                knowledge_graph.update_file,
+                file_path=file_path, project_indexer=self._project_indexer, llm=None
+            )
         except Exception as e:
             logger.debug("KG update_file ignoré pour %s : %s", file_path.name, e)
 
-        # ── ÉTAPE 5 : Mise à jour graphe NetworkX ─────────────────────────────
+        # ── ÉTAPE 5 : Mise à jour graphe NetworkX ─────────────────────────
         update_graph(self._dependency_graph, file_path, parsed)
 
-        # ── ÉTAPE 6 : Voisinage ───────────────────────────────────────────────
-        neighborhood = self._retriever_agent.get_neighborhood(file_path)
+        # ── Checkpoint cancellation ───────────────────────────────────────
+        await asyncio.sleep(0)
+
+        # ── ÉTAPE 6 : Voisinage ───────────────────────────────────────────
+        neighborhood = await asyncio.to_thread(
+            self._retriever_agent.get_neighborhood, file_path
+        )
         if isinstance(neighborhood, str):
             neighborhood = {}
         preds    = neighborhood["predecessors"]
@@ -415,23 +517,26 @@ class Orchestrator:
             print(f" 📡 Impact indirect : {len(indirect)} fichier(s)")
         print(f"{'🔴' if crit > 5 else '🟡' if crit > 0 else '🟢'} Criticité : {crit}")
 
-        # ── ÉTAPE 7 : SystemAwareRAG ──────────────────────────────────────────
+        # ── ÉTAPE 7 : SystemAwareRAG ──────────────────────────────────────
         language = code_agent.detect_language(file_path)
 
-        # Injecter les entités pour detect_patterns (project_indexer prioritaire)
         file_info = {}
         if (self._project_indexer and self._project_indexer.context and
             hasattr(self._project_indexer.context, 'files') and
             isinstance(self._project_indexer.context.files, dict)):
             cached_value = self._project_indexer.context.files.get(str(file_path), {})
-            # Defensive: ensure file_info is a dict, not a string (cache corruption)
             file_info = cached_value if isinstance(cached_value, dict) else {}
-        
+
         neighborhood["_parsed_entities"] = (
             file_info.get("entities", []) or parsed.get("entities", []))
         neighborhood["language"] = language
-        
-        relevant_docs, rag_scores = self._retriever_agent.retrieve_system_aware(
+
+        # ── Checkpoint cancellation ───────────────────────────────────────
+        await asyncio.sleep(0)
+
+        # RAG retrieval (I/O-bound : reranker CPU + ChromaDB)
+        relevant_docs, rag_scores = await asyncio.to_thread(
+            self._retriever_agent.retrieve_system_aware,
             current_code      = new_content,
             neighborhood      = neighborhood,
             current_file_name = file_path.name,
@@ -439,7 +544,7 @@ class Orchestrator:
         )
         print(f"   • {len(relevant_docs)} chunk(s) RAG (KB rules + project code)")
 
-        #  ÉTAPE 8 : Contexte enrichi 
+        # ── ÉTAPE 8 : Contexte enrichi ────────────────────────────────────
         context = build_context(
             file_path       = file_path,
             neighborhood    = neighborhood,
@@ -449,17 +554,14 @@ class Orchestrator:
         if isinstance(context, str):
             context = {}
 
-        #  ÉTAPE 8.5 : Lire l'ancien résultat (pour le delta)
+        # ── ÉTAPE 8.5 : Lire l'ancien résultat (pour le delta) ───────────
         previous_analysis = ""
         if self._cache:
             cached = self._cache.get_cached_analysis(file_path)
             if cached and cached.get("analysis"):
                 previous_analysis = cached["analysis"]
 
-        # ── ÉTAPE 8.6 : Injecter flag post-solution si ce fichier en a eu une ──
-        # Si une solution full_class a été générée pour ce fichier dans cette session,
-        # on force Gemini à ne faire que des block_fix résiduels — pas de nouvelle
-        # réécriture complète qui créerait une boucle infinie.
+        # ── ÉTAPE 8.6 : Flag post-solution ────────────────────────────────
         if file_key in self._solution_applied:
             context["post_solution_mode"] = True
             context["post_solution_hint"] = (
@@ -471,22 +573,27 @@ class Orchestrator:
             )
             print(f"  {_DM}↩  Mode post-solution — block_fix uniquement{_R}", flush=True)
 
-        # ── ÉTAPE 9 : LLM ────────────────────────────────────────────────────
-        analysis = self._analysis_agent.analyze(
+        # ── Checkpoint cancellation ───────────────────────────────────────
+        await asyncio.sleep(0)
+
+        # ── ÉTAPE 9 : LLM (le plus long — wrappé dans to_thread) ─────────
+        analysis = await asyncio.to_thread(
+            self._analysis_agent.analyze,
             code=new_content, context=context,
-            docs=relevant_docs, scores=rag_scores)
+            docs=relevant_docs, scores=rag_scores
+        )
         if isinstance(analysis, str):
             analysis = {"analysis": analysis, "relevant_knowledge": [], "validated_blocks": []}
 
-        # ── ÉTAPE 10 : Cache ──────────────────────────────────────────────────
+        # ── ÉTAPE 10 : Cache ──────────────────────────────────────────────
         if self._cache:
             self._cache.update_file_cache(
                 file_path, analysis,
                 context.get("dependencies", []),
                 context.get("dependents",   []))
-        self._file_contents[str(file_path)] = new_content
+        self._file_contents[file_key] = new_content
 
-        # ── Affichage ─────────────────────────────────────────────────────────
+        # ── Affichage ─────────────────────────────────────────────────────
         elapsed     = time.time() - start
         result_text = analysis["analysis"]
         result_hash = hashlib.md5(result_text.encode("utf-8", errors="replace")).hexdigest()
@@ -500,34 +607,30 @@ class Orchestrator:
             return  # même résultat déjà affiché (watchdog double-fire)
         self._last_hash[file_key] = result_hash
 
-        # Parser la réponse agentique : Gemini a décidé la stratégie
+        # Parser la réponse agentique : stratégie décidée par Gemini
         from agents.analysis_agent import parse_llm_response
-        parsed = parse_llm_response(result_text)
-        strategy = parsed["strategy"]
+        parsed_resp = parse_llm_response(result_text)
+        strategy = parsed_resp["strategy"]
 
         with self._print_lock:
             if strategy == "full_class":
-                print(f"  Strategy : {_CY}full_class{_R} — {parsed['reason'][:80]}")
+                print(f"  Strategy : {_CY}full_class{_R} — {parsed_resp['reason'][:80]}")
                 print_solution(
                     solution_text = result_text,
                     file_name     = file_path.name,
-                    changes       = parsed["payload"].get("changes", []),
+                    changes       = parsed_resp["payload"].get("changes", []),
                     language      = language,
                     elapsed       = elapsed,
                     analyzed_count= self._stats["analyzed"],
                     score         = change_info["score"],
                     impacted      = preds,
                 )
-                # Mémoriser que ce fichier vient de recevoir une solution complète.
-                # Le prochain save déclenchera une analyse en mode "post-solution"
-                # (block_fix seulement, pas de nouvelle réécriture complète).
-                code_block = parsed["payload"].get("class_code", "")
+                code_block = parsed_resp["payload"].get("class_code", "")
                 if code_block:
                     self._solution_applied[file_key] = hashlib.md5(
                         code_block.encode("utf-8", errors="replace")
                     ).hexdigest()
-                # Afficher aussi les blocs fix s'il y en a dans la réponse
-                remaining = parsed["payload"].get("remaining_blocks", [])
+                remaining = parsed_resp["payload"].get("remaining_blocks", [])
                 if remaining:
                     print_results(
                         text=result_text, file_name=file_path.name,
@@ -538,12 +641,12 @@ class Orchestrator:
                     )
 
             elif strategy == "targeted_methods":
-                methods = parsed["payload"].get("methods", [])
-                print(f"  Strategy : {_CY}targeted_methods{_R} ({len(methods)} méthode(s)) — {parsed['reason'][:80]}")
+                methods = parsed_resp["payload"].get("methods", [])
+                print(f"  Strategy : {_CY}targeted_methods{_R} ({len(methods)} méthode(s)) — {parsed_resp['reason'][:80]}")
                 print_targeted_methods(
                     methods    = methods,
                     file_name  = file_path.name,
-                    remaining  = parsed["payload"].get("remaining_blocks", []),
+                    remaining  = parsed_resp["payload"].get("remaining_blocks", []),
                     elapsed    = elapsed,
                     analyzed_count = self._stats["analyzed"],
                     score      = change_info["score"],
@@ -552,7 +655,7 @@ class Orchestrator:
                 )
 
             else:  # block_fix
-                print(f"  Strategy : {_CY}block_fix{_R} — {parsed['reason'][:80]}" if parsed['reason'] else "")
+                print(f"  Strategy : {_CY}block_fix{_R} — {parsed_resp['reason'][:80]}" if parsed_resp['reason'] else "")
                 print_results(
                     text=result_text, file_name=file_path.name,
                     context=context, elapsed=elapsed,
@@ -561,10 +664,10 @@ class Orchestrator:
                     previous_analysis=previous_analysis,
                 )
 
-        # ── ÉTAPE 11 : Self-Improving RAG ────────────────────────────────────
+        # ── ÉTAPE 11 : Self-Improving RAG ────────────────────────────────
         fix_blocks = parse_fix_blocks(result_text)
 
-        # Mémoire épisodique — enregistrer chaque pattern détecté
+        # Mémoire épisodique
         if fix_blocks and self._cache:
             session_id = getattr(self, "_session_id", None)
             for block in fix_blocks:
@@ -582,7 +685,7 @@ class Orchestrator:
                 except Exception as e:
                     logger.debug("record_pattern erreur : %s", e)
 
-        # Afficher les patterns récurrents si pertinent
+        # Patterns récurrents
         if self._cache:
             try:
                 recurring = self._cache.get_recurring_patterns(
@@ -593,7 +696,7 @@ class Orchestrator:
             except Exception as e:
                 logger.debug("get_recurring_patterns erreur : %s", e)
 
-        # LearningAgent — auto-amélioration KB (non-bloquant)
+        # LearningAgent (non-bloquant)
         if hasattr(self, "_learning_agent") and self._learning_agent:
             if fix_blocks:
                 try:
@@ -608,25 +711,23 @@ class Orchestrator:
                 except Exception as e:
                     logger.debug("Feedback Loop erreur : %s", e)
 
-        # ── ÉTAPE 12 : Analyse proactive des fichiers dépendants ──────────────
-        # On analyse directement les dépendants avec le contexte du changement,
-        # sans attendre que le LLM génère des FIX pour eux (approche passive).
-        # Cela couvre aussi le mode full_class où aucun bloc FIX n'est émis.
+        # ── ÉTAPE 12 : Analyse proactive des dépendants (async) ───────────
         if preds and not context.get("post_solution_mode"):
-            self._analyze_dependents(
+            await self._analyze_dependents(
                 dependents        = preds,
                 changed_file_name = file_path.name,
                 change_summary    = result_text[:1500],
                 language          = language,
             )
 
-        # Libérer le verrou — ce fichier peut maintenant être re-analysé
-        with self._in_progress_lock:
-            self._in_progress.pop(str(file_path), None)
+        # Nettoyage de la tâche
+        self._pending_tasks.pop(file_key, None)
 
-    # ── Analyse proactive des dépendants ──────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Analyse proactive des dépendants (async + gather)
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def _analyze_dependents(
+    async def _analyze_dependents(
         self,
         dependents:        List[str],
         changed_file_name: str,
@@ -634,155 +735,162 @@ class Orchestrator:
         language:          str,
     ) -> None:
         """
-        Analyse les fichiers qui dépendent du fichier qui vient d'être modifié.
-
-        Pourquoi on contourne has_file_changed() ici ?
-        Les dépendants n'ont PAS changé sur disque, donc le filtre de hash les bloque.
-        Mais leur COMPATIBILITÉ peut avoir changé suite au fix du fichier principal.
-        On force l'analyse en leur injectant le contexte du changement upstream.
-
-        Cette méthode est intentionnellement synchrone et bloquante pour que
-        les résultats apparaissent dans le terminal juste après l'analyse principale.
-        Elle est limitée à self._max_deps_per_analysis pour préserver le quota LLM.
+        Analyse les dépendants en parallèle via asyncio.gather().
+        Chaque dépendant est traité comme une coroutine indépendante.
         """
-        from agents.code_agent     import code_agent
-        from agents.analysis_agent import build_context
-        from output.console_renderer import print_results, parse_fix_blocks, _CY, _R, _DM
-
-        analyzed_count = 0
-
+        tasks = []
         for dep_path_str in dependents[:self._max_deps_per_analysis]:
             dep_path = Path(dep_path_str)
             if not dep_path.exists():
                 continue
-
-            dep_key = str(dep_path)
-
-            # Éviter de ré-analyser si déjà en cours (délai plus long que pour les saves normaux)
-            with self._in_progress_lock:
-                now  = time.time()
-                last = self._in_progress.get(dep_key, 0)
-                if now - last < 10.0:
-                    logger.debug("Dépendant ignoré (en cours) : %s", dep_path.name)
-                    continue
-                self._in_progress[dep_key] = now
-
-            try:
-                dep_content = dep_path.read_text(encoding="utf-8", errors="replace")
-            except Exception as e:
-                logger.debug("Lecture dépendant %s : %s", dep_path.name, e)
-                with self._in_progress_lock:
-                    self._in_progress.pop(dep_key, None)
-                continue
-
-            print(f"\n{'─'*70}")
-            print(f" 🔗 Dépendant : {dep_path.name}  ← {changed_file_name} vient de changer")
-
-            # Parsing
-            parsed_dep = code_agent.parse(dep_path)
-            if isinstance(parsed_dep, str):
-                parsed_dep = {"entities": [], "imports": []}
-            if parsed_dep.get("error"):
-                logger.debug("Parsing dépendant %s : %s", dep_path.name, parsed_dep["error"])
-                with self._in_progress_lock:
-                    self._in_progress.pop(dep_key, None)
-                continue
-
-            # Voisinage + RAG
-            neighborhood_dep = self._retriever_agent.get_neighborhood(dep_path)
-            if isinstance(neighborhood_dep, str):
-                neighborhood_dep = {}
-            dep_lang = code_agent.detect_language(dep_path)
-            neighborhood_dep["language"] = dep_lang
-            neighborhood_dep["_parsed_entities"] = parsed_dep.get("entities", [])
-
-            relevant_docs, rag_scores = self._retriever_agent.retrieve_system_aware(
-                current_code      = dep_content,
-                neighborhood      = neighborhood_dep,
-                current_file_name = dep_path.name,
-                networkx_graph    = self._dependency_graph,
-            )
-
-            # Contexte enrichi avec info sur le changement upstream
-            context_dep = build_context(
-                file_path       = dep_path,
-                neighborhood    = neighborhood_dep,
-                project_indexer = self._project_indexer,
-            )
-            if isinstance(context_dep, str):
-                context_dep = {}
-
-            context_dep["upstream_change"] = (
-                f"IMPORTANT: {changed_file_name} was just refactored. "
-                f"Verify that THIS file still compiles and works correctly with it.\n"
-                f"Summary of changes in {changed_file_name}:\n{change_summary[:800]}"
-            )
-            # Bloquer full_class sur les dépendants — on cherche seulement les incompatibilités
-            context_dep["post_solution_mode"] = True
-            context_dep["post_solution_hint"] = (
-                f"{changed_file_name} was refactored. Check for: broken imports, "
-                f"wrong method calls, signature mismatches, compilation errors caused "
-                f"by the upstream change. Use block_fix only. "
-                f"If everything is compatible, say so clearly with 0 fix blocks."
-            )
-
-            print(f"  {_DM}↩  Mode compatibilité — vérifie l'impact de {changed_file_name}{_R}")
-
-            # Analyse LLM
-            try:
-                analysis_dep = self._analysis_agent.analyze(
-                    code    = dep_content,
-                    context = context_dep,
-                    docs    = relevant_docs,
-                    scores  = rag_scores,
+            tasks.append(
+                self._analyze_single_dependent(
+                    dep_path, changed_file_name, change_summary, language
                 )
-            except Exception as e:
-                logger.error("Analyse dépendant %s : %s", dep_path.name, e)
-                with self._in_progress_lock:
-                    self._in_progress.pop(dep_key, None)
-                continue
+            )
 
-            if isinstance(analysis_dep, str):
-                analysis_dep = {"analysis": analysis_dep, "relevant_knowledge": [], "validated_blocks": []}
+        if not tasks:
+            return
 
-            result_text_dep = analysis_dep.get("analysis", "")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Cache — le pre-commit hook lira ce résultat
-            if self._cache:
-                self._cache.update_file_cache(dep_path, analysis_dep, [], [])
-
-            # Affichage
-            with self._print_lock:
-                print_results(
-                    text           = result_text_dep,
-                    file_name      = dep_path.name,
-                    context        = context_dep,
-                    elapsed        = 0.0,
-                    analyzed_count = self._stats["analyzed"],
-                    score          = 0,
-                    impacted       = [],
-                )
-
-            # Self-Improving RAG pour le dépendant aussi
-            fix_blocks_dep = parse_fix_blocks(result_text_dep)
-            if fix_blocks_dep and hasattr(self, "_learning_agent") and self._learning_agent:
-                try:
-                    self._learning_agent.collect_feedback(
-                        blocks      = fix_blocks_dep,
-                        code_before = dep_content,
-                        language    = dep_lang,
-                        file_name   = dep_path.name,
-                    )
-                except Exception as e:
-                    logger.debug("Feedback dépendant %s : %s", dep_path.name, e)
-
-            analyzed_count += 1
-
-            with self._in_progress_lock:
-                self._in_progress.pop(dep_key, None)
+        analyzed_count = sum(1 for r in results if r is True)
+        for r in results:
+            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                logger.error("Erreur analyse dépendant : %s", r)
 
         if analyzed_count > 0:
             print(f"\n  ✓ {analyzed_count} dépendant(s) analysé(s) suite au changement de {changed_file_name}\n")
+
+    async def _analyze_single_dependent(
+        self,
+        dep_path:          Path,
+        changed_file_name: str,
+        change_summary:    str,
+        language:          str,
+    ) -> bool:
+        """Analyse un seul dépendant. Retourne True si l'analyse a réussi."""
+        from agents.code_agent     import code_agent
+        from agents.analysis_agent import build_context
+        from output.console_renderer import print_results, parse_fix_blocks, _CY, _R, _DM
+
+        try:
+            dep_content = dep_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.debug("Lecture dépendant %s : %s", dep_path.name, e)
+            return False
+
+        print(f"\n{'─'*70}")
+        print(f" 🔗 Dépendant : {dep_path.name}  ← {changed_file_name} vient de changer")
+
+        # Parsing
+        parsed_dep = await asyncio.to_thread(code_agent.parse, dep_path)
+        if isinstance(parsed_dep, str):
+            parsed_dep = {"entities": [], "imports": []}
+        if parsed_dep.get("error"):
+            logger.debug("Parsing dépendant %s : %s", dep_path.name, parsed_dep["error"])
+            return False
+
+        # Voisinage + RAG
+        neighborhood_dep = await asyncio.to_thread(
+            self._retriever_agent.get_neighborhood, dep_path
+        )
+        if isinstance(neighborhood_dep, str):
+            neighborhood_dep = {}
+        dep_lang = code_agent.detect_language(dep_path)
+        neighborhood_dep["language"] = dep_lang
+        neighborhood_dep["_parsed_entities"] = parsed_dep.get("entities", [])
+
+        # Checkpoint cancellation
+        await asyncio.sleep(0)
+
+        relevant_docs, rag_scores = await asyncio.to_thread(
+            self._retriever_agent.retrieve_system_aware,
+            current_code      = dep_content,
+            neighborhood      = neighborhood_dep,
+            current_file_name = dep_path.name,
+            networkx_graph    = self._dependency_graph,
+        )
+
+        # Contexte enrichi avec info upstream
+        context_dep = build_context(
+            file_path       = dep_path,
+            neighborhood    = neighborhood_dep,
+            project_indexer = self._project_indexer,
+        )
+        if isinstance(context_dep, str):
+            context_dep = {}
+
+        context_dep["upstream_change"] = (
+            f"IMPORTANT: {changed_file_name} was just refactored. "
+            f"Verify that THIS file still compiles and works correctly with it.\n"
+            f"Summary of changes in {changed_file_name}:\n{change_summary[:800]}"
+        )
+        context_dep["post_solution_mode"] = True
+        context_dep["post_solution_hint"] = (
+            f"{changed_file_name} was refactored. Check for: broken imports, "
+            f"wrong method calls, signature mismatches, compilation errors caused "
+            f"by the upstream change. Use block_fix only. "
+            f"If everything is compatible, say so clearly with 0 fix blocks."
+        )
+
+        print(f"  {_DM}↩  Mode compatibilité — vérifie l'impact de {changed_file_name}{_R}")
+
+        # Checkpoint cancellation
+        await asyncio.sleep(0)
+
+        # Analyse LLM (le gros morceau — via to_thread)
+        try:
+            analysis_dep = await asyncio.to_thread(
+                self._analysis_agent.analyze,
+                code    = dep_content,
+                context = context_dep,
+                docs    = relevant_docs,
+                scores  = rag_scores,
+            )
+        except Exception as e:
+            logger.error("Analyse dépendant %s : %s", dep_path.name, e)
+            return False
+
+        if isinstance(analysis_dep, str):
+            analysis_dep = {"analysis": analysis_dep, "relevant_knowledge": [], "validated_blocks": []}
+
+        result_text_dep = analysis_dep.get("analysis", "")
+
+        # Cache
+        if self._cache:
+            self._cache.update_file_cache(dep_path, analysis_dep, [], [])
+
+        # Affichage
+        with self._print_lock:
+            print_results(
+                text           = result_text_dep,
+                file_name      = dep_path.name,
+                context        = context_dep,
+                elapsed        = 0.0,
+                analyzed_count = self._stats["analyzed"],
+                score          = 0,
+                impacted       = [],
+            )
+
+        # Self-Improving RAG pour le dépendant
+        fix_blocks_dep = parse_fix_blocks(result_text_dep)
+        if fix_blocks_dep and hasattr(self, "_learning_agent") and self._learning_agent:
+            try:
+                self._learning_agent.collect_feedback(
+                    blocks      = fix_blocks_dep,
+                    code_before = dep_content,
+                    language    = dep_lang,
+                    file_name   = dep_path.name,
+                )
+            except Exception as e:
+                logger.debug("Feedback dépendant %s : %s", dep_path.name, e)
+
+        return True
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Utilitaires
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _extract_pattern_type(self, block: dict) -> str:
         """
@@ -791,7 +899,6 @@ class Orchestrator:
         """
         problem = block.get("problem", "").lower()
 
-        # Mapping simple — extensible
         patterns = {
             "sql injection":         "SqlInjection",
             "prepared statement":    "SqlInjection",
@@ -811,7 +918,6 @@ class Orchestrator:
             if keyword in problem:
                 return pattern_name
 
-        # Fallback : premiers 40 chars normalisés
         import re
         return re.sub(r'[^a-zA-Z0-9]', '', problem[:40].title())
 

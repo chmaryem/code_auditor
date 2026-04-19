@@ -1,0 +1,10 @@
+{
+    "file": "ResourceLeak.java",
+    "expected_bugs": [
+        {
+            "pattern": "ResourceLeak",
+            "severity": "HIGH",
+            "line_contains": "DriverManager.getConnection"
+        }
+    ]
+}

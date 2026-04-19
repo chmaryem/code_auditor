@@ -81,6 +81,36 @@ class GitNotifier:
         elif level == "CRITICAL":
             self._notify_critical(snapshot)
 
+    def notify_reminder(self, snapshot: "SessionSnapshot", minutes_at_level: int) -> None:
+        """
+        FIX 3 — Reminder notification after N minutes at same level.
+
+        Different from notify(): uses a compact, inline format so it
+        doesn't look like a new event. Makes clear this is a reminder
+        that issues are STILL unresolved.
+        """
+        level = snapshot.level
+        color = _LEVEL_COLOR.get(level, _YL)
+
+        with self._lock:
+            c = snapshot.total_critical
+            h = snapshot.total_high
+            nb_files = len(snapshot.files_at_risk)
+
+            now = datetime.now().strftime("%H:%M")
+
+            print(f"\n  {color}⏰  [{now}] RAPPEL — {level} depuis {minutes_at_level} min"
+                  f" — {nb_files} fichier(s) non corrigés"
+                  f"  (🔴{c} 🟠{h}  score {snapshot.score}){_R}")
+
+            # For CRITICAL, repeat the file list
+            if level == "CRITICAL" and snapshot.files_at_risk:
+                for fr in snapshot.files_at_risk[:3]:
+                    name = fr.path.split("/")[-1]
+                    print(f"    {_RD}●{_R}  {name}  —  {fr.bugs_critical}C {fr.bugs_high}H")
+
+            print(f"  {_DM}Appliquez les corrections Watch ou git commit --no-verify.{_R}\n")
+
     def notify_unanalyzed(self, file_names: list) -> None:
         """
         Notifie que des fichiers modifiés n'ont pas encore été analysés.

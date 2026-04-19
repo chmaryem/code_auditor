@@ -7,12 +7,24 @@ Commandes disponibles :
   python main.py watch   <dossier>        # surveillance temps réel
   python main.py git     <dossier>        # analyser le dernier commit Git
   python main.py hook    <dossier>        # installer le pre-commit hook Git
+
+  # Smart Git Merge
+  python main.py resolve-conflicts <dossier>       # résoudre les conflits locaux via LLM
+  python main.py merge-hook <dossier>               # installer le pre-merge hook
+
+  # MCP Code Mode (agents autonomes)
+  python main.py pr-check       --repo owner/repo --pr N  # revue PR via agent
+  python main.py pr-resolve     --repo owner/repo --pr N  # résoudre conflits PR via agent
+  python main.py pr-merge-check --repo owner/repo --pr N  # vérifier readiness merge
 """
 import sys
+import io
 import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+
 
 # ── Couleurs console ──────────────────────────────────────────────────────────
 G  = "\033[92m"
@@ -320,6 +332,80 @@ def cmd_hook(args):
         install_hook(project_path, strict=strict)
 
 
+# ── Commande : resolve-conflicts ───────────────────────────────────────────────
+
+def cmd_resolve_conflicts(args):
+    """
+    Résout les conflits de merge locaux via le LLM.
+    Après un 'git merge' qui produit des conflits, cette commande
+    envoie chaque fichier en conflit au LLM pour résolution automatique.
+    """
+    from smart_git.git_conflict_resolver import resolve_all_conflicts
+    project_path = Path(args.path).resolve()
+    resolve_all_conflicts(project_path)
+
+
+# ── Commande : merge-hook ──────────────────────────────────────────────────
+
+def cmd_merge_hook(args):
+    """
+    Installe ou désinstalle le pre-merge-commit hook.
+    Ce hook bloque 'git merge' si le code de la branche source
+    contient des bugs CRITICAL (score ≥ 35).
+    """
+    from smart_git.git_merge_hook import install_merge_hook, uninstall_merge_hook
+    project_path = Path(args.path).resolve()
+    if getattr(args, "uninstall", False):
+        uninstall_merge_hook(project_path)
+    else:
+        install_merge_hook(project_path)
+
+
+# ── Commande : pr-check (MCP Code Mode) ──────────────────────────────────
+
+def cmd_pr_check(args):
+    """
+    Analyse une Pull Request via MCP Code Mode.
+    L'agent Gemini génère un script Python qui analyse la PR
+    avec le pipeline RAG complet et poste un review structuré.
+    """
+    import asyncio
+    from smart_git.pr_analyzer import analyze_pr, _parse_repo
+
+    owner, repo = _parse_repo(args.repo)
+    asyncio.run(analyze_pr(owner, repo, args.pr))
+
+
+# ── Commande : pr-resolve (MCP Code Mode) ────────────────────────────────
+
+def cmd_pr_resolve(args):
+    """
+    Résout les conflits d'une PR via MCP Code Mode.
+    L'agent Gemini génère un script qui résout les conflits
+    avec le resolver 3-strategy et pousse une branche de résolution.
+    """
+    import asyncio
+    from smart_git.pr_analyzer import resolve_pr_conflicts, _parse_repo
+
+    owner, repo = _parse_repo(args.repo)
+    asyncio.run(resolve_pr_conflicts(owner, repo, args.pr))
+
+
+# ── Commande : pr-merge-check (MCP Code Mode) ────────────────────────────
+
+def cmd_pr_merge_check(args):
+    """
+    Vérifie si une PR est prête à merger via MCP Code Mode.
+    L'agent vérifie le statut mergeable, les checks CI/CD,
+    et les reviews, puis poste un rapport de readiness.
+    NE MERGE JAMAIS automatiquement.
+    """
+    import asyncio
+    from smart_git.pr_analyzer import check_pr_merge_readiness, _parse_repo
+
+    owner, repo = _parse_repo(args.repo)
+    asyncio.run(check_pr_merge_readiness(owner, repo, args.pr))
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -333,6 +419,15 @@ Exemples :
   python main.py watch   ./mon_projet      # surveillance temps réel
   python main.py git     ./mon_projet      # dernier commit Git
   python main.py hook    ./mon_projet      # installer le pre-commit hook
+
+  # Smart Git Merge
+  python main.py resolve-conflicts ./mon_projet          # résoudre conflits locaux
+  python main.py merge-hook ./mon_projet                  # installer merge hook
+
+  # MCP Code Mode (agents autonomes)
+  python main.py pr-check       --repo owner/repo --pr 42  # revue PR via agent
+  python main.py pr-resolve     --repo owner/repo --pr 42  # résoudre conflits PR
+  python main.py pr-merge-check --repo owner/repo --pr 42  # vérifier readiness merge
         """,
     )
     sub = p.add_subparsers(dest="command")
@@ -363,7 +458,27 @@ Exemples :
     sp = sub.add_parser("hook",       help="Installer/désinstaller le pre-commit hook Git")
     sp.add_argument("path")
     sp.add_argument("--uninstall",  action="store_true", help="Désinstaller le hook")
-    sp.add_argument("--no-strict",  action="store_true", help="Mode non-strict (avertit sans bloquer)")
+    sp.add_argument("--no-strict",  action="store_true", help="Mode non-strict")
+
+    # ── Smart Git Merge commands ────────────────────────────────────────────
+    sp = sub.add_parser("resolve-conflicts", help="Résoudre les conflits de merge locaux via LLM")
+    sp.add_argument("path", help="Chemin du projet Git")
+
+    sp = sub.add_parser("merge-hook", help="Installer/désinstaller le pre-merge hook")
+    sp.add_argument("path", help="Chemin du projet Git")
+    sp.add_argument("--uninstall", action="store_true", help="Désinstaller le merge hook")
+
+    sp = sub.add_parser("pr-check", help="Analyser une PR GitHub via MCP")
+    sp.add_argument("--repo", required=True, help="owner/repo")
+    sp.add_argument("--pr", type=int, required=True, help="Numéro de la PR")
+
+    sp = sub.add_parser("pr-resolve", help="Résoudre les conflits d'une PR via MCP Code Mode")
+    sp.add_argument("--repo", required=True, help="owner/repo")
+    sp.add_argument("--pr", type=int, required=True, help="Numéro de la PR")
+
+    sp = sub.add_parser("pr-merge-check", help="Vérifier si une PR est prête à merger (MCP Code Mode)")
+    sp.add_argument("--repo", required=True, help="owner/repo")
+    sp.add_argument("--pr", type=int, required=True, help="Numéro de la PR")
 
     return p
 
@@ -374,9 +489,19 @@ def main():
     if not args.command:
         parser.print_help()
         return
-    {"file": cmd_file, "project": cmd_project, "watch": cmd_watch,
-     "git": cmd_git, "git-status": cmd_git_status,
-     "git-branch": cmd_git_branch, "hook": cmd_hook}[args.command](args)
+    commands = {
+        "file": cmd_file, "project": cmd_project, "watch": cmd_watch,
+        "git": cmd_git, "git-status": cmd_git_status,
+        "git-branch": cmd_git_branch, "hook": cmd_hook,
+        # Smart Git Merge
+        "resolve-conflicts": cmd_resolve_conflicts,
+        "merge-hook": cmd_merge_hook,
+        # MCP Code Mode
+        "pr-check": cmd_pr_check,
+        "pr-resolve": cmd_pr_resolve,
+        "pr-merge-check": cmd_pr_merge_check,
+    }
+    commands[args.command](args)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,7 @@ class CodeRAGSystemAPI:
         self.embeddings:   HuggingFaceEmbeddings  | None = None
         self.vector_store: Chroma                 | None = None
         self.llm:          ChatGoogleGenerativeAI | None = None
+        self.fallback_llm = None  # Groq LLaMA3-70B fallback
         self._initialize()
 
     # Initialisation 
