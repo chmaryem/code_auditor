@@ -1,19 +1,17 @@
 """
 conflict_resolution_agent.py — Résolution de conflits PR.
 
-ARCHITECTURE v5 — Pipeline direct Python (sans CodeModeAgent/sandbox) :
-
-  POURQUOI on retire CodeModeAgent ici (mais pas pour pr-check) :
-    - La résolution de conflits suit un workflow DÉTERMINISTE et FIXE.
-    - L'agent génèrerait toujours le même script → 2000 tokens gaspillés.
-    - La valeur de l'IA est dans resolve_single_file() (3-way diff + LLM budget).
-
-  Le MCP Code Mode est GARDÉ pour pr-check (analyse dynamique, variable par PR).
+ARCHITECTURE v6.2 — Pipeline RAG-enriched :
 
   Pipeline de résolution :
-    1. get_pr_mergeable_status() — détection fiable des conflits
-    2. resolve_file_smart() — 3-way diff → merge conservateur → Gemini budget
-    3. push_file() + create_pull_request() — via github.* wrappers MCP
+    1. get_pr_mergeable_status() — détection fiable (REST API direct + fallback MCP)
+    2. RAG context query — cache SQLite + ChromaDB + KnowledgeGraph (0 token LLM)
+    3. resolve_file_smart() — 3-way diff → conservateur → Gemini + RAG context
+    4. RESOLVE_README.md — résumé des changements généré automatiquement
+    5. push_file() + create_pull_request() — via github.* wrappers MCP
+
+  Le RAG enrichit le prompt Gemini avec les patterns du projet (SQL injection,
+  bcrypt, design patterns) pour une résolution contextuelle et pas seulement mécanique.
 """
 
 from __future__ import annotations
@@ -150,10 +148,12 @@ def _merge_conservative(ours: str, theirs: str, filename: str) -> Optional[str]:
     return ours
 
 
-def _resolve_with_gemini_budget(filename: str, ours: str, theirs: str) -> Optional[str]:
+def _resolve_with_gemini_budget(
+    filename: str, ours: str, theirs: str, rag_context: list = None
+) -> Optional[str]:
     """
     Résolution LLM avec budget strict — seulement les blocs différents.
-    Input : ~200-500 chars de blocs seulement (au lieu de 10 000 chars entiers).
+    v6.2 : enrichi avec le contexte RAG (patterns, vulnérabilités détectées).
     """
     import os, time
     from dotenv import load_dotenv
@@ -188,7 +188,22 @@ def _resolve_with_gemini_budget(filename: str, ours: str, theirs: str) -> Option
         f"Strategy: prefer security fixes, keep functional code from both sides.\n"
         f"File header:\n{ours_header}\n\n"
         f"Conflicts to resolve:\n{conflicts_text}\n"
-        f"Output ONLY the full resolved file content. No explanations.\n"
+    )
+
+    # v6.2 : Injecter le contexte RAG dans le prompt
+    if rag_context:
+        prompt += "\nRelevant project patterns (from knowledge base):\n"
+        for k in rag_context[:5]:
+            if isinstance(k, dict):
+                name = k.get("pattern", k.get("name", k.get("rule", "")))
+                desc = k.get("description", k.get("detail", ""))
+                prompt += f"- {name}: {desc}\n"
+            elif isinstance(k, str):
+                prompt += f"- {k}\n"
+        prompt += "Use these patterns to guide the merge resolution.\n"
+
+    prompt += (
+        f"\nOutput ONLY the full resolved file content. No explanations.\n"
         f"If cannot resolve: output OURS_FALLBACK"
     )
 
@@ -243,10 +258,12 @@ def _resolve_with_gemini_budget(filename: str, ours: str, theirs: str) -> Option
 
 
 def resolve_file_smart(
-    filename: str, base_content: str, ours_content: str, theirs_content: str
+    filename: str, base_content: str, ours_content: str, theirs_content: str,
+    rag_context: list = None,
 ) -> Tuple[Optional[str], str]:
     """
     Pipeline à 3 niveaux. Retourne (contenu_résolu, méthode).
+    v6.2 : le contexte RAG est passé au niveau 3 (Gemini).
     """
     # Niveau 1 : 3-way déterministe (0 token)
     result = _merge_3way(base_content, ours_content, theirs_content)
@@ -258,11 +275,11 @@ def resolve_file_smart(
     if result:
         return result, "conservative"
 
-    # Niveau 3 : Gemini budget minimal
-    print(f"    {_YL}conflit complexe → Gemini (budget){_R}", end="", flush=True)
-    result = _resolve_with_gemini_budget(filename, ours_content, theirs_content)
+    # Niveau 3 : Gemini budget minimal + RAG context
+    print(f"    {_YL}conflit complexe -> Gemini + RAG{_R}", end="", flush=True)
+    result = _resolve_with_gemini_budget(filename, ours_content, theirs_content, rag_context)
     if result:
-        return result, "gemini_budget"
+        return result, "gemini_rag"
 
     return None, "failed"
 
@@ -281,18 +298,95 @@ def _ensure_list(value: Any) -> List:
 # API publique — appelée par pr_analyzer.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _generate_resolve_readme(
+    pr_number: int, orig_title: str, base_ref: str, head_ref: str,
+    resolved_files: List[str], failed_files: List[str],
+    diffs: List[str], rag_patterns: Dict[str, List[str]],
+) -> str:
+    """
+    Génère un RESOLVE_README.md pour documenter la résolution automatique.
+    0 token LLM — template Markdown pur.
+    """
+    lines = [
+        f"# Auto-Resolve Report — PR #{pr_number}",
+        "",
+        f"> **PR originale** : #{pr_number} — *{orig_title}*",
+        f"> **Branche base** : `{base_ref}` | **Branche source** : `{head_ref}`",
+        f"> **Generé par** : Code Auditor v6.2 (RAG-enhanced conflict resolution)",
+        "",
+        "## Fichiers résolus",
+        "",
+    ]
+
+    if resolved_files:
+        lines.append("| Fichier | Méthode | Status |")
+        lines.append("|---|---|---|")
+        for d in diffs:
+            # Parse "- **filename**: ...L -> ...L -> resolved ...L (`method`)"
+            parts = d.replace("- **", "").split("**")
+            fname = parts[0] if parts else "?"
+            method = "3way"
+            if "`" in d:
+                method = d.split("`")[1]
+            lines.append(f"| `{fname}` | {method} | Resolved |")
+        lines.append("")
+    else:
+        lines.append("*Aucun fichier résolu automatiquement.*")
+        lines.append("")
+
+    if failed_files:
+        lines.append("## Resolution manuelle requise")
+        lines.append("")
+        for f in failed_files:
+            lines.append(f"- [ ] `{f}`")
+        lines.append("")
+
+    # Section RAG patterns
+    if rag_patterns:
+        lines.append("## Patterns détectés (Knowledge Graph)")
+        lines.append("")
+        lines.append("Les patterns suivants ont été utilisés pour guider la résolution :")
+        lines.append("")
+        for filename, patterns in rag_patterns.items():
+            if patterns:
+                lines.append(f"### `{filename}`")
+                for p in patterns:
+                    lines.append(f"- {p}")
+                lines.append("")
+
+    lines.extend([
+        "## Instructions pour le reviewer",
+        "",
+        "1. Vérifier que les résolutions préservent la logique métier",
+        "2. Vérifier qu'aucune vulnérabilité n'a été réintroduite",
+        "3. Exécuter les tests unitaires avant de merger",
+        "",
+        "```bash",
+        f"git fetch origin && git checkout auto-resolve/pr-{pr_number}",
+        "# Vérifier les changements",
+        "git diff main..HEAD",
+        "```",
+        "",
+        "---",
+        "*Généré automatiquement par Code Auditor — ne pas modifier manuellement.*",
+    ])
+
+    return "\n".join(lines)
+
+
 async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
     """
-    Résout les conflits d'une PR via MCP github.* wrappers + pipeline 3 niveaux.
+    Résout les conflits d'une PR via MCP github.* wrappers + pipeline RAG.
 
-    Architecture conservée :
-      - github.* wrappers → MCP GitHub Server (communication MCP préservée)
-      - resolver pipeline → 3-way diff → conservative → Gemini budget
-      - Résultat posté sur GitHub via github.post_comment() et github.create_pull_request()
+    Architecture v6.2 :
+      - github.* wrappers -> MCP GitHub Server (communication MCP préservée)
+      - RAG context -> cache SQLite + ChromaDB + KnowledgeGraph (0 token)
+      - resolver pipeline -> 3-way diff -> conservative -> Gemini + RAG context
+      - RESOLVE_README.md -> résumé automatique pushé sur la branche
     """
     print(f"\n  {_CY}{_B}Code Auditor — Résolution conflits PR #{pr_number}{_R}")
     print(f"  {_DM}Repo : {owner}/{repo}{_R}")
-    print(f"  {_DM}Mode : 3-way diff -> conservateur -> Gemini budget{_R}\n")
+    print(f"  {_DM}Mode : 3-way diff -> RAG context -> Gemini enrichi{_R}\n")
 
     try:
         from services.code_mode_client import github
@@ -324,23 +418,38 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
         ]
         print(f"  Fichiers à traiter : {len(code_files)}\n")
 
-        # 3. Créer la branche de résolution
+        # 3. Initialiser le pipeline RAG (0 token LLM)
+        print(f"  Chargement contexte RAG...")
+        rag = None
+        cache = None
+        try:
+            from services.code_mode_client import RAGAnalyzer, CacheClient
+            rag = RAGAnalyzer()
+            cache = CacheClient()
+            print(f"  {_GR}RAG + Cache actifs{_R}")
+        except Exception as e:
+            logger.debug("RAG/Cache non disponible: %s", e)
+            print(f"  {_YL}RAG non disponible — résolution sans contexte{_R}")
+
+        # 4. Créer la branche de résolution
         branch_name = f"auto-resolve/pr-{pr_number}"
         print(f"  Création branche {branch_name}...")
         github.create_branch(owner, repo, branch_name, base_ref)
 
-        # 4. Résoudre chaque fichier
+        # 5. Résoudre chaque fichier avec contexte RAG
         resolved_files, failed_files, diffs = [], [], []
+        rag_patterns = {}  # {filename: [pattern_names]} pour le README
 
         for f in code_files:
             filename = f.get("filename", f.get("path", ""))
-            print(f"  {_DM}→ {filename}{_R}", end="", flush=True)
+            ext = Path(filename).suffix.lstrip(".")
+            print(f"  {_DM}-> {filename}{_R}", end="", flush=True)
 
             base_content = github.get_file_content(owner, repo, filename, base_ref)
             head_content = github.get_file_content(owner, repo, filename, head_ref)
 
             if not base_content or not head_content:
-                print(f"  {_RD}✗ contenu inaccessible{_R}")
+                print(f"  {_RD}x contenu inaccessible{_R}")
                 failed_files.append(filename)
                 continue
 
@@ -348,7 +457,40 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
                 print(f"  {_GR}= identique{_R}")
                 continue
 
-            resolved, method = resolve_file_smart(filename, base_content, base_content, head_content)
+            # Requête RAG : cache SQLite d'abord, puis analyse complète
+            file_rag_context = []
+            try:
+                if cache:
+                    cached = cache.read_analysis(filename)
+                    if cached:
+                        file_rag_context = cached.get("relevant_knowledge", [])
+                        print(f" [cache]", end="", flush=True)
+
+                if not file_rag_context and rag:
+                    rag_result = rag.analyze(head_content, filename, ext)
+                    file_rag_context = rag_result.get("relevant_knowledge", [])
+                    # Extraire aussi les noms de patterns pour le README
+                    if file_rag_context:
+                        print(f" [rag:{len(file_rag_context)}]", end="", flush=True)
+            except Exception as e:
+                logger.debug("RAG query failed for %s: %s", filename, e)
+
+            # Stocker les noms de patterns pour le README
+            pattern_names = []
+            for k in (file_rag_context or []):
+                if isinstance(k, dict):
+                    name = k.get("pattern", k.get("name", k.get("rule", "")))
+                    if name:
+                        pattern_names.append(str(name))
+                elif isinstance(k, str) and k:
+                    pattern_names.append(k)
+            if pattern_names:
+                rag_patterns[filename] = pattern_names
+
+            resolved, method = resolve_file_smart(
+                filename, base_content, base_content, head_content,
+                rag_context=file_rag_context,
+            )
 
             if resolved:
                 msg = f"auto-resolve: {filename} (method={method})"
@@ -357,10 +499,10 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
                 b = len(base_content.splitlines())
                 h = len(head_content.splitlines())
                 r = len(resolved.splitlines())
-                diffs.append(f"- **{filename}**: {b}L → {h}L → resolved {r}L (`{method}`)")
-                print(f"  {_GR}✓ [{method}]{_R}")
+                diffs.append(f"- **{filename}**: {b}L -> {h}L -> resolved {r}L (`{method}`)")
+                print(f"  {_GR}v [{method}]{_R}")
             else:
-                print(f"  {_RD}✗ échec{_R}")
+                print(f"  {_RD}x echec{_R}")
                 failed_files.append(filename)
 
         # 5. Poster le rapport sur la PR originale
@@ -383,39 +525,69 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
             ]
         github.post_comment(owner, repo, pr_number, "\n".join(comment_lines))
 
-        # 6. Créer la PR auto-resolve → main
+        # 6. Générer et pusher RESOLVE_README.md
+        pr_data = status.get("pr_data", {})
+        orig_title = pr_data.get("title", f"PR #{pr_number}") if pr_data else f"PR #{pr_number}"
+
+        if resolved_files:
+            readme_content = _generate_resolve_readme(
+                pr_number, orig_title, base_ref, head_ref,
+                resolved_files, failed_files, diffs, rag_patterns,
+            )
+            try:
+                github.push_file(
+                    owner, repo, "RESOLVE_README.md", readme_content,
+                    f"auto-resolve: add resolution README for PR #{pr_number}",
+                    branch_name,
+                )
+                print(f"  {_GR}v RESOLVE_README.md pushed{_R}")
+            except Exception as e:
+                logger.warning("Failed to push README: %s", e)
+
+        # 7. Créer la PR auto-resolve -> main
         pr_url = ""
         if resolved_files:
-            pr_data = status.get("pr_data", {})
-            orig_title = pr_data.get("title", f"PR #{pr_number}") if pr_data else f"PR #{pr_number}"
             new_pr = github.create_pull_request(
                 owner, repo,
                 title=f"Auto-resolve conflicts for PR #{pr_number}",
                 body="\n".join([
                     f"## Conflict resolution for PR #{pr_number}",
                     f"Original : #{pr_number} — *{orig_title}*", "",
-                    "Created by **Code Auditor** — automatic merge conflict resolution.", "",
+                    "Created by **Code Auditor** v6.2 — RAG-enhanced conflict resolution.", "",
                     "### Resolution Methods", "",
-                ] + diffs),
+                ] + diffs + [
+                    "",
+                    "### RAG Patterns Applied",
+                    "",
+                ] + [
+                    f"- **{fn}**: {', '.join(pats[:5])}"
+                    for fn, pats in rag_patterns.items() if pats
+                ] + [
+                    "",
+                    "*See `RESOLVE_README.md` in the branch for full details.*",
+                ]),
                 head=branch_name,
                 base=base_ref,
             )
             pr_url = new_pr.get("html_url", "") if isinstance(new_pr, dict) else ""
 
-        # Affichage terminal
-        print(f"\n  {'─'*50}")
-        print(f"  {_B}Résumé : {len(resolved_files)} résolu(s) · {len(failed_files)} échec(s){_R}")
+       
+        print(f"\n  {'='*50}")
+        print(f"  {_B}Resume : {len(resolved_files)} resolu(s) - {len(failed_files)} echec(s){_R}")
+        if rag_patterns:
+            total_p = sum(len(v) for v in rag_patterns.values())
+            print(f"  {_CY}RAG patterns : {total_p} patterns appliques{_R}")
         if resolved_files:
             print(f"  {_GR}Branche : {branch_name}{_R}")
             if pr_url:
-                print(f"  {_GR}PR créée : {pr_url}{_R}")
+                print(f"  {_GR}PR creee : {pr_url}{_R}")
             print(f"  {_DM}  git fetch origin && git checkout {branch_name}{_R}")
         for fn in resolved_files:
-            print(f"    {_GR}✓{_R}  {fn}")
+            print(f"    {_GR}v{_R}  {fn}")
         if failed_files:
-            print(f"\n  {_YL}Résolution manuelle requise :{_R}")
+            print(f"\n  {_YL}Resolution manuelle requise :{_R}")
             for fn in failed_files:
-                print(f"    {_YL}✗{_R}  {fn}")
+                print(f"    {_YL}x{_R}  {fn}")
         print()
 
         return {
