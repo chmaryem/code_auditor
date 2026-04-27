@@ -1,0 +1,104 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Code Auditor — PR Review Automatique
+#
+# Ce workflow se déclenche AUTOMATIQUEMENT quand :
+#   - Une PR est ouverte (opened)
+#   - Un nouveau commit est poussé sur une PR existante (synchronize)
+#   - Une PR fermée est réouverte (reopened)
+#
+# Il exécute ci_runner.py qui :
+#   1. Analyse le code de la PR via RAG + KnowledgeGraph + LLM
+#   2. Poste un review commentaire sur la PR
+#   3. Poste un status check (success/failure) sur le commit
+#   4. Si CRITICAL détecté ou score >= 35 → merge bloqué
+#
+# Secrets nécessaires (Settings → Secrets and variables → Actions) :
+#   - OPENROUTER_API_KEY  : clé OpenRouter pour le LLM primaire
+#   - GOOGLE_API_KEY      : clé Gemini (fallback si OpenRouter échoue)
+#   - GITHUB_TOKEN        : automatique dans Actions (pas besoin de le créer)
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: "Code Auditor — PR Review"
+
+# ── Quand déclencher ──────────────────────────────────────────────────────────
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# ── Permissions ───────────────────────────────────────────────────────────────
+# Le GITHUB_TOKEN a besoin de ces permissions pour :
+#   - statuses: write  → poster les status checks (success/failure)
+#   - pull-requests: write → poster le review commentaire sur la PR
+#   - contents: read → lire le code du repo
+permissions:
+  statuses: write
+  pull-requests: write
+  contents: read
+
+# ── Job principal ─────────────────────────────────────────────────────────────
+jobs:
+  code-review:
+    name: "🔍 Analyse qualité"
+    runs-on: ubuntu-latest
+    # Timeout : évite les jobs bloqués si le LLM ne répond pas
+    timeout-minutes: 15
+
+    steps:
+      # 1. Checkout du code du repo (inclut la PR)
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # 2. Installer Python 3.11
+      - name: " Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Cache pip — évite de re-télécharger les dépendances à chaque run
+      - name: "📦Cache pip"
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-
+
+      # 4. Cache ChromaDB — persiste la vector store entre les runs
+      #    Sans ce cache, le RAG doit reconstruire les embeddings à chaque fois
+      - name: " Cache ChromaDB"
+        uses: actions/cache@v4
+        with:
+          path: data/vector_store
+          key: chromadb-${{ hashFiles('data/knowledge_base/**') }}
+          restore-keys: chromadb-
+
+      # 5. Cache Knowledge Graph
+      - name: " Cache Knowledge Graph"
+        uses: actions/cache@v4
+        with:
+          path: data/knowledge_graph.json
+          key: kg-${{ hashFiles('data/knowledge_base/**') }}
+          restore-keys: kg-
+
+      # 6. Installer les dépendances Python
+      - name: "📦 Install dependencies"
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          # Ajouter les dépendances LLM (si pas dans requirements.txt)
+          pip install langchain-openai langchain-google-genai python-dotenv pydantic
+
+      # 7. Lancer l'analyse
+      #    - GITHUB_TOKEN est injecté automatiquement par GitHub Actions
+      #    - Les autres secrets doivent être configurés dans Settings → Secrets
+      - name: "🔍 Analyse PR"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_PERSONAL_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: "minimax/minimax-m2.5:free"
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GEMINI_MODEL: "gemini-2.5-flash"
+        run: |
+          python ci_runner.py \
+            --repo "${{ github.repository }}" \
+            --pr "${{ github.event.pull_request.number }}"

@@ -17,7 +17,7 @@ FIX v5 — Budget token contrôlé + cascade de modèles :
   2. max_output_tokens = 1024 (était 8192)
      → Gemini donne une réponse concise, pas 8000 tokens de code commenté
 
-  3. Cascade de modèles : gemini-2.5-flash → gemini-2.0-flash → gemini-1.5-flash
+  3. Modèle exclusif : gemini-3.1-pro-preview
      Chaque modèle a son propre quota indépendant.
      Backoff : 20s → 45s entre retries par modèle.
 
@@ -47,8 +47,7 @@ _DM = "\033[2m"
 
 MAX_ATTEMPTS = 3
 
-# Cascade de modèles (quota indépendant par modèle)
-_LLM_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+_LLM_MODELS = ["gemini-3.1-pro-preview"]
 
 # Budget tokens en chars
 _BUDGET_OURS     = 2000
@@ -200,7 +199,7 @@ def resolve_single_file(
     """
     Résolution avec budget contrôlé et cascade de modèles.
 
-    3 stratégies × cascade gemini-2.5-flash → 2.0-flash → 1.5-flash.
+    3 stratégies avec gemini-3.1-pro-preview.
     max_output_tokens=1024 (réponse concise forcée).
     """
     from dotenv import load_dotenv

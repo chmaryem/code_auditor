@@ -136,21 +136,18 @@ type(scope): short description
 GENERATE THE COMMIT MESSAGE:"""
 
     try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        from dotenv import load_dotenv
+        from services.llm_factory import invoke_with_fallback
 
-        load_dotenv(Path(_project_root) / ".env")
-        api_key = os.getenv("GOOGLE_API_KEY")
-
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            google_api_key=api_key,
-            max_output_tokens=256,
-            temperature=0.3,
+        message = invoke_with_fallback(
+            prompt,
+            temperature = 0.3,
+            max_tokens  = 256,
+            label       = "commit-msg",
         )
-        response = llm.invoke(prompt)
-        message = response.content.strip()
+        if not message:
+            return ""
 
+        message = message.strip()
         # Nettoyer les blocs markdown si présents
         if message.startswith("```"):
             lines = message.splitlines()
@@ -161,7 +158,7 @@ GENERATE THE COMMIT MESSAGE:"""
 
         return message
 
-    except Exception as e:
+    except Exception:
         return ""
 
 

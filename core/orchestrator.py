@@ -121,10 +121,14 @@ class Orchestrator:
 
         # Knowledge Graph
         print(" Knowledge Graph RAG...")
+        # Construire un LLM compatible (SemanticLinker utilise .invoke() optionnellement)
+        from services.llm_factory import build_llm_cascade_for_agent
+        _cascade = build_llm_cascade_for_agent(temperature=0.0, max_tokens=256)
+        _kg_llm  = _cascade[0][1] if _cascade else None  # premier provider disponible
         knowledge_graph.build(
             project_indexer  = self._project_indexer,
             dependency_graph = self._dependency_graph,
-            llm              = assistant_agent.llm,
+            llm              = _kg_llm,
         )
         kg_n = knowledge_graph._graph.number_of_nodes()
         kg_e = knowledge_graph._graph.number_of_edges()
@@ -149,9 +153,12 @@ class Orchestrator:
         # Brancher LearningAgent
         try:
             from services.knowledge_loader import KnowledgeBaseLoader
+            from services.llm_factory import build_llm_cascade_for_agent
             kb_loader = KnowledgeBaseLoader()
+            _la_cascade = build_llm_cascade_for_agent(temperature=0.0, max_tokens=2048)
+            _la_llm = _la_cascade[0][1] if _la_cascade else None
             learning_agent.initialize(
-                llm             = assistant_agent.llm,
+                llm             = _la_llm,
                 vector_store    = assistant_agent.vector_store,
                 kb_dir          = kb_loader.kb_dir,
                 kb_loader       = kb_loader,

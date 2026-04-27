@@ -23,25 +23,21 @@ def _detect_optimal_device() -> str:
     return "cpu"
 
 
+
 class APIConfig(BaseModel):
-    # ─────────────────────────────────────────────────────────────
-    # Multi-Provider LLM Strategy
-    # Provider 1 (Principal)  — Gemini 2.5 Flash  : quota journalier gratuit
-    # Provider 2 (Fallback 1) — Groq Llama3.3-70B : 12 000 TPM, gratuit
-    # Provider 3 (Fallback 2) — Groq Llama4-Scout : 30 000 TPM, gratuit
-    #
-    # Si quota Gemini 2.5 épuisé, changer 'model' en :
-    #   gemini-2.0-flash        — quota DIFFÉRENT de 2.5, peut fonctionner
-    #   gemini-1.5-flash        — ancien modèle, quota encore différent
-    # ─────────────────────────────────────────────────────────────
-    provider:    str   = "google"
-    api_key:     str   = os.getenv("GOOGLE_API_KEY", "")
-    model:       str   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    provider:    str   = "openrouter"
+    # ── OpenRouter (primary) ──────────────────────────────────────────────────
+    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
+    openrouter_model:   str = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.5:free")
+    # Rotation round-robin entre modèles gratuits (contourne le rate-limit)
+   
+    # ── Google Gemini (fallback) ──────────────────────────────────────────────
+    gemini_api_key: str = os.getenv("GOOGLE_API_KEY", "")
+    gemini_model:   str = os.getenv("GEMINI_MODEL",   "gemini-2.5-flash")
+    # ── Commun ────────────────────────────────────────────────────────────────
     temperature: float = 0.0
-    max_tokens:  int   = 32768
-
-
-
+    max_tokens:  int   = 16384
 
 class RAGConfig(BaseModel):
     embedding_model:     str   = "jinaai/jina-embeddings-v2-base-code"

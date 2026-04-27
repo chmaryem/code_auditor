@@ -9,11 +9,11 @@ from typing import Any
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config import config
+from services.llm_factory import invoke_with_fallback
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -49,16 +49,17 @@ def _has_security_patterns(code: str, language: str) -> bool:
 class CodeRAGSystemAPI:
 
     def __init__(self) -> None:
-        self.embeddings:   HuggingFaceEmbeddings  | None = None
-        self.vector_store: Chroma                 | None = None
-        self.llm:          ChatGoogleGenerativeAI | None = None
-        self.fallback_llm = None  # Groq LLaMA3-70B fallback
+        self.embeddings:   HuggingFaceEmbeddings | None = None
+        self.vector_store: Chroma                | None = None
+        # LLM calls are handled by services.llm_factory (OpenRouter → Gemini fallback)
         self._initialize()
 
     # Initialisation 
 
     def _initialize(self) -> None:
-        """Initialise les 3 composants : Embeddings → ChromaDB → Google Gemini."""
+        """Initialise les 2 composants : Embeddings → ChromaDB.
+        Le LLM est géré via services.llm_factory (OpenRouter/MiniMax → Gemini fallback).
+        """
         logger.info("Initialisation CodeRAGSystemAPI...")
 
         # 1. Embeddings Jina v2
@@ -94,8 +95,6 @@ class CodeRAGSystemAPI:
             print("   Lancez : python knowledge_loader.py")
             print("   (sans ça, le RAG ne trouvera aucune règle)\n")
         elif chunk_count < 50:
-            # KB anormalement petite — probablement seules les règles auto_learned
-            # sont présentes, la KB manuelle (java/, python/...) est absente.
             logger.warning(
                 "Collection ChromaDB '%s' : seulement %d chunks — KB incomplète ! "
                 "Les règles manuelles sont absentes. Lancez : python knowledge_loader.py",
@@ -109,20 +108,7 @@ class CodeRAGSystemAPI:
             logger.info("Collection '%s' : %d chunks disponibles",
                         config.CHROMA_COLLECTION, chunk_count)
 
-        # 3. Google Gemini
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            logger.warning("GOOGLE_API_KEY non défini — les analyses LLM échoueront")
-
-        self.llm = ChatGoogleGenerativeAI(
-            model                           = config.api.model,
-            temperature                     = config.api.temperature,
-            google_api_key                  = api_key or "placeholder",
-            max_output_tokens               = config.api.max_tokens,
-            convert_system_message_to_human = True,
-        )
-
-        logger.info("Google Gemini initialisé ✓")
+        logger.info("CodeRAGSystemAPI initialisé ✓ (LLM : OpenRouter/MiniMax M2.5)")
 
     #  Retrieval RAG 
 
@@ -324,6 +310,87 @@ If 3 methods use undeclared `connection` → 3 separate blocks, each with
   the FULL rewritten method using dataSource.getConnection() in try-with-resources.
 """
 
+    # ── Language-specific rules ──────────────────────────────────────────────
+
+    @staticmethod
+    def _build_language_rules(language: str) -> str:
+        """
+        Retourne les règles d'audit spécifiques au langage.
+        Chaque langage a sa propre checklist optimisée pour une analyse fluide.
+        """
+        lang = language.lower()
+
+        if lang == "java":
+            return """
+LANGUAGE-SPECIFIC RULES (Java):
+  - try-with-resources for ALL Statement / PreparedStatement / ResultSet / Connection / FileWriter
+  - Password hashing (BCrypt / Argon2) — plain text comparison is always CRITICAL
+  - Single Responsibility: one method must not do DB + email + logging + stats
+  - DataSource injection instead of DriverManager.getConnection()
+  - Pagination on every method that returns a List from DB
+  - Package declaration correctness
+  - String concatenation in SQL → ALWAYS use PreparedStatement with setXxx()
+  - Transaction management: setAutoCommit(false) MUST have rollback in catch
+  - Check for proper bean validation annotations (@NotNull, @Valid)
+  - Avoid catching generic Exception — use specific exception types
+  - Check for proper use of Optional instead of returning null
+  - Verify correct equals/hashCode implementation when overriding"""
+
+        if lang == "python":
+            return """
+LANGUAGE-SPECIFIC RULES (Python):
+  - SQL injection: cursor.execute() with f-strings, %, or .format() is CRITICAL
+    → ALWAYS use parameterized queries: cursor.execute("SELECT ... WHERE id = %s", (id,))
+  - eval() / exec() / __import__() usage is CRITICAL (arbitrary code execution)
+  - subprocess.call/Popen with shell=True is HIGH (command injection)
+  - os.system() usage is HIGH → prefer subprocess.run() with shell=False
+  - Exception handling: bare 'except:' or 'except Exception: pass' swallows errors
+  - Resource management: file/socket/DB connections MUST use 'with' statements
+  - Hardcoded credentials: passwords, API keys, tokens in source code = CRITICAL
+  - Input validation: always validate/sanitize user input before processing
+  - Type hints: check for missing type annotations on public functions
+  - Mutable default arguments: def func(items=[]) is a common bug → use None
+  - Import organization: check for unused imports, circular imports
+  - pickle.loads() on untrusted data = CRITICAL (deserialization attack)
+  - Check for proper use of logging instead of print() in production
+  - Async: verify proper await usage, check for unawaited coroutines"""
+
+        if lang in ("typescript", "javascript"):
+            ts_specific = ""
+            if lang == "typescript":
+                ts_specific = """
+  - TypeScript strict mode: check for 'any' type usage → prefer explicit types
+  - Verify proper interface/type definitions for function parameters
+  - Check for missing null checks (strictNullChecks)
+  - Ensure proper use of enum instead of magic strings/numbers"""
+
+            return f"""
+LANGUAGE-SPECIFIC RULES ({'TypeScript' if lang == 'typescript' else 'JavaScript'}):
+  - XSS vulnerabilities: innerHTML, document.write(), dangerouslySetInnerHTML = CRITICAL
+  - SQL injection in ORM queries (Sequelize, Prisma raw queries) = CRITICAL
+  - Prototype pollution: avoid Object.assign with untrusted input
+  - eval() / Function() constructor usage = CRITICAL
+  - Hardcoded secrets: API keys, tokens in source or .env committed = CRITICAL
+  - Async/await error handling: always wrap await in try/catch or .catch()
+  - Memory leaks: check for missing cleanup in useEffect, event listeners
+  - Input validation: validate req.body, req.params, req.query before use
+  - Avoid == for comparison → use === (strict equality)
+  - Check for proper error handling in Promise chains
+  - Avoid console.log in production code → use proper logger
+  - Check for missing 'return' in async functions
+  - Path traversal: validate file paths before fs operations
+  - CORS configuration: verify proper origin restrictions{ts_specific}"""
+
+        # Langage non reconnu — règles génériques
+        return """
+LANGUAGE-SPECIFIC RULES (General):
+  - Check for hardcoded credentials and secrets
+  - Verify proper error handling (no swallowed exceptions)
+  - Check for resource leaks (unclosed files, connections)
+  - Verify input validation on public-facing functions
+  - Check for SQL injection in any database queries
+  - Avoid eval() or equivalent dynamic code execution"""
+
     # ── Prompt builder ────────────────────────────────────────────────────────
 
     def _build_prompt(
@@ -473,9 +540,9 @@ BEST PRACTICES FROM KNOWLEDGE BASE:
 
 RULES:
 1. Report ALL issues including: SQL injection (every vulnerable method = separate block),
-   plain text passwords, resource leaks (Statement/ResultSet/Connection/FileWriter not closed),
+   plain text passwords, resource leaks (unclosed resources),
    hardcoded credentials, missing error handling, architectural violations (SRP, DI),
-   N+1 queries, unbounded queries, package/import errors, static mutable state,
+   N+1 queries, unbounded queries, import errors, static mutable state,
    magic numbers, utility class design issues.
 2. Focus on: COMPILATION ERRORS, security vulnerabilities, critical bugs,
    architecture violations, resource leaks, performance problems.
@@ -492,29 +559,16 @@ RULES:
     Example: LOCATION: UserController.java:42 (calling method, line 42)
 7. Only suggest libraries already present in the project imports. Never invent dependencies.
 7b. FIXED CODE must ALWAYS contain real, compilable source code — never only comments.
-    BAD:  // Use PreparedStatement instead  // String query = "SELECT..."
-    GOOD: try (PreparedStatement stmt = conn.prepareStatement("SELECT ... WHERE id = ?")) {{
-              stmt.setInt(1, id);
-              ...
-          }}
     If the fix is architectural and cannot fit in one block, show the MINIMUM compilable
     change that demonstrates the fix — even if incomplete, it must be real code.
 8. Only respond with "Code quality is good, no major issues." if there are literally
    zero issues. If you find even one issue, report it. Never truncate your analysis.
-9. For Java specifically, always check:
-   - try-with-resources for ALL Statement / PreparedStatement / ResultSet / Connection / FileWriter
-   - password hashing (BCrypt / Argon2) — plain text comparison is always CRITICAL
-   - Single Responsibility: one method must not do DB + email + logging + stats
-   - DataSource injection instead of DriverManager.getConnection()
-   - Pagination on every method that returns a List from DB
-   - Package declaration correctness
+{self._build_language_rules(language)}
 10. Do not stop until every method listed in the SECURITY SCAN section has been checked.
     If you have not finished all methods, continue — do not truncate.
 11. CRITICAL — compilation errors do NOT stop the analysis of other issues.
-    If a variable is undeclared (e.g. `connection` not declared), report it as CRITICAL,
-    THEN CONTINUE analyzing every other method independently for:
-    SQL injection, resource leaks, N+1 queries, transaction issues, etc.
-    These issues exist regardless of whether the code compiles.
+    If a variable is undeclared, report it as CRITICAL,
+    THEN CONTINUE analyzing every other method independently.
     A file with 1 compilation error + 10 resource leaks = 11 separate blocks.
     NEVER use a compilation error as a reason to skip analyzing individual methods.
 12. Treat each method as INDEPENDENT. Even if method A has a fatal error,
@@ -690,18 +744,16 @@ ANALYZE NOW — START WITH ---DECISION---:"""
         # 3. Construction du prompt
         prompt = self._build_prompt(code, context, knowledge_context)
 
-        # 4. Appel LLM
-        try:
-            response = self.llm.invoke(prompt)
-            analysis = (
-                response.content
-                if hasattr(response, "content")
-                else str(response)
-            )
-        except Exception as e:
-            logger.error("Erreur LLM lors de l'analyse de %s : %s",
-                         context.get("file_path", "?"), e)
-            analysis = f"Erreur: {e}\n\nVerifiez votre GOOGLE_API_KEY."
+        # 4. Appel LLM — OpenRouter/MiniMax (fallback Gemini)
+        analysis = invoke_with_fallback(
+            prompt,
+            temperature = config.api.temperature,
+            max_tokens  = config.api.max_tokens,
+            label       = f"analyze:{context.get('file_path', '?')}",
+        )
+        if analysis is None:
+            logger.error("Tous les LLM ont échoué pour %s", context.get("file_path", "?"))
+            analysis = "Erreur : tous les providers LLM sont indisponibles (vérifiez vos clés API)."
 
         return {
             "analysis":           analysis,
@@ -709,6 +761,147 @@ ANALYZE NOW — START WITH ---DECISION---:"""
             "rag_scores":         rag_scores,
             "docs_used":          len(relevant_docs),
             "security_mode":      bool(self._build_security_section(code, language)),
+            "code":               code,
+            "context":            context,
+        }
+
+    # ── Chunking — découpage par méthodes ─────────────────────────────────────
+
+    @staticmethod
+    def _chunk_code_by_methods(code: str, language: str, max_chunk: int = 4000) -> list[str]:
+        """
+        Découpe le code source par méthodes/fonctions.
+        Retourne une liste de chunks, chacun contenant 1+ méthodes complètes.
+
+        Si le fichier est assez petit (< max_chunk), retourne [code] tel quel.
+        Ne modifie jamais le contenu — découpe uniquement.
+        """
+        if len(code) <= max_chunk:
+            return [code]
+
+        lang = language.lower()
+
+        # Patterns pour détecter les débuts de méthodes selon le langage
+        if lang == "java":
+            pattern = re.compile(
+                r'^(?:[ \t]*(?:@\w+(?:\([^)]*\))?\s*\n)*)[ \t]*'
+                r'(?:public|private|protected|static|final|synchronized|abstract|native|default)\s+',
+                re.MULTILINE,
+            )
+        elif lang == "python":
+            pattern = re.compile(
+                r'^(?:[ \t]*@\w+(?:\([^)]*\))?\s*\n)*[ \t]*(?:def|class|async\s+def)\s+',
+                re.MULTILINE,
+            )
+        elif lang in ("typescript", "javascript"):
+            pattern = re.compile(
+                r'^[ \t]*(?:export\s+)?(?:async\s+)?(?:function|class|const\s+\w+\s*=\s*(?:async\s*)?\()',
+                re.MULTILINE,
+            )
+        else:
+            # Fallback : découper par lignes (chunks de max_chunk chars)
+            lines = code.splitlines(keepends=True)
+            chunks, current = [], ""
+            for line in lines:
+                if len(current) + len(line) > max_chunk and current:
+                    chunks.append(current)
+                    current = ""
+                current += line
+            if current:
+                chunks.append(current)
+            return chunks or [code]
+
+        # Trouver les positions de début de chaque méthode
+        matches = list(pattern.finditer(code))
+        if not matches:
+            return [code]
+
+        # Découper le code entre les méthodes, respectant max_chunk
+        # Le header (imports, déclaration classe) est inclus dans le premier chunk
+        header = code[:matches[0].start()] if matches[0].start() > 0 else ""
+        chunks = []
+        current_chunk = header
+
+        for i, m in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(code)
+            method_block = code[m.start():end]
+
+            if len(current_chunk) + len(method_block) > max_chunk and current_chunk.strip():
+                chunks.append(current_chunk)
+                # Nouveau chunk : inclure le header pour le contexte (imports/classe)
+                current_chunk = header + method_block
+            else:
+                current_chunk += method_block
+
+        if current_chunk.strip():
+            chunks.append(current_chunk)
+
+        return chunks or [code]
+
+    def analyze_code_chunked(
+        self,
+        code: str,
+        context: dict[str, Any],
+        precomputed_docs:   list | None = None,
+        precomputed_scores: list | None = None,
+    ) -> dict[str, Any]:
+        """
+        Analyse un fichier de code avec découpage par méthodes.
+
+        QUAND UTILISER :
+          - Fichiers > 5000 chars (sinon, utiliser analyze_code_with_rag directement)
+          - Modèles avec contexte limité ou rate-limiting strict
+
+        LOGIQUE :
+          1. Découper le code en chunks par méthode
+          2. Analyser chaque chunk individuellement via analyze_code_with_rag()
+          3. Agréger les résultats
+
+        La logique de analyze_code_with_rag() est PRÉSERVÉE — on l'appelle pour chaque chunk.
+        """
+        language = context.get("language", "unknown")
+        chunks = self._chunk_code_by_methods(code, language)
+
+        if len(chunks) == 1:
+            # Fichier petit ou non découpable → analyse standard
+            return self.analyze_code_with_rag(
+                code, context, precomputed_docs, precomputed_scores
+            )
+
+        logger.info(
+            "Chunked analysis: %s → %d chunks",
+            context.get("file_path", "?"), len(chunks),
+        )
+
+        # Analyser chaque chunk
+        all_analyses = []
+        all_knowledge = []
+        all_scores = []
+        total_docs = 0
+        has_security = False
+
+        for i, chunk in enumerate(chunks, 1):
+            chunk_ctx = {**context, "chunk": f"{i}/{len(chunks)}"}
+            result = self.analyze_code_with_rag(
+                chunk, chunk_ctx, precomputed_docs, precomputed_scores,
+            )
+            analysis_text = result.get("analysis", "")
+            if analysis_text and "no major issues" not in analysis_text.lower():
+                all_analyses.append(f"--- Chunk {i}/{len(chunks)} ---\n{analysis_text}")
+            all_knowledge.extend(result.get("relevant_knowledge", []))
+            all_scores.extend(result.get("rag_scores", []))
+            total_docs += result.get("docs_used", 0)
+            if result.get("security_mode"):
+                has_security = True
+
+        combined_analysis = "\n\n".join(all_analyses) if all_analyses else "Code quality is good, no major issues."
+
+        return {
+            "analysis":           combined_analysis,
+            "relevant_knowledge": all_knowledge,
+            "rag_scores":         all_scores,
+            "docs_used":          total_docs,
+            "security_mode":      has_security,
             "code":               code,
             "context":            context,
         }
@@ -838,12 +1031,15 @@ CHANGES MADE:
 
 WRITE THE COMPLETE SOLUTION NOW:"""
 
-        try:
-            response = self.llm.invoke(prompt)
-            return response.content if hasattr(response, "content") else str(response)
-        except Exception as e:
-            logger.error("generate_complete_solution erreur : %s", e)
-            return f"Erreur génération solution : {e}"
+        result = invoke_with_fallback(
+            prompt,
+            temperature = config.api.temperature,
+            max_tokens  = config.api.max_tokens,
+            label       = f"solution:{context.get('file_path', '?')}",
+        )
+        if result is None:
+            return "Erreur : tous les providers LLM sont indisponibles (vérifiez vos clés API)."
+        return result
 
     def generate_refactoring_plan(self, analysis_results: list[dict]) -> str:
         """
@@ -929,12 +1125,15 @@ RECOMMANDATIONS FINALES
 
 PLAN:"""
 
-        try:
-            response = self.llm.invoke(prompt)
-            return response.content if hasattr(response, "content") else str(response)
-        except Exception as e:
-            logger.error("Erreur generation plan refactoring : %s", e)
-            return f"Erreur lors de la generation du plan: {e}"
+        result = invoke_with_fallback(
+            prompt,
+            temperature = config.api.temperature,
+            max_tokens  = config.api.max_tokens,
+            label       = "refactoring-plan",
+        )
+        if result is None:
+            return "Erreur : tous les providers LLM sont indisponibles (vérifiez vos clés API)."
+        return result
 
 
 assistant_agent = CodeRAGSystemAPI()

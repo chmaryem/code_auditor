@@ -46,9 +46,6 @@ _CY = "\033[96m"
 _DM = "\033[2m"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Résolution intelligente à 3 niveaux (miroir de git_conflict_resolver)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _merge_3way(base: str, ours: str, theirs: str) -> Optional[str]:
     """
@@ -153,14 +150,8 @@ def _resolve_with_gemini_budget(
 ) -> Optional[str]:
     """
     Résolution LLM avec budget strict — seulement les blocs différents.
-    v6.2 : enrichi avec le contexte RAG (patterns, vulnérabilités détectées).
+    v6.3 : cascade OpenAI → Gemini → Groq via services.llm_factory.
     """
-    import os, time
-    from dotenv import load_dotenv
-    load_dotenv(Path(_project_root) / ".env")
-    api_key  = os.getenv("GOOGLE_API_KEY")
-    groq_key = os.getenv("GROQ_API_KEY")
-
     ext = Path(filename).suffix.lstrip(".")
 
     # Extraire les blocs différents seulement
@@ -190,7 +181,7 @@ def _resolve_with_gemini_budget(
         f"Conflicts to resolve:\n{conflicts_text}\n"
     )
 
-    # v6.2 : Injecter le contexte RAG dans le prompt
+    # Injecter le contexte RAG dans le prompt
     if rag_context:
         prompt += "\nRelevant project patterns (from knowledge base):\n"
         for k in rag_context[:5]:
@@ -207,81 +198,263 @@ def _resolve_with_gemini_budget(
         f"If cannot resolve: output OURS_FALLBACK"
     )
 
-    # Gemini first
-    if api_key:
-        for model in [os.getenv("GEMINI_MODEL", "gemini-2.5-flash"), "gemini-2.0-flash", "gemini-1.5-flash"]:
-            for attempt in range(2):
-                try:
-                    from langchain_google_genai import ChatGoogleGenerativeAI
-                    llm = ChatGoogleGenerativeAI(
-                        model=model, google_api_key=api_key,
-                        max_output_tokens=2048, temperature=0.0,
-                    )
-                    resp = llm.invoke(prompt)
-                    text = resp.content.strip() if hasattr(resp, "content") else str(resp)
-                    if "OURS_FALLBACK" in text:
-                        return ours
-                    if "<<<<<<" not in text:
-                        return text
-                except Exception as e:
-                    err = str(e)
-                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                        wait = 20 if attempt == 0 else 50
-                        print(f"    {_YL}[{model}] quota → attente {wait}s...{_R}", end="", flush=True)
-                        time.sleep(wait)
-                        if attempt == 1:
-                            break
-                    else:
-                        break
-
-    # Groq fallback
-    if groq_key:
-        for model_g, display in [
-            ("llama-3.3-70b-versatile", "Groq Llama3.3-70B"),
-            ("llama-4-scout-17b-16e-instruct", "Groq Llama4-Scout"),
-        ]:
-            try:
-                from langchain_groq import ChatGroq
-                llm_g = ChatGroq(model=model_g, temperature=0.0, groq_api_key=groq_key, max_tokens=4096)
-                resp = llm_g.invoke(prompt)
-                text = resp.content.strip() if hasattr(resp, "content") else str(resp)
-                if "OURS_FALLBACK" in text:
-                    return ours
-                if "<<<<<<" not in text:
-                    print(f" {display}", end="", flush=True)
-                    return text
-            except Exception as e:
-                logger.warning("Groq [%s] echec: %s", display, e)
-
-    # Dernier recours : OURS
+    # Cascade OpenAI → Gemini → Groq via llm_factory
+    from services.llm_factory import invoke_with_fallback
+    text = invoke_with_fallback(
+        prompt,
+        temperature = 0.0,
+        max_tokens  = 10000,
+        label       = f"resolve:{filename}",
+    )
+    if text is None:
+        return ours
+    if "OURS_FALLBACK" in text:
+        return ours
+    if "<<<<<<" not in text:
+        return text
     return ours
+
+
+# ── Interactive conflict resolution helpers ───────────────────────────────────
+
+def _classify_block_type(ours_text: str, theirs_text: str, filename: str) -> str:
+    """Classifie un bloc de diff: 'import', 'method', 'simple', ou 'other'."""
+    combined = (ours_text + "\n" + theirs_text).strip()
+    lines = [l.strip() for l in combined.splitlines() if l.strip()]
+    if not lines:
+        return "simple"
+    ext = Path(filename).suffix.lower()
+
+    # Imports
+    if ext == ".java" and all(l.startswith(("import ", "package ")) for l in lines):
+        return "import"
+    if ext == ".py" and all(l.startswith(("import ", "from ")) for l in lines):
+        return "import"
+    if ext in (".ts", ".js") and all("import " in l or "require(" in l for l in lines):
+        return "import"
+
+    # Method bodies
+    if ext == ".java" and re.search(
+        r'(?:public|private|protected)\s+(?:static\s+)?\w+[\w<>\[\]]*\s+\w+\s*\(', combined
+    ):
+        return "method"
+    if ext == ".py" and re.search(r'^\s*(async\s+)?def\s+\w+', combined, re.MULTILINE):
+        return "method"
+    if ext in (".ts", ".js") and re.search(r'(?:function|class|const\s+\w+\s*=)\s', combined):
+        return "method"
+
+    # Simple (whitespace only)
+    o = {l.strip() for l in ours_text.splitlines() if l.strip()}
+    t = {l.strip() for l in theirs_text.splitlines() if l.strip()}
+    if len(o.symmetric_difference(t)) <= 2:
+        return "simple"
+    return "other"
+
+
+def _auto_merge_imports(ours_text: str, theirs_text: str) -> str:
+    """Fusionne les imports des 2 côtés (dédupliqués, triés)."""
+    all_lines = list(dict.fromkeys(
+        [l for l in ours_text.splitlines() if l.strip()]
+        + [l for l in theirs_text.splitlines() if l.strip()]
+    ))
+    packages = [l for l in all_lines if l.strip().startswith("package ")]
+    imports = sorted(set(l for l in all_lines if l.strip().startswith(("import ", "from "))))
+    others = [l for l in all_lines if l not in packages and l not in imports]
+    result = packages + ([""] if packages and imports else []) + imports + others
+    return "\n".join(result) + "\n"
+
+
+def _prompt_user_choice(
+    filename: str, ours_block: str, theirs_block: str, block_type: str,
+) -> str:
+    """Affiche les 2 versions et demande [1] OURS [2] THEIRS [3] LLM."""
+    short = Path(filename).name
+    label = {"method": "MÉTHODE", "other": "LOGIQUE"}.get(block_type, "BLOC")
+
+    print(f"\n  {'─' * 60}")
+    print(f"  {_CY}{_B}Conflit {label} dans {short}{_R}")
+    print(f"  {'─' * 60}")
+
+    for tag, color, block in [("[1] OURS (base)", _GR, ours_block),
+                               ("[2] THEIRS (feature)", _YL, theirs_block)]:
+        preview = "\n".join(f"    {l}" for l in block.splitlines()[:12])
+        extra = len(block.splitlines()) - 12
+        if extra > 0:
+            preview += f"\n    {_DM}... (+{extra} lignes){_R}"
+        print(f"\n  {color}{tag} :{_R}")
+        print(preview)
+
+    print(f"\n  {_CY}[3] MERGER par LLM (résolution intelligente){_R}")
+    print(f"  {'─' * 60}")
+
+    while True:
+        try:
+            c = input(f"  Choix [1/2/3] (défaut=1) : ").strip()
+            if c in ("", "1"):
+                return "ours"
+            if c == "2":
+                return "theirs"
+            if c == "3":
+                return "llm"
+            print(f"  {_RD}Tapez 1, 2 ou 3.{_R}")
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n  {_DM}→ OURS par défaut{_R}")
+            return "ours"
+
+
+def _resolve_block_with_llm(
+    filename: str, ours_block: str, theirs_block: str, rag_context: list = None,
+) -> str:
+    """Résout UN bloc de conflit via LLM."""
+    ext = Path(filename).suffix.lstrip(".")
+    prompt = (
+        f"Merge this conflict in {filename} ({ext}).\n"
+        f"Combine the best of both. Keep security fixes.\n\n"
+        f"OURS:\n```{ext}\n{ours_block}\n```\n\n"
+        f"THEIRS:\n```{ext}\n{theirs_block}\n```\n"
+    )
+    if rag_context:
+        prompt += "\nPatterns:\n"
+        for k in (rag_context or [])[:3]:
+            name = k.get("pattern", k.get("name", "")) if isinstance(k, dict) else str(k)
+            if name:
+                prompt += f"- {name}\n"
+    prompt += "\nOutput ONLY the merged code. No explanations, no fences.\n"
+
+    from services.llm_factory import invoke_with_fallback
+    text = invoke_with_fallback(prompt, temperature=0.0, max_tokens=4000,
+                                label=f"merge_block:{Path(filename).name}")
+    if text and "<<<<<<" not in text:
+        text = re.sub(r'^```\w*\n', '', text)
+        text = re.sub(r'\n```\s*$', '', text)
+        return text
+    return ours_block
+
+
+def _validate_resolution(code: str) -> tuple:
+    """Validation rapide du code résolu (0 dépendance externe)."""
+    if "<<<<<<" in code or "=======" in code:
+        return False, "Marqueurs de conflit non résolus"
+    if code.count("{") != code.count("}"):
+        return False, f"Accolades déséquilibrées ({code.count('{')}/{code.count('}')})"
+    if not code.strip():
+        return False, "Contenu vide"
+    return True, "OK"
 
 
 def resolve_file_smart(
     filename: str, base_content: str, ours_content: str, theirs_content: str,
     rag_context: list = None,
-) -> Tuple[Optional[str], str]:
+) -> Tuple[Optional[str], str, list]:
     """
-    Pipeline à 3 niveaux. Retourne (contenu_résolu, méthode).
-    v6.2 : le contexte RAG est passé au niveau 3 (Gemini).
+    Pipeline interactif à 3 niveaux. Retourne (contenu, méthode, details[]).
+
+    v7.3 — Résolution interactive :
+      - Auto : imports, package, whitespace, simple changes
+      - Interactif : method bodies, logique → [1] OURS [2] THEIRS [3] LLM
+      - Sandbox : validation après résolution LLM
     """
-    # Niveau 1 : 3-way déterministe (0 token)
-    result = _merge_3way(base_content, ours_content, theirs_content)
-    if result:
-        return result, "3way"
+    # Niveau 0 : fichiers identiques
+    if ours_content == theirs_content:
+        return ours_content, "identical", []
 
-    # Niveau 2 : merge conservateur (0 token)
-    result = _merge_conservative(ours_content, theirs_content, filename)
-    if result:
-        return result, "conservative"
+    # Niveau 1 : 3-way sans conflit (modifications dans des zones séparées)
+    ours_lines = ours_content.splitlines(keepends=True)
+    theirs_lines = theirs_content.splitlines(keepends=True)
+    opcodes = list(difflib.SequenceMatcher(None, ours_lines, theirs_lines).get_opcodes())
 
-    # Niveau 3 : Gemini budget minimal + RAG context
-    print(f"    {_YL}conflit complexe -> Gemini + RAG{_R}", end="", flush=True)
-    result = _resolve_with_gemini_budget(filename, ours_content, theirs_content, rag_context)
-    if result:
-        return result, "gemini_rag"
+    # Check if all diffs are imports/simple → full auto
+    diff_blocks = [(tag, i1, i2, j1, j2) for tag, i1, i2, j1, j2 in opcodes if tag != "equal"]
+    if not diff_blocks:
+        return ours_content, "identical", []
 
-    return None, "failed"
+    all_auto = True
+    for tag, i1, i2, j1, j2 in diff_blocks:
+        ours_block = "".join(ours_lines[i1:i2])
+        theirs_block = "".join(theirs_lines[j1:j2])
+        btype = _classify_block_type(ours_block, theirs_block, filename)
+        if btype not in ("import", "simple"):
+            all_auto = False
+            break
+
+    if all_auto:
+        # All diffs are imports/simple → auto-merge without asking
+        result = _merge_3way(base_content, ours_content, theirs_content)
+        if result:
+            return result, "3way", [{"type": "import", "choice": "auto"}]
+        return ours_content, "conservative", [{"type": "import", "choice": "auto"}]
+
+    # Niveau 2 : Résolution interactive bloc par bloc
+    print(f"\n  {_CY}Résolution interactive pour {Path(filename).name}{_R}")
+    resolved_lines = []
+    details = []
+    used_llm = False
+
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            resolved_lines.extend(ours_lines[i1:i2])
+            continue
+
+        ours_block = "".join(ours_lines[i1:i2])
+        theirs_block = "".join(theirs_lines[j1:j2])
+        btype = _classify_block_type(ours_block, theirs_block, filename)
+
+        if btype == "import":
+            merged = _auto_merge_imports(ours_block, theirs_block)
+            resolved_lines.extend(merged.splitlines(keepends=True))
+            details.append({"type": "import", "choice": "auto",
+                            "ours": ours_block[:100], "theirs": theirs_block[:100]})
+            print(f"    {_GR}✓ Imports fusionnés automatiquement{_R}")
+        elif btype == "simple":
+            resolved_lines.extend(ours_lines[i1:i2])
+            details.append({"type": "simple", "choice": "auto"})
+        else:
+            # Interactive
+            choice = _prompt_user_choice(filename, ours_block, theirs_block, btype)
+            if choice == "ours":
+                resolved_lines.extend(ours_lines[i1:i2])
+            elif choice == "theirs":
+                resolved_lines.extend(theirs_lines[j1:j2])
+            elif choice == "llm":
+                used_llm = True
+                print(f"    {_YL}Résolution LLM en cours...{_R}", end="", flush=True)
+                merged = _resolve_block_with_llm(filename, ours_block, theirs_block, rag_context)
+                resolved_lines.extend(merged.splitlines(keepends=True))
+                if not merged.endswith("\n"):
+                    resolved_lines.append("\n")
+                print(f" {_GR}✓{_R}")
+            details.append({"type": btype, "choice": choice,
+                            "ours": ours_block[:200], "theirs": theirs_block[:200]})
+
+    result = "".join(resolved_lines)
+
+    # Validation
+    valid, msg = _validate_resolution(result)
+    if not valid:
+        print(f"    {_RD}Validation échouée : {msg} → fallback OURS{_R}")
+        return ours_content, "fallback", details
+
+    # Sandbox validation pour résolutions LLM
+    if used_llm:
+        try:
+            from services.sandbox_executor import SandboxExecutor
+            script = (
+                f"code = '''{result[:3000]}'''\n"
+                f"# Quick syntax check\n"
+                f"braces = code.count('{{') == code.count('}}')\n"
+                f"no_markers = '<<<<<<' not in code\n"
+                f"print('SANDBOX_OK' if braces and no_markers else 'SANDBOX_FAIL')\n"
+            )
+            sb_result = SandboxExecutor(timeout=15).execute(script)
+            if sb_result.success and "SANDBOX_OK" in (sb_result.stdout or ""):
+                print(f"    {_GR}✓ Sandbox validé{_R}")
+            else:
+                print(f"    {_YL}⚠ Sandbox warning (résultat conservé){_R}")
+        except Exception:
+            pass  # Sandbox non disponible → OK
+
+    method = "interactive" + ("_llm" if used_llm else "")
+    return result, method, details
 
 
 def _ensure_list(value: Any) -> List:
@@ -302,73 +475,112 @@ def _generate_resolve_readme(
     pr_number: int, orig_title: str, base_ref: str, head_ref: str,
     resolved_files: List[str], failed_files: List[str],
     diffs: List[str], rag_patterns: Dict[str, List[str]],
+    resolution_details: Dict[str, list] = None,
 ) -> str:
     """
-    Génère un RESOLVE_README.md pour documenter la résolution automatique.
-    0 token LLM — template Markdown pur.
+    Génère un RESOLVE_README.md enrichi avec les détails de résolution.
+    v7.3 : inclut le type de conflit, la méthode choisie, et les previews.
     """
     lines = [
         f"# Auto-Resolve Report — PR #{pr_number}",
         "",
         f"> **PR originale** : #{pr_number} — *{orig_title}*",
         f"> **Branche base** : `{base_ref}` | **Branche source** : `{head_ref}`",
-        f"> **Generé par** : Code Auditor v6.2 (RAG-enhanced conflict resolution)",
-        "",
-        "## Fichiers résolus",
+        f"> **Généré par** : Code Auditor v7.3 (Interactive + RAG-enhanced resolution)",
         "",
     ]
 
+    # Résumé
     if resolved_files:
-        lines.append("| Fichier | Méthode | Status |")
-        lines.append("|---|---|---|")
+        lines.append("## Résumé des résolutions")
+        lines.append("")
+        lines.append("| Fichier | Méthode | Conflits | Détails |")
+        lines.append("|---|---|---|---|")
         for d in diffs:
-            # Parse "- **filename**: ...L -> ...L -> resolved ...L (`method`)"
             parts = d.replace("- **", "").split("**")
             fname = parts[0] if parts else "?"
             method = "3way"
             if "`" in d:
                 method = d.split("`")[1]
-            lines.append(f"| `{fname}` | {method} | Resolved |")
+            # Count details for this file
+            file_details = (resolution_details or {}).get(fname, [])
+            n_auto = sum(1 for x in file_details if x.get("choice") == "auto")
+            n_interactive = sum(1 for x in file_details if x.get("choice") in ("ours", "theirs", "llm"))
+            detail_str = f"{n_auto} auto"
+            if n_interactive:
+                detail_str += f", {n_interactive} interactif"
+            lines.append(f"| `{fname}` | `{method}` | {len(file_details)} | {detail_str} |")
         lines.append("")
     else:
+        lines.append("## Fichiers résolus")
+        lines.append("")
         lines.append("*Aucun fichier résolu automatiquement.*")
         lines.append("")
 
+    # Détails par fichier
+    if resolution_details:
+        lines.append("## Détails des résolutions")
+        lines.append("")
+        for fname, details in resolution_details.items():
+            if not details:
+                continue
+            lines.append(f"### `{Path(fname).name}`")
+            lines.append("")
+            for i, d in enumerate(details, 1):
+                btype = d.get("type", "?")
+                choice = d.get("choice", "?")
+                icon = {"auto": "✅", "ours": "🔵 OURS", "theirs": "🟡 THEIRS", "llm": "🤖 LLM"}.get(choice, "?")
+                lines.append(f"**Bloc {i}** — Type: `{btype}` | Résolution: {icon}")
+                lines.append("")
+                # Preview for non-trivial blocks
+                if btype in ("method", "other") and d.get("ours"):
+                    ours_preview = d["ours"][:150].replace("\n", "\n> ")
+                    lines.append(f"<details><summary>OURS (preview)</summary>")
+                    lines.append(f"")
+                    lines.append(f"```")
+                    lines.append(f"{ours_preview}")
+                    lines.append(f"```")
+                    lines.append(f"</details>")
+                    lines.append("")
+                if btype in ("method", "other") and d.get("theirs"):
+                    theirs_preview = d["theirs"][:150].replace("\n", "\n> ")
+                    lines.append(f"<details><summary>THEIRS (preview)</summary>")
+                    lines.append(f"")
+                    lines.append(f"```")
+                    lines.append(f"{theirs_preview}")
+                    lines.append(f"```")
+                    lines.append(f"</details>")
+                    lines.append("")
+
     if failed_files:
-        lines.append("## Resolution manuelle requise")
+        lines.append("## Résolution manuelle requise")
         lines.append("")
         for f in failed_files:
             lines.append(f"- [ ] `{f}`")
         lines.append("")
 
-    # Section RAG patterns
     if rag_patterns:
-        lines.append("## Patterns détectés (Knowledge Graph)")
-        lines.append("")
-        lines.append("Les patterns suivants ont été utilisés pour guider la résolution :")
+        lines.append("## Patterns Knowledge Graph")
         lines.append("")
         for filename, patterns in rag_patterns.items():
             if patterns:
-                lines.append(f"### `{filename}`")
-                for p in patterns:
-                    lines.append(f"- {p}")
+                lines.append(f"**`{Path(filename).name}`** : {', '.join(patterns[:5])}")
                 lines.append("")
 
     lines.extend([
         "## Instructions pour le reviewer",
         "",
-        "1. Vérifier que les résolutions préservent la logique métier",
+        "1. Vérifier les résolutions interactives (marquées 🔵/🟡/🤖)",
         "2. Vérifier qu'aucune vulnérabilité n'a été réintroduite",
         "3. Exécuter les tests unitaires avant de merger",
         "",
         "```bash",
         f"git fetch origin && git checkout auto-resolve/pr-{pr_number}",
-        "# Vérifier les changements",
         "git diff main..HEAD",
         "```",
         "",
         "---",
-        "*Généré automatiquement par Code Auditor — ne pas modifier manuellement.*",
+        "*Généré automatiquement par Code Auditor v7.3*",
     ])
 
     return "\n".join(lines)
@@ -439,6 +651,7 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
         # 5. Résoudre chaque fichier avec contexte RAG
         resolved_files, failed_files, diffs = [], [], []
         rag_patterns = {}  # {filename: [pattern_names]} pour le README
+        resolution_details = {}  # {filename: [detail_dicts]} pour le README enrichi
 
         for f in code_files:
             filename = f.get("filename", f.get("path", ""))
@@ -469,7 +682,6 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
                 if not file_rag_context and rag:
                     rag_result = rag.analyze(head_content, filename, ext)
                     file_rag_context = rag_result.get("relevant_knowledge", [])
-                    # Extraire aussi les noms de patterns pour le README
                     if file_rag_context:
                         print(f" [rag:{len(file_rag_context)}]", end="", flush=True)
             except Exception as e:
@@ -487,7 +699,7 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
             if pattern_names:
                 rag_patterns[filename] = pattern_names
 
-            resolved, method = resolve_file_smart(
+            resolved, method, details = resolve_file_smart(
                 filename, base_content, base_content, head_content,
                 rag_context=file_rag_context,
             )
@@ -496,6 +708,7 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
                 msg = f"auto-resolve: {filename} (method={method})"
                 github.push_file(owner, repo, filename, resolved, msg, branch_name)
                 resolved_files.append(filename)
+                resolution_details[filename] = details
                 b = len(base_content.splitlines())
                 h = len(head_content.splitlines())
                 r = len(resolved.splitlines())
@@ -533,6 +746,7 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
             readme_content = _generate_resolve_readme(
                 pr_number, orig_title, base_ref, head_ref,
                 resolved_files, failed_files, diffs, rag_patterns,
+                resolution_details=resolution_details,
             )
             try:
                 github.push_file(
@@ -553,7 +767,7 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
                 body="\n".join([
                     f"## Conflict resolution for PR #{pr_number}",
                     f"Original : #{pr_number} — *{orig_title}*", "",
-                    "Created by **Code Auditor** v6.2 — RAG-enhanced conflict resolution.", "",
+                    "Created by **Code Auditor** v7.3 — Interactive + RAG-enhanced resolution.", "",
                     "### Resolution Methods", "",
                 ] + diffs + [
                     "",

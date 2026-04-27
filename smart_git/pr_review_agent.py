@@ -1,32 +1,41 @@
 """
-pr_review_agent.py — Agent MCP Code Mode pour la revue de Pull Requests.
+pr_review_agent.py — Agent de revue de Pull Requests.
 
-FIX v4 :
-  Bug analyse incorrect : le système analysait le code de main (branch de base)
-  au lieu du code de la feature branch. C'est pourquoi score=0 même avec des bugs.
-  
-  Le PR_REVIEW_SYSTEM_PROMPT maintenant force explicitement l'utilisation de
-  head_ref (la branche feature) pour get_file_content().
+REFACTOR v7 — Direct Python (0 token CodeModeAgent) :
 
-  Résultat attendu :
-    - PR avec UserService.java bugué (SQL injection, mot de passe en dur) :
-      ✗ MERGE BLOQUÉ — score 45+
-      CRITICAL: 2+ · HIGH: 3+ · Fichiers: 1
-    - Review posté sur GitHub avec analyse RAG détaillée
+  AVANT (v4-v6) :
+    CodeModeAgent génère un script Python (LLM #1 ~500-800 tokens)
+    → Sandbox l'exécute
+    → rag.analyze() appelle Gemini (LLM #2)
+    TOTAL : 2 appels LLM par exécution + overhead de génération de script
+
+  APRÈS (v7) :
+    Appels directs github.* + rag.analyze() (LLM unique, 1 par fichier)
+    → Même architecture que conflict_resolution_agent.py
+    → Cache-first : 0 token LLM si fichier déjà en cache Watch
+    TOTAL : 0-1 appel LLM par fichier (selon cache)
+
+  Économie : -50% à -80% de consommation quota selon le cache.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
 _project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(_project_root))
+
+# Force UTF-8 sur Windows
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 _R  = "\033[0m"
 _B  = "\033[1m"
@@ -36,117 +45,213 @@ _RD = "\033[91m"
 _CY = "\033[96m"
 _DM = "\033[2m"
 
-
-def _extract_json_from_output(raw_output: str) -> dict:
-    """Extrait le JSON résultat depuis le stdout du sandbox."""
-    if not raw_output:
-        return {}
-    lines = raw_output.strip().splitlines()
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("{") or line.startswith("["):
-            try:
-                result = json.loads(line)
-                if isinstance(result, dict):
-                    return result
-            except json.JSONDecodeError:
-                continue
-    try:
-        start = raw_output.rfind("{")
-        end   = raw_output.rfind("}") + 1
-        if start != -1 and end > start:
-            return json.loads(raw_output[start:end])
-    except Exception:
-        pass
-    return {}
+CODE_EXTENSIONS = {".java", ".py", ".js", ".ts", ".jsx", ".tsx"}
 
 
-def create_pr_review_agent():
-    from agents.code_mode_agent import CodeModeAgent, PR_REVIEW_SYSTEM_PROMPT
-    return CodeModeAgent(system_prompt=PR_REVIEW_SYSTEM_PROMPT)
+def _detect_language(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    return {
+        ".py": "python", ".java": "java",
+        ".js": "javascript", ".jsx": "javascript",
+        ".ts": "typescript", ".tsx": "typescript",
+    }.get(ext, "unknown")
 
 
 async def review_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
     """
-    Analyse une Pull Request via MCP Code Mode avec le pipeline RAG complet.
+    Analyse une Pull Request via appels directs rag.analyze() (sans CodeModeAgent).
 
-    RÉSULTAT ATTENDU dans le terminal (PR avec UserService.java bugué) :
-      ✗ MERGE BLOQUÉ — score 45
-      CRITICAL: 2 · HIGH: 3 · Fichiers: 1 · Itérations: 1
-
-    RÉSULTAT ATTENDU sur GitHub :
-      Un review posté automatiquement avec :
-      - Score total RAG
-      - Bugs détectés par fichier (SQL injection, credentials hardcodés, etc.)
-      - Verdict REQUEST_CHANGES avec description détaillée
+    Architecture v7 :
+      1. github.get_pr_info()      → head_ref / base_ref
+      2. github.get_pr_files()     → liste des fichiers modifiés
+      3. Pour chaque fichier code :
+           a. cache.read_analysis(filename)  [0 token si hit]
+           b. Si miss : rag.analyze(content, filename, language, patch)  [1 token LLM]
+           c. kg.detect_patterns(content, language)
+      4. Calcul score total → verdict
+      5. github.post_review() → review posté sur GitHub
 
     IMPORTANT : analyse le code de la FEATURE BRANCH (head_ref), pas de main.
-    C'est pourquoi les bugs sont détectés même si main est propre.
     """
     import asyncio
 
-    print(f"\n  {_CY}{_B}Code Auditor — Revue PR #{pr_number} (MCP Code Mode){_R}")
+    print(f"\n  {_CY}{_B}Code Auditor — Revue PR #{pr_number} (Direct Mode v7){_R}")
     print(f"  {_DM}Repo : {owner}/{repo}{_R}")
-    print(f"  {_DM}Mode : Agent autonome avec sandbox{_R}\n")
+    print(f"  {_DM}Mode : Direct Python (0 overhead CodeModeAgent){_R}\n")
 
-    agent = create_pr_review_agent()
+    try:
+        from services.code_mode_client import github, rag, kg, cache
+    except ImportError as e:
+        print(f"  {_RD}✗ Erreur import code_mode_client : {e}{_R}\n")
+        return {"success": False, "error": str(e)}
 
-    task = (
-        f"Review Pull Request #{pr_number} on {owner}/{repo}.\n\n"
-        f"owner = '{owner}'\n"
-        f"repo = '{repo}'\n"
-        f"pr_number = {pr_number}\n\n"
-        f"CRITICAL: Fetch file content from the FEATURE BRANCH (head_ref), NOT from main.\n"
-        f"pr_info = github.get_pr_info(owner, repo, pr_number)\n"
-        f"head_ref = pr_info['head']['ref']   ← use THIS branch for get_file_content()\n"
-        f"files = github.get_pr_files(owner, repo, pr_number)\n"
-        f"For each file: content = github.get_file_content(owner, repo, filename, head_ref)\n"
-        f"Then: analysis = rag.analyze(content, filename, language, patch)\n"
-    )
+    try:
+        # ── 1. Infos PR ──────────────────────────────────────────────────────
+        print(f"  Récupération PR #{pr_number}...")
+        pr_info = github.get_pr_info(owner, repo, pr_number)
+        if not pr_info:
+            return {"success": False, "error": "PR introuvable"}
 
-    result = await asyncio.to_thread(agent.run, task)
+        head_ref = pr_info.get("head", {}).get("ref", "")
+        base_ref = pr_info.get("base", {}).get("ref", "main")
+        pr_title = pr_info.get("title", f"PR #{pr_number}")
+        print(f"  {_DM}head={head_ref}  base={base_ref}{_R}")
 
-    if result["success"]:
-        parsed = _extract_json_from_output(result["output"])
+        # ── 2. Fichiers modifiés ──────────────────────────────────────────────
+        print(f"  Récupération des fichiers...")
+        files = github.get_pr_files(owner, repo, pr_number)
+        code_files = [
+            f for f in files
+            if Path(f.get("filename", f.get("path", ""))).suffix.lower() in CODE_EXTENSIONS
+        ]
+        print(f"  {len(code_files)} fichier(s) à analyser sur {len(files)} modifiés\n")
 
-        verdict  = parsed.get("verdict",   "UNKNOWN")
-        score    = parsed.get("score",     0)
-        critical = parsed.get("critical",  0)
-        high     = parsed.get("high",      0)
-        files    = parsed.get("files_analyzed", 0)
+        # ── 3. Analyse de chaque fichier ──────────────────────────────────────
+        total_score    = 0.0
+        total_critical = 0
+        total_high     = 0
+        total_medium   = 0
+        files_analyzed = 0
+        per_file_results: List[str] = []
 
+        for f in code_files:
+            filename = f.get("filename", f.get("path", ""))
+            patch    = f.get("patch", "")
+            language = _detect_language(filename)
+            ext      = Path(filename).suffix.lstrip(".")
+
+            print(f"  {_DM}→ {filename}{_R}", end="", flush=True)
+
+            # a. Cache-first (0 token LLM si hit)
+            cached_text = cache.read_analysis(filename)
+            if cached_text:
+                result = rag.count_severity(cached_text)
+                result["source"] = "cache"
+                print(f" {_GR}[cache]{_R}", end="", flush=True)
+            else:
+                # b. Télécharger le contenu de la feature branch
+                content = github.get_file_content(owner, repo, filename, head_ref)
+                if not content:
+                    print(f" {_YL}[vide]{_R}")
+                    continue
+
+                # Validation : détecter contenu binaire/corrompu
+                _printable = sum(1 for c in content[:1000] if c.isprintable() or c in '\n\r\t')
+                if len(content) > 20 and _printable / min(len(content), 1000) < 0.80:
+                    print(f" {_YL}[skip: contenu binaire/corrompu]{_R}")
+                    continue
+
+                # c. Analyse RAG complète (1 appel LLM)
+                result = rag.analyze(content, filename, language, patch)
+                print(f" {_DM}[rag score={result.get('score', 0):.0f}]{_R}", end="", flush=True)
+
+            # d. Knowledge Graph patterns
+            try:
+                content_for_kg = (
+                    github.get_file_content(owner, repo, filename, head_ref)
+                    if not cached_text else cached_text
+                )
+                patterns = kg.detect_patterns(content_for_kg, language)
+                if patterns:
+                    print(f" [kg:{len(patterns)}]", end="", flush=True)
+            except Exception:
+                patterns = []
+
+            score    = result.get("score",    0)
+            critical = result.get("critical", 0)
+            high     = result.get("high",     0)
+            medium   = result.get("medium",   0)
+
+            total_score    += score
+            total_critical += critical
+            total_high     += high
+            total_medium   += medium
+            files_analyzed += 1
+
+            sev_icon = (
+                f"{_RD}✗" if critical > 0 else
+                f"{_YL}⚠" if high > 0     else
+                f"{_GR}✓"
+            ) + _R
+            print(f" {sev_icon} C:{critical} H:{high} M:{medium}")
+
+            # Résumé par fichier pour le review GitHub
+            analysis_snippet = result.get("analysis", "")[:600].replace("\n", "  \n")
+            per_file_results.append(
+                f"### `{filename}` — score {score:.0f}\n"
+                f"**CRITICAL**: {critical} | **HIGH**: {high} | **MEDIUM**: {medium}\n\n"
+                + (f"**KG Patterns**: {', '.join(patterns[:5])}\n\n" if patterns else "")
+                + f"<details><summary>Détails RAG</summary>\n\n{analysis_snippet}\n</details>\n"
+            )
+
+        # ── 4. Verdict ────────────────────────────────────────────────────────
+        if total_critical > 0 or total_score >= 35:
+            event = "REQUEST_CHANGES"
+        elif total_score >= 15:
+            event = "COMMENT"
+        else:
+            event = "APPROVE"
+
+        # ── 5. Review body ────────────────────────────────────────────────────
+        verdict_icon = {
+            "REQUEST_CHANGES": "❌ MERGE BLOQUÉ",
+            "COMMENT":         "⚠️ MERGE AVEC PRÉCAUTION",
+            "APPROVE":         "✅ MERGE AUTORISÉ",
+        }[event]
+
+        body_lines = [
+            f"## Code Auditor — PR Review #{pr_number}",
+            f"> **PR** : {pr_title}",
+            f"> **Verdict** : **{verdict_icon}**",
+            f"> **Score global** : {total_score:.0f} "
+            f"| CRITICAL: {total_critical} | HIGH: {total_high} | MEDIUM: {total_medium}",
+            f"> **Fichiers analysés** : {files_analyzed} / {len(code_files)}",
+            f"> **Pipeline** : RAG (ChromaDB + KnowledgeGraph + Multi-Model) — cache-first",
+            "",
+            "---",
+            "",
+        ] + per_file_results + [
+            "---",
+            "*Généré par Code Auditor v7 — [Direct Mode, 0 overhead CodeModeAgent]*",
+        ]
+        body = "\n".join(body_lines)
+
+        # ── 6. Post Review ────────────────────────────────────────────────────
+        print(f"\n  Posting review sur GitHub...")
+        github.post_review(owner, repo, pr_number, body, event)
+
+        # ── 7. Affichage terminal ─────────────────────────────────────────────
         verdict_display = {
             "REQUEST_CHANGES": f"{_RD}{_B}✗  MERGE BLOQUÉ{_R}",
             "COMMENT":         f"{_YL}{_B}⚠  MERGE AVEC PRÉCAUTION{_R}",
             "APPROVE":         f"{_GR}{_B}✓  MERGE AUTORISÉ{_R}",
-        }
-        display = verdict_display.get(verdict, f"{_YL}⚠  {verdict}{_R}")
+        }[event]
 
-        print(f"\n  {display} — score {score}")
-        print(f"  CRITICAL: {critical} · HIGH: {high} · Fichiers: {files} · Itérations: {result['iterations']}")
-
-        if verdict == "UNKNOWN" and not parsed:
-            print(f"\n  {_YL}⚠ Impossible de parser le JSON de sortie.{_R}")
-            print(f"  {_DM}Output brut :{_R}\n  {result['output'][:400]}")
+        print(f"\n  {verdict_display} — score {total_score:.0f}")
+        print(
+            f"  CRITICAL: {total_critical} · HIGH: {total_high} · "
+            f"MEDIUM: {total_medium} · Fichiers: {files_analyzed}"
+        )
         print()
 
         return {
-            "success": True,
-            "verdict": verdict,
-            "score": score,
-            "critical": critical,
-            "high": high,
-            "files_analyzed": files,
-            "iterations": result["iterations"],
-            "raw_output": result["output"],
+            "success":        True,
+            "verdict":        event,
+            "score":          total_score,
+            "critical":       total_critical,
+            "high":           total_high,
+            "medium":         total_medium,
+            "files_analyzed": files_analyzed,
+            "iterations":     0,  # 0 = pas d'itération CodeModeAgent
+            "head_sha":       pr_info.get("head", {}).get("sha", ""),
         }
 
-    else:
-        print(f"\n  {_RD}✗ Échec de l'analyse : {result['error']}{_R}\n")
-        return {
-            "success": False,
-            "error": result["error"],
-            "iterations": result["iterations"],
-        }
+    except Exception as e:
+        logger.error("review_pr failed: %s", e)
+        print(f"\n  {_RD}✗ Erreur : {e}{_R}\n")
+        return {"success": False, "error": str(e), "iterations": 0}
+    finally:
+        try:
+            github.disconnect()
+        except Exception:
+            pass

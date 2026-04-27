@@ -58,8 +58,17 @@ _DM = "\033[2m"
 
 
 def _count_severity_from_blocks(text: str) -> Tuple[int, int, int, float]:
-  
-  
+    """
+    Compte les sévérités depuis l'analyse LLM.
+
+    Stratégie à 2 niveaux :
+      1. Blocs structurés ---FIX START--- avec **SEVERITY**: X (précis, pas de faux positifs)
+      2. Fallback texte libre : compte les mentions CRITICAL/HIGH/MEDIUM dans le texte
+         quand aucun bloc structuré n'est trouvé (pour les modèles qui ne suivent pas le format)
+
+    Le fallback utilise des patterns contextuels pour éviter de compter les mentions
+    dans les sections KB rules ou knowledge context.
+    """
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     parts = re.split(r'-{3,}\s*FIX START\s*-{3,}', text, flags=re.IGNORECASE)
 
@@ -73,6 +82,39 @@ def _count_severity_from_blocks(text: str) -> Tuple[int, int, int, float]:
             sev = sev_match.group(1).upper()
             if sev in counts:
                 counts[sev] += 1
+
+    # ── Fallback : comptage texte libre si aucun bloc structuré ────────────
+    # Certains modèles (MiniMax, Qwen) ne génèrent pas de blocs ---FIX START---
+    # mais écrivent "CRITICAL - SQL injection" ou "CRITICAL: dataSource undeclared"
+    if sum(counts.values()) == 0 and text:
+        # Patterns qui indiquent une vraie issue (pas juste une mention dans les rules)
+        # Ex: "CRITICAL - SQL injection", "CRITICAL: undeclared", "[CRITICAL]"
+        #     "Issues Found:\nCRITICAL - ..."
+        critical_patterns = [
+            r'(?:^|\n)\s*(?:\*\*)?CRITICAL(?:\*\*)?\s*[-:–—]',        # CRITICAL - xxx ou CRITICAL: xxx
+            r'\[CRITICAL\]',                                           # [CRITICAL]
+            r'Severity\s*:\s*CRITICAL',                                # Severity: CRITICAL
+            r'CRITICAL\s+(?:error|bug|issue|vulnerability|security)',   # CRITICAL error/bug/...
+        ]
+        high_patterns = [
+            r'(?:^|\n)\s*(?:\*\*)?HIGH(?:\*\*)?\s*[-:–—]',
+            r'\[HIGH\]',
+            r'Severity\s*:\s*HIGH',
+            r'HIGH\s+(?:error|bug|issue|vulnerability|security|performance)',
+        ]
+        medium_patterns = [
+            r'(?:^|\n)\s*(?:\*\*)?MEDIUM(?:\*\*)?\s*[-:–—]',
+            r'\[MEDIUM\]',
+            r'Severity\s*:\s*MEDIUM',
+            r'MEDIUM\s+(?:error|bug|issue|vulnerability|warning)',
+        ]
+
+        for pattern in critical_patterns:
+            counts["CRITICAL"] += len(re.findall(pattern, text, re.IGNORECASE))
+        for pattern in high_patterns:
+            counts["HIGH"] += len(re.findall(pattern, text, re.IGNORECASE))
+        for pattern in medium_patterns:
+            counts["MEDIUM"] += len(re.findall(pattern, text, re.IGNORECASE))
 
     score = (
         counts["CRITICAL"] * SEVERITY_WEIGHTS["CRITICAL"] +

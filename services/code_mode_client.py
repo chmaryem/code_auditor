@@ -372,7 +372,12 @@ class RAGAnalyzer:
                     "Focus on the CHANGED lines from the patch/diff, "
                     "but consider the full file for context."
                 )
-            result       = assistant_agent.analyze_code_with_rag(code=code, context=context)
+            # Utiliser le chunking pour les gros fichiers (> 5000 chars)
+            # pour réduire la consommation de tokens par appel
+            if len(code) > 5000:
+                result = assistant_agent.analyze_code_chunked(code=code, context=context)
+            else:
+                result = assistant_agent.analyze_code_with_rag(code=code, context=context)
             analysis_text = result.get("analysis", "")
 
             # FIX v6.1 — Détecter le 429 caché dans le texte d'analyse.

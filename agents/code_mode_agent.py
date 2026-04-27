@@ -35,10 +35,12 @@ logger = logging.getLogger(__name__)
 _project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(_project_root))
 
+# Cascade de modèles (OpenAI → Gemini → Groq) — géré via services.llm_factory
 LLM_MODEL_CASCADE = [
+    "gpt-4o",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "llama-3.3-70b-versatile",
 ]
 
 
@@ -276,28 +278,33 @@ class CodeModeAgent:
 
     def _invoke_with_cascade(self, messages) -> Optional[str]:
         """
-        Cascade de modèles avec backoff si quota 429.
-        gemini-2.5-flash → 2.0-flash → 1.5-flash
+        Cascade OpenAI → Gemini → Groq avec backoff si quota 429.
+        Délègue à services.llm_factory.build_llm_cascade_for_agent().
         """
-        backoff = [15, 45]
-        for model in LLM_MODEL_CASCADE:
-            llm = self._get_llm(model)
+        from services.llm_factory import build_llm_cascade_for_agent, _BACKOFF, _is_quota_error
+        cascade = build_llm_cascade_for_agent(temperature=self.temperature, max_tokens=8192)
+
+        if not cascade:
+            logger.error("Aucun provider LLM disponible (vérifiez vos clés API)")
+            return None
+
+        for provider_name, llm in cascade:
             for attempt in range(2):
                 try:
-                    print(f"   ⏳ [{model}] Appel LLM...")
+                    print(f"   ⏳ [{provider_name}] Appel LLM...")
                     response = llm.invoke(messages)
                     return response.content if hasattr(response, "content") else str(response)
                 except Exception as e:
                     err = str(e)
-                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                        wait = backoff[min(attempt, 1)]
-                        print(f"   ⏳ [{model}] Quota 429 — {wait}s...")
+                    if _is_quota_error(err):
+                        wait = _BACKOFF[min(attempt, 1)]
+                        print(f"   ⏳ [{provider_name}] Quota 429 — {wait}s...")
                         time.sleep(wait)
                         if attempt == 1:
-                            print(f"   ✗ [{model}] → modèle suivant")
+                            print(f"   ✗ [{provider_name}] → provider suivant")
                             break
                     else:
-                        logger.debug("[%s] LLM error: %s", model, err[:80])
+                        logger.debug("[%s] LLM error: %s", provider_name, err[:80])
                         break
         return None
 

@@ -308,8 +308,8 @@ class MCPGitHubService:
                             "head_sha": head_sha,
                             "pr_data": rest_pr,
                         }
-                    # mergeable=None → GitHub calcule encore, attendre
-                    await asyncio.sleep(3)
+                    # mergeable=None → GitHub calcule encore — attendre 1s (réduit de 3s)
+                    await asyncio.sleep(1)
                 except Exception as e:
                     sys.stderr.write(f"[REST] Stratégie 0 erreur: {e}\n")
                     sys.stderr.flush()
@@ -388,10 +388,9 @@ class MCPGitHubService:
                     continue
 
         # ── Stratégie 2 : Poll get_pull_request → champ mergeable ────────────
-        # FIX v6.1 : 6 tentatives (au lieu de 4) avec 5s de délai (au lieu de 3s).
-        # GitHub met parfois 15-20s pour calculer le champ mergeable après un push.
-        # Premier appel = "kick" pour déclencher le calcul côté GitHub.
-        max_polls = 6
+        # Réduit à 4 polls (au lieu de 6) : la Stratégie 0 REST a déjà attendu.
+        # Délai maintenu à 3s (GitHub nécessite ce temps pour calculer mergeable).
+        max_polls = 4
         try:
             # Kick initial : déclencher le calcul de mergeable côté GitHub
             await self.get_pull_request(owner, repo, pr_number)
@@ -580,7 +579,15 @@ class MCPGitHubService:
     ) -> str:
         """
         Lit le contenu d'un fichier GitHub.
-        max_chars=8000 par défaut pour limiter la consommation de tokens Gemini.
+        max_chars=8000 par défaut pour limiter la consommation de tokens LLM.
+
+        FIX v7.2 — Détection contenu déjà décodé :
+          Le serveur MCP npm retourne parfois encoding='base64' MAIS le contenu
+          est déjà du texte clair (pas du vrai base64). Si on tente b64decode()
+          sur du texte Java, on obtient du garbage binaire.
+
+          SOLUTION : vérifier si le contenu ressemble déjà à du texte lisible
+          AVANT de tenter le décodage base64. Si oui, utiliser tel quel.
         """
         for args in [
             {"owner": owner, "repo": repo, "path": path, "branch": ref},
@@ -592,19 +599,75 @@ class MCPGitHubService:
                     content = result.get("content", "")
                     encoding = result.get("encoding", "")
                     if encoding == "base64" and content:
-                        import base64
-                        try:
-                            content = base64.b64decode(
-                                content.replace("\n", "")
-                            ).decode("utf-8", errors="replace")
-                        except Exception:
-                            pass
-                    return (content or "")[:max_chars]
+                        # FIX v7.2 : Le MCP retourne parfois du texte clair
+                        # avec encoding='base64'. Détecter ce cas AVANT de décoder.
+                        if self._looks_like_source_code(content):
+                            # Le contenu est déjà du texte — ne PAS décoder
+                            logger.debug(
+                                "get_file_content: contenu déjà en texte clair pour %s@%s (skip b64decode)",
+                                path, ref,
+                            )
+                        else:
+                            # Vrai base64 — décoder normalement
+                            import base64
+                            try:
+                                raw_bytes = base64.b64decode(content.replace("\n", ""))
+                                decoded = None
+                                for enc in ("utf-8", "latin-1", "cp1252"):
+                                    try:
+                                        decoded = raw_bytes.decode(enc)
+                                        break
+                                    except (UnicodeDecodeError, ValueError):
+                                        continue
+                                if decoded is None:
+                                    decoded = raw_bytes.decode("utf-8", errors="replace")
+                                content = decoded
+                            except Exception:
+                                # base64 decode échoué — garder le contenu tel quel
+                                pass
+                    content = (content or "")[:max_chars]
+                    # Validation : rejeter le contenu binaire (NUL bytes)
+                    if content and "\x00" in content:
+                        logger.warning(
+                            "get_file_content: contenu binaire (NUL bytes) pour %s@%s — ignoré",
+                            path, ref,
+                        )
+                        return ""
+                    return content
                 if isinstance(result, str) and result:
                     return result[:max_chars]
             except Exception:
                 continue
         return ""
+
+    @staticmethod
+    def _looks_like_source_code(content: str) -> bool:
+        """
+        Heuristique rapide : le contenu ressemble-t-il à du code source ?
+        Utilisé pour détecter quand le MCP retourne du texte clair
+        alors qu'il annonce encoding='base64'.
+
+        Vérifie les 500 premiers caractères pour des indicateurs courants :
+        - Mots-clés de langage (import, package, class, def, function, const)
+        - Caractères non-base64 (espaces, points-virgules, accolades)
+        - Ratio de caractères imprimables > 90%
+        """
+        if not content or len(content) < 10:
+            return False
+        sample = content[:500]
+        # Base64 ne contient PAS ces caractères
+        code_indicators = (";", "{", "}", "(", ")", "import ", "package ", "class ",
+                           "def ", "function ", "const ", "public ", "private ")
+        if any(ind in sample for ind in code_indicators):
+            return True
+        # Vérifier le ratio imprimable + whitespace
+        printable = sum(1 for c in sample if c.isprintable() or c in "\n\r\t")
+        ratio = printable / len(sample)
+        # Du vrai base64 a un ratio printable ~100% aussi, mais sans espaces/newlines
+        # Du code source a toujours des newlines et des espaces
+        has_newlines = "\n" in sample
+        has_spaces = " " in sample
+        return ratio > 0.90 and has_newlines and has_spaces
 
     async def post_pr_comment(self, owner: str, repo: str, pr_number: int, body: str) -> Dict[str, Any]:
         for alias in ["post_comment", "post_comment_npm"]:
