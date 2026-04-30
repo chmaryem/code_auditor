@@ -1,0 +1,42 @@
+# requirements-ci.txt — Dépendances allégées pour le runner GitHub Actions CI
+# Optimisé pour une installation rapide (<3 min) et sans conflits sur Python 3.11
+# NE PAS utiliser requirements.txt (versions trop old, conflits sur Actions)
+
+# ── LLM ──────────────────────────────────────────────────────────────────────
+langchain>=0.2.0,<0.4.0
+langchain-community>=0.2.0,<0.4.0
+langchain-google-genai>=1.0.0,<3.0.0
+langchain-groq>=0.1.0,<1.0.0
+
+# ── RAG / Embeddings ─────────────────────────────────────────────────────────
+chromadb>=0.5.0,<1.0.0
+langchain-chroma>=0.1.0,<1.0.0
+langchain-huggingface>=0.0.3,<1.0.0
+sentence-transformers>=3.0.0,<4.0.0
+
+# ── Text processing ───────────────────────────────────────────────────────────
+langchain-text-splitters>=0.2.0,<0.4.0
+
+# ── Config / Env ─────────────────────────────────────────────────────────────
+pydantic>=2.0.0,<3.0.0
+python-dotenv>=1.0.0
+
+# ── MCP Client ────────────────────────────────────────────────────────────────
+mcp>=1.0.0
+httpx>=0.27.0
+anyio>=4.0.0
+
+# ── Networking ────────────────────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Web search (optionnel) ────────────────────────────────────────────────────
+duckduckgo-search>=6.0.0
+
+# ── NetworkX (KnowledgeGraph) ─────────────────────────────────────────────────
+networkx>=3.0.0
+
+# ── Watchdog (non nécessaire en CI, mais importé dans certains modules) ───────
+watchdog>=4.0.0
+
+# ── Optionnel : tree-sitter (parsing enrichi) — skip si erreur build ──────────
+# tree-sitter>=0.21.3   # commenté : lent à compiler sur Actions, fallback regex OK

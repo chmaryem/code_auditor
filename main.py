@@ -361,6 +361,23 @@ def cmd_merge_hook(args):
         install_merge_hook(project_path)
 
 
+# ── Commande : ci-deploy (CI/CD) ──────────────────────────────────────────
+
+def cmd_ci_deploy(args):
+    """
+    Déploie le workflow GitHub Actions CI/CD sur un repo distant via MCP.
+    Détecte le langage (Java/Python/JS) et génère le YAML adapté.
+    """
+    import asyncio
+    from smart_git.pr_analyzer import _parse_repo
+    from ci_cd.ci_deploy_agent import deploy_ci_workflow
+
+    owner, repo = _parse_repo(args.repo)
+    auditor_repo = getattr(args, "auditor_repo", "chmaryem/code_auditor")
+    force = getattr(args, "force", False)
+    asyncio.run(deploy_ci_workflow(owner, repo, auditor_repo=auditor_repo, force=force))
+
+
 # ── Commande : pr-check (MCP Code Mode) ──────────────────────────────────
 
 def cmd_pr_check(args):
@@ -406,13 +423,45 @@ def cmd_pr_merge_check(args):
     owner, repo = _parse_repo(args.repo)
     asyncio.run(check_pr_merge_readiness(owner, repo, args.pr))
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+
+# ── Commande : generate-tests ──────────────────────────────────────────────
+
+def cmd_generate_tests(args):
+    """
+    Génère des tests unitaires pour un fichier source donné.
+    Utilise le TestGeneratorAgent avec RAG pour produire des tests
+    cohérents avec les conventions du projet.
+    """
+    from pathlib import Path
+    from agents.test_generator_agent import TestGeneratorAgent
+
+    source_path = Path(args.path)
+    if not source_path.exists():
+        err(f"Fichier introuvable : {source_path}")
+        return
+
+    project_path = Path(args.project) if args.project else source_path.parent
+    agent = TestGeneratorAgent(project_path)
+
+    hdr(f"GÉNÉRATION DE TESTS : {source_path.name}")
+    result = agent.generate_for_file(source_path, write=args.write)
+
+    if result.get("test_file"):
+        ok(f"Tests générés : {result['test_file']}")
+        if not args.write:
+            info("(mode preview — utilisez --write pour écrire)")
+    else:
+        err(result.get("error", "Échec de la génération"))
+
+
+#  CLI ────────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Code Auditor AI — analyse intelligente de code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=
+        """
 Exemples :
   python main.py file    mon_script.py     # un seul fichier
   python main.py project ./mon_projet      # projet complet
@@ -424,11 +473,15 @@ Exemples :
   python main.py resolve-conflicts ./mon_projet          # résoudre conflits locaux
   python main.py merge-hook ./mon_projet                  # installer merge hook
 
+  # CI/CD Pipeline
+  python main.py ci-deploy      --repo owner/repo           # déployer workflow CI/CD
+
   # MCP Code Mode (agents autonomes)
   python main.py pr-check       --repo owner/repo --pr 42  # revue PR via agent
   python main.py pr-resolve     --repo owner/repo --pr 42  # résoudre conflits PR
   python main.py pr-merge-check --repo owner/repo --pr 42  # vérifier readiness merge
-        """,
+  python main.py generate-tests ./src/service.py --project ./  # générer tests unitaires
+        """
     )
     sub = p.add_subparsers(dest="command")
 
@@ -468,6 +521,12 @@ Exemples :
     sp.add_argument("path", help="Chemin du projet Git")
     sp.add_argument("--uninstall", action="store_true", help="Désinstaller le merge hook")
 
+    # ── CI/CD Pipeline ──────────────────────────────────────────────────────
+    sp = sub.add_parser("ci-deploy", help="Déployer le workflow CI/CD sur un repo GitHub")
+    sp.add_argument("--repo", required=True, help="owner/repo cible")
+    sp.add_argument("--auditor-repo", default="chmaryem/code_auditor", help="Repo de Code Auditor")
+    sp.add_argument("--force", action="store_true", help="Écraser le workflow existant")
+
     sp = sub.add_parser("pr-check", help="Analyser une PR GitHub via MCP")
     sp.add_argument("--repo", required=True, help="owner/repo")
     sp.add_argument("--pr", type=int, required=True, help="Numéro de la PR")
@@ -479,6 +538,11 @@ Exemples :
     sp = sub.add_parser("pr-merge-check", help="Vérifier si une PR est prête à merger (MCP Code Mode)")
     sp.add_argument("--repo", required=True, help="owner/repo")
     sp.add_argument("--pr", type=int, required=True, help="Numéro de la PR")
+
+    sp = sub.add_parser("generate-tests", help="Générer des tests unitaires pour un fichier source")
+    sp.add_argument("path", help="Chemin du fichier source à tester")
+    sp.add_argument("--project", help="Chemin racine du projet (défaut: dossier du fichier)")
+    sp.add_argument("--write", action="store_true", help="Écrire le fichier de test sur disque")
 
     return p
 
@@ -496,10 +560,13 @@ def main():
         # Smart Git Merge
         "resolve-conflicts": cmd_resolve_conflicts,
         "merge-hook": cmd_merge_hook,
+        # CI/CD Pipeline
+        "ci-deploy": cmd_ci_deploy,
         # MCP Code Mode
         "pr-check": cmd_pr_check,
         "pr-resolve": cmd_pr_resolve,
         "pr-merge-check": cmd_pr_merge_check,
+        "generate-tests": cmd_generate_tests,
     }
     commands[args.command](args)
 

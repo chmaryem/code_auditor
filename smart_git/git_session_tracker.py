@@ -128,6 +128,7 @@ class SessionSnapshot:
     minutes_since_commit: int
     time_multiplier:     float
     stats: Dict[str, Any] = field(default_factory=dict)
+    test_gaps:           List[Any] = field(default_factory=list)  # TestGapStatus
 
     @property
     def total_critical(self) -> int:
@@ -309,7 +310,25 @@ class GitSessionTracker:
         # Score final avec facteur temps
         final_score = total_score * time_mult
 
-        # Étape 5 : déterminer le niveau
+        # Étape 5 : détecter les test gaps (0 token — scan rapide)
+        test_gaps = []
+        try:
+            from services.test_discovery import TestDiscoveryService
+            discovery = TestDiscoveryService(self.project_path)
+            for file_info in uncommitted:
+                file_path_abs = self.project_path / file_info["path"]
+                if not discovery.has_test_file(file_path_abs):
+                    test_gaps.append({
+                        "source_file": file_path_abs,
+                        "test_file": None,
+                        "missing": True,
+                        "impact_score": 50,
+                        "reason": f"aucun test pour {file_path_abs.name}",
+                    })
+        except Exception as e:
+            logger.debug("TestDiscoveryService erreur : %s", e)
+
+        # Étape 6 : déterminer le niveau
         level = _score_to_level(final_score)
 
         return SessionSnapshot(
@@ -320,6 +339,7 @@ class GitSessionTracker:
             minutes_since_commit = minutes,
             time_multiplier      = time_mult,
             stats                = stats,
+            test_gaps            = test_gaps,
         )
 
     def _assess_file_risk(self, file_path_abs: Path, file_info: Dict) -> FileRisk:
@@ -433,6 +453,17 @@ class GitSessionTracker:
                 except Exception as e:
                     logger.debug("GitNotifier.notify_reminder erreur : %s", e)
 
+        # Notification des test gaps (pas liée au niveau de risque)
+        if snapshot.test_gaps:
+            try:
+                from agents.test_proposal_notifier import TestProposalNotifier
+                if isinstance(self._notifier, TestProposalNotifier):
+                    self._notifier.notify_batch(snapshot.test_gaps)
+                elif hasattr(self._notifier, "notify_test_gaps"):
+                    self._notifier.notify_test_gaps(snapshot.test_gaps)
+            except Exception as e:
+                logger.debug("Test gap notification erreur : %s", e)
+
     # Accesseurs utiles
 
     def set_notifier(self, notifier) -> None:
@@ -442,7 +473,6 @@ class GitSessionTracker:
     def get_last_level(self) -> str:
         """Dernier niveau calculé — utilisé par le pre-commit hook."""
         return self._last_level
-
 
 
 # Fonctions utilitaires pures

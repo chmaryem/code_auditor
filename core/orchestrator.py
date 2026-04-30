@@ -103,6 +103,8 @@ class Orchestrator:
         from agents.retriever_agent    import retriever_agent
         from agents.analysis_agent     import analysis_agent
         from agents.learning_agent     import learning_agent
+        from agents.test_gap_agent     import TestGapAgent
+        from agents.test_proposal_notifier import TestProposalNotifier
 
         print(" Initialisation System-Aware RAG...")
 
@@ -170,7 +172,12 @@ class Orchestrator:
             logger.debug("LearningAgent non initialisé : %s", e)
         self._learning_agent = learning_agent
 
-        print(" System-Aware RAG + Knowledge Graph + Self-Improving activés")
+        # Brancher TestGapAgent
+        self._test_gap_agent = TestGapAgent(self.project_path)
+        self._test_proposal_notifier = TestProposalNotifier(print_lock=self._print_lock)
+        print(" Test Gap Detection activé — surveillance des tests manquants")
+
+        print(" System-Aware RAG + Knowledge Graph + Self-Improving + Test-Aware activés")
         print(" Architecture Async activée (asyncio.PriorityQueue)\n")
 
         # ── Démarrer l'event loop async dans un thread daemon ─────────────
@@ -495,7 +502,26 @@ class Orchestrator:
                 file_path=file_path, project_indexer=self._project_indexer, llm=None
             )
         except Exception as e:
-            logger.debug("KG update_file ignoré pour %s : %s", file_path.name, e)
+            logger.error("KG update_file erreur pour %s : %s", file_path.name, e)
+
+        # ── ÉTAPE 4.7 : Test Gap Detection (0 token) ──────────────────────
+        if hasattr(self, "_test_gap_agent") and self._test_gap_agent:
+            try:
+                print(f"  [ÉTAPE 4.7] Test Gap Detection pour {file_path.name}")
+                test_status = self._test_gap_agent.check(
+                    source_file=file_path,
+                    parsed_entities=parsed.get("entities", []),
+                    change_info=change_info,
+                )
+                print(f"  [ÉTAPE 4.7] Résultat: needs_attention={test_status.needs_attention}, missing={test_status.missing}")
+                if test_status.needs_attention and hasattr(self, "_test_proposal_notifier"):
+                    self._test_proposal_notifier.notify(test_status)
+                    print(f"  [ÉTAPE 4.7] Notification envoyée!")
+            except Exception as e:
+                print(f"  [ÉTAPE 4.7] ERREUR: {e}")
+                import traceback
+                traceback.print_exc()
+                logger.error("TestGapAgent erreur pour %s : %s", file_path.name, e)
 
         # ── ÉTAPE 5 : Mise à jour graphe NetworkX ─────────────────────────
         update_graph(self._dependency_graph, file_path, parsed)
