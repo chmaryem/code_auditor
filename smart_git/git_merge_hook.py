@@ -21,7 +21,6 @@ git_merge_hook.py — Pre-merge hook intelligent.
 from __future__ import annotations
 
 import re
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path

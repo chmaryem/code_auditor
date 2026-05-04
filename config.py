@@ -27,15 +27,13 @@ def _detect_optimal_device() -> str:
 class APIConfig(BaseModel):
 
     provider:    str   = "openrouter"
-    # ── OpenRouter (primary) ──────────────────────────────────────────────────
+ 
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
     openrouter_model:   str = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.5:free")
-    # Rotation round-robin entre modèles gratuits (contourne le rate-limit)
-   
-    # ── Google Gemini (fallback) ──────────────────────────────────────────────
+
     gemini_api_key: str = os.getenv("GOOGLE_API_KEY", "")
     gemini_model:   str = os.getenv("GEMINI_MODEL",   "gemini-2.5-flash")
-    # ── Commun ────────────────────────────────────────────────────────────────
+   
     temperature: float = 0.0
     max_tokens:  int   = 16384
 
@@ -101,6 +99,12 @@ class WatcherConfig(BaseModel):
     ]
 
 
+class RedisConfig(BaseModel):
+    """Configuration pour la connexion Redis via MCP."""
+    url:    str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    prefix: str = "ca:"  # Namespace isolation (code_auditor)
+
+
 class Config:
     BASE_DIR           = Path(__file__).parent
     DATA_DIR           = BASE_DIR / "data"
@@ -116,6 +120,7 @@ class Config:
     rag      = RAGConfig()
     analysis = AnalysisConfig()
     watcher  = WatcherConfig()
+    redis    = RedisConfig()
 
     HOST  = os.getenv("SERVER_HOST", "127.0.0.1")
     PORT  = int(os.getenv("SERVER_PORT", "8000"))

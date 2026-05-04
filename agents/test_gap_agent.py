@@ -98,9 +98,6 @@ class TestGapAgent:
         )
         status.reason = self._build_reason(status)
 
-        # Log visible pour débogage (sera supprimé en production)
-        print(f"  [TEST GAP DEBUG] {source_file.name}: missing={status.missing}, coverage={status.coverage_ratio*100:.0f}%, impact={status.impact_score}, needs_attention={status.needs_attention}")
-
         logger.debug(
             "TestGap %s : missing=%s coverage=%.0f%% impact=%d",
             source_file.name, status.missing, status.coverage_ratio * 100,

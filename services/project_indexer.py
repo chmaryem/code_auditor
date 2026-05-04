@@ -3,12 +3,11 @@ ProjectIndexer — Indexe tout le projet pour donner du contexte au LLM.
 
 Corrections vs original :
   - from dependency_graph → from services.graph_service
-  - Cache JSON sans verrou → SQLite thread-safe
+  - Cache Redis MCP (migration depuis SQLite)
   - Toute la logique métier est identique à l'original
 """
 import json
 import logging
-import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set
 from datetime import datetime
 
 from services.graph_service import dependency_builder
+from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -69,29 +69,19 @@ class ProjectIndexer:
     def __init__(self, project_path: Path):
         self.project_path = project_path
         self.context: Optional[ProjectContext] = None
+        self._lock = threading.Lock()
+        self._redis = None  # Lazy init
 
-        cache_dir = project_path / ".codeaudit"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        self._db_path = cache_dir / "project_context.db"
-        self._conn    = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._lock    = threading.Lock()
-        self._init_db()
+    @property
+    def redis(self):
+        """Lazy init du client MCP Redis."""
+        if self._redis is None:
+            self._redis = get_mcp_redis()
+        return self._redis
 
-    def _init_db(self):
-        with self._lock:
-            self._conn.executescript("""
-                CREATE TABLE IF NOT EXISTS project_snapshot (
-                    id             INTEGER PRIMARY KEY,
-                    saved_at       TEXT,
-                    total_files    INTEGER,
-                    total_entities INTEGER,
-                    languages      TEXT,
-                    packages       TEXT,
-                    files          TEXT,
-                    architecture   TEXT
-                );
-            """)
-            self._conn.commit()
+    def _ps_key(self) -> str:
+        """Clé Redis pour le project snapshot."""
+        return f"{KEY_PREFIX}ps:{key_hash(str(self.project_path))}"
 
     # ── Build principal ───────────────────────────────────────────────────────
 
@@ -160,57 +150,51 @@ class ProjectIndexer:
         print(f" Indexation terminée : {self.context.total_files} fichiers\n")
         return self.context
 
-    # ── Cache SQLite ──────────────────────────────────────────────────────────
+    # ── Cache Redis MCP ────────────────────────────────────────────────────────
 
     def _save_to_cache(self):
-        now = datetime.now().isoformat() if True else ""
-        from datetime import datetime as _dt
-        now = _dt.now().isoformat()
+        now = datetime.now().isoformat()
+        ps_key = self._ps_key()
+        snapshot = {
+            "saved_at":       now,
+            "total_files":    self.context.total_files,
+            "total_entities": self.context.total_entities,
+            "languages":      self.context.languages,
+            "packages":       self.context.packages,
+            "files":          self.context.files,
+            "architecture":   self.context.architecture_info,
+        }
         with self._lock:
-            self._conn.execute("DELETE FROM project_snapshot")
-            self._conn.execute(
-                "INSERT INTO project_snapshot "
-                "(saved_at,total_files,total_entities,languages,packages,files,architecture) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (
-                    now,
-                    self.context.total_files,
-                    self.context.total_entities,
-                    json.dumps(self.context.languages),
-                    json.dumps(self.context.packages),
-                    json.dumps(self.context.files),
-                    json.dumps(self.context.architecture_info),
-                ),
-            )
-            self._conn.commit()
-        print(f" Index sauvegardé : {self._db_path}")
+            self.redis.set(ps_key, json.dumps(snapshot, ensure_ascii=False))
+        print(f" Index sauvegardé dans Redis : {ps_key}")
 
     def _load_from_cache(self) -> bool:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT total_files,total_entities,languages,packages,files,architecture "
-                "FROM project_snapshot ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        if row is None:
+        ps_key = self._ps_key()
+        try:
+            raw = self.redis.get(ps_key)
+        except Exception:
+            return False
+        if not raw:
             return False
         try:
-            files_data = json.loads(row[4])
+            data = json.loads(raw)
+            files_data = data.get("files", {})
             # Defensive: ensure files is a dict, not a string (cache corruption)
             if isinstance(files_data, str):
                 logger.warning("Cache corruption: files_data is a string, resetting")
                 files_data = {}
             self.context = ProjectContext(
-                total_files       = row[0],
-                total_entities    = row[1],
-                languages         = json.loads(row[2]),
-                packages          = json.loads(row[3]),
+                total_files       = data.get("total_files", 0),
+                total_entities    = data.get("total_entities", 0),
+                languages         = data.get("languages", {}),
+                packages          = data.get("packages", []),
                 files             = files_data,
-                architecture_info = json.loads(row[5]),
+                architecture_info = data.get("architecture", {}),
             )
-            print(f" Index chargé depuis cache : {self.context.total_files} fichiers\n")
+            print(f" Index chargé depuis Redis : {self.context.total_files} fichiers\n")
             return True
         except Exception as e:
-            logger.warning("Erreur chargement index cache : %s", e)
+            logger.warning("Erreur chargement index cache Redis : %s", e)
             return False
 
     # ── Fichiers liés (logique originale conservée) ───────────────────────────

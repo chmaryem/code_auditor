@@ -43,14 +43,45 @@ BUILD_FILES = {
 }
 
 
-def detect_project_profile(file_checker) -> ProjectProfile:
+# Mapping extension → langage (fallback quand pas de fichier de build)
+EXT_TO_LANGUAGE = {
+    ".py":   "python",
+    ".java": "java",
+    ".js":   "javascript",
+    ".ts":   "typescript",
+    ".jsx":  "javascript",
+    ".tsx":  "typescript",
+    ".go":   "go",
+    ".rs":   "rust",
+    ".rb":   "ruby",
+    ".php":  "php",
+    ".cs":   "csharp",
+}
+
+# Langage → build system par défaut
+LANG_DEFAULT_BUILD = {
+    "python":     "pip",
+    "java":       "maven",
+    "javascript": "npm",
+    "typescript": "npm",
+    "go":         "go",
+    "rust":       "cargo",
+}
+
+
+def detect_project_profile(file_checker, file_lister=None) -> ProjectProfile:
     """
-    Détecte le profil du projet en cherchant les fichiers de build.
+    Détecte le profil du projet.
+
+    Stratégie en 2 niveaux :
+      1. Chercher les fichiers de build (pom.xml, requirements.txt, etc.)
+      2. Fallback : compter les extensions de fichiers du repo
 
     Args:
         file_checker: callable(path) -> str|None
-            Retourne le contenu d'un fichier ou None s'il n'existe pas.
+        file_lister:  callable() -> list[str] (noms de fichiers du repo)
     """
+    # Niveau 1 : fichiers de build
     for build_file, (language, build_system) in BUILD_FILES.items():
         content = file_checker(build_file)
         if content:
@@ -61,6 +92,26 @@ def detect_project_profile(file_checker) -> ProjectProfile:
                 if m:
                     profile.java_version = m.group(1)
             return profile
+
+    # Niveau 2 : fallback par extensions de fichiers
+    if file_lister:
+        try:
+            files = file_lister()
+            if files:
+                from pathlib import Path
+                ext_count: dict[str, int] = {}
+                for f in files:
+                    ext = Path(f).suffix.lower()
+                    if ext in EXT_TO_LANGUAGE:
+                        lang = EXT_TO_LANGUAGE[ext]
+                        ext_count[lang] = ext_count.get(lang, 0) + 1
+
+                if ext_count:
+                    dominant = max(ext_count, key=ext_count.get)
+                    build = LANG_DEFAULT_BUILD.get(dominant, "unknown")
+                    return ProjectProfile(language=dominant, build_system=build)
+        except Exception:
+            pass
 
     return ProjectProfile(language="unknown", build_system="unknown")
 
@@ -414,8 +465,8 @@ def _sonar_steps(profile: ProjectProfile) -> str:
 
 {sonar_step}
 
-      - name: "✅ SonarQube Quality Gate"
-        uses: sonarqube-quality-gate-action@master
+      - name: "SonarQube Quality Gate"
+        uses: sonarsource/sonarqube-quality-gate-action@master
         timeout-minutes: 5
         env:
           SONAR_TOKEN: {sonar_token}

@@ -2,7 +2,7 @@
 
 ## Vue d'ensemble
 
-Le système CI/CD de Code Auditor permet d'analyser automatiquement les Pull Requests sur GitHub en utilisant l'IA (Gemini/OpenRouter) pour reviewer le code.
+Le système CI/CD de Code Auditor déploie un pipeline classique **Build + Test + SonarQube** sur les repositories GitHub cibles.
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -11,10 +11,13 @@ Le système CI/CD de Code Auditor permet d'analyser automatiquement les Pull Req
 └─────────────────┘     └─────────────────┘     └─────────────────┘
                                                            │
                                                            ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Commentaires   │◀────│  Analyse IA     │◀────│  Code Auditor   │
-│   sur la PR     │     │  (RAG + KG)     │     │   s'exécute     │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
+                                    ┌──────────────────────────────────┐
+                                    │         Workflow GitHub Actions    │
+                                    │  ┌─────────────┐  ┌─────────────┐  │
+                                    │  │ build-test  │──▶│ sonar-scan  │  │
+                                    │  │ Build + Test│  │   SonarQube │  │
+                                    │  └─────────────┘  └─────────────┘  │
+                                    └──────────────────────────────────┘
 ```
 
 ---
@@ -36,39 +39,34 @@ Développeur
 │                    ci_deploy_agent.py                       │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│  [0/6] Validation Token                                     │
+│  [0/5] Validation Token                                     │
 │        ├── Vérifie GITHUB_TOKEN                              │
 │        ├── Test API /user                                    │
 │        └── ✓ ou ✗                                           │
 │                                                             │
-│  [0b/6] Validation Secrets                                  │
-│        ├── Vérifie GOOGLE_API_KEY                           │
-│        └── Vérifie OPENROUTER_API_KEY                       │
+│  [0b/5] Validation Secrets                                  │
+│        ├── Vérifie SONAR_TOKEN                               │
+│        └── Vérifie SONAR_HOST_URL                            │
 │                                                             │
-│  [1/6] Check Workflow existant                              │
+│  [1/5] Check Workflow existant                              │
 │        ├── MCP get_file_content(".github/workflows/ci.yml") │
 │        └── Si existe et pas --force → arrêt                 │
 │                                                             │
-│  [2/6] Détection Profil                                     │
+│  [2/5] Détection Profil                                     │
 │        ├── Check pom.xml → Java/Maven                       │
 │        ├── Check package.json → Node.js                     │
 │        ├── Check requirements.txt → Python                  │
 │        └── Sinon → unknown/unknown                          │
 │                                                             │
-│  [3/6] Génération YAML                                      │
+│  [3/5] Génération YAML                                      │
 │        └── workflow_generator.py                            │
 │                                                             │
-│  [3b/6] Validation YAML                                     │
+│  [3b/5] Validation YAML                                     │
 │        ├── Parse YAML                                        │
-│        ├── Check jobs build-test + code-review              │
+│        ├── Check jobs build-test + sonar-scan               │
 │        └── ✓ ou ✗                                           │
 │                                                             │
-│  [4/6] Préparation requirements-ci.txt                      │
-│        ├── Lit fichier local                                 │
-│        └── Sinon → génère version minimal                   │
-│                                                             │
-│  [5/6] Push des fichiers                                    │
-│        ├── MCP push_file(requirements-ci.txt)               │
+│  [4/5] Push du workflow YAML                                │
 │        └── MCP push_file(ci.yml)                            │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -99,23 +97,24 @@ Génère le fichier YAML GitHub Actions adapté au langage du projet.
 #### Structure du YAML généré
 
 ```yaml
-name: "CI/CD — Build + Code Auditor"
+name: "CI/CD — Build + SonarQube"
 
 # Déclencheurs
 trigger:
   - pull_request (opened, synchronize, reopened)
-  - push (branche main)
+  - push (branches main, develop)
 
 # Permissions nécessaires
 permissions:
-  - statuses: write      # Pour poster les status checks
-  - pull-requests: write # Pour commenter la PR
-  - contents: read       # Pour lire le code
+  - contents: read          # Pour lire le code
+  - statuses: write         # Pour poster les status checks
+  - pull-requests: read     # Pour lire la PR
+  - security-events: write  # Pour SonarQube
 
-# Deux jobs en parallèle
+# Deux jobs séquentiels
 jobs:
-  1. build-test:    # Compile et teste le projet
-  2. code-review:   # Analyse IA du code
+  1. build-test:  # Compile et teste le projet
+  2. sonar-scan:  # Analyse qualité SonarQube (dépend de build-test)
 ```
 
 #### Détection automatique du langage
@@ -126,129 +125,61 @@ jobs:
 | `build.gradle` ou `gradlew` | Java | Gradle |
 | `package.json` | JavaScript/TypeScript | npm/yarn |
 | `requirements.txt` ou `setup.py` | Python | pip |
+| `pyproject.toml` | Python | poetry |
+| `Cargo.toml` | Rust | cargo |
+| `go.mod` | Go | go |
 
 ---
 
-### 3. Job "code-review" (exécuté par GitHub Actions)
+### 3. Job "build-test" (exécuté par GitHub Actions)
 
+Compile et teste le projet selon le langage détecté.
+
+**Java / Maven :**
+- Setup Java (version détectée dans `pom.xml`)
+- `mvn compile`
+- `mvn test` (continue-on-error : les tests n'empêchent pas SonarQube)
+- `mvn package`
+
+**JavaScript / npm :**
+- Setup Node.js 20
+- `npm ci`
+- `npm run build`
+- `npm test`
+
+**Python / pip :**
+- Setup Python 3.11
+- `pip install -r requirements.txt`
+- `pytest`
+
+---
+
+### 4. Job "sonar-scan" (exécuté par GitHub Actions)
+
+Analyse qualité du code via SonarQube.
+
+**Dépendance :**
 ```yaml
-# Job 2 : Code Auditor IA Review
-code-review:
-  name: "Code Auditor Review"
-  runs-on: ubuntu-latest
-  timeout-minutes: 20
-  if: github.event_name == 'pull_request'  # Uniquement sur PR
-  
-  steps:
-    1. Checkout du projet cible
-    2. Checkout de Code Auditor (chmaryem/code_auditor)
-    3. Setup Python 3.11
-    4. Setup Node.js 20 (pour MCP)
-    5. Cache pip (optimisation)
-    6. Install Code Auditor (pip install)
-    7. Pre-install MCP GitHub server
-    8. Analyse PR (python -m ci_cd.ci_runner)
+needs: build-test
+if: always() && needs.build-test.result == 'success'
 ```
 
-#### Détail du step "Analyse PR"
+**Java / Maven :**
+- Plugin SonarQube officiel via Maven
 
-```yaml
-- name: "Analyse PR"
-  working-directory: code_auditor_tool    # ← Exécute dans ce dossier
-  env:
-    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    GITHUB_PERSONAL_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-    GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-    PYTHONPATH: "${{ github.workspace }}/code_auditor_tool"  # ← Important !
-  run: |
-    python -m ci_cd.ci_runner \
-      --repo "${{ github.repository }}" \
-      --pr "${{ github.event.pull_request.number }}"
-```
+**Autres langages :**
+- Téléchargement du `sonar-scanner-cli`
+- Analyse des sources avec le token configuré
 
-**Pourquoi `PYTHONPATH` est crucial :**
-- Sans lui, Python ne trouve pas le module `ci_cd`
-- Il indique à Python où chercher les modules
+**Quality Gate :**
+- Check optionnel du Quality Gate SonarQube
 
 ---
 
-### 4. Runner CI (`ci_runner.py`)
-
-Point d'entrée exécuté dans GitHub Actions.
-
-#### Séquence d'exécution
+## Flux Complet : Du push à l'analyse SonarQube
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    ci_runner.py                         │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  [0/5] Test connexion MCP                             │
-│        ├── subprocess.run(["npx", "--yes", ...])        │
-│        └── Vérifie que Node.js/MCP sont disponibles     │
-│                                                         │
-│  [1/5] Récupération SHA HEAD                           │
-│        ├── GitHub API: GET /repos/{owner}/{repo}/     │
-│        └── Récupère le SHA du dernier commit de la PR   │
-│                                                         │
-│  [2/5] Post Status "Pending"                           │
-│        ├── POST /repos/{owner}/{repo}/statuses/{sha}   │
-│        └── state: "pending", description: "Analyse..." │
-│                                                         │
-│  [3/5] Analyse PR (review_pr)                          │
-│        ├── Import smart_git.pr_review_agent            │
-│        ├── asyncio.run(review_pr(owner, repo, pr))       │
-│        └── Retourne: verdict, score, issues...          │
-│                                                         │
-│  [4/5] Post Status Final                                │
-│        ├── Si APPROVE → state: "success"                │
-│        ├── Si COMMENT → state: "success"                │
-│        └── Si REQUEST_CHANGES → state: "failure"      │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-#### Codes de sortie
-
-| Verdict | Exit Code | Bloque le merge ? |
-|---------|-----------|-------------------|
-| APPROVE | 0 | Non |
-| COMMENT | 0 | Non |
-| REQUEST_CHANGES | 1 | **Oui** |
-
----
-
-### 5. Status Reporter (`ci_status_reporter.py`)
-
-Poste les status checks sur GitHub.
-
-#### API GitHub utilisée
-
-```python
-# POST /repos/{owner}/{repo}/statuses/{sha}
-{
-  "state": "pending" | "success" | "failure",
-  "target_url": "https://github.com/.../actions/runs/...",
-  "description": "Code Auditor analyse en cours...",
-  "context": "Code Auditor / PR Review"
-}
-```
-
-#### États possibles
-
-| État | Description | Icône PR |
-|------|-------------|----------|
-| `pending` | Analyse en cours | 🟡 Jaune |
-| `success` | Analyse OK (APPROVE/COMMENT) | 🟢 Vert |
-| `failure` | Bugs trouvés (REQUEST_CHANGES) | 🔴 Rouge |
-
----
-
-## Flux Complet : De la PR au Commentaire
-
-```
-1. Développeur crée une PR
+1. Développeur push sur PR
    │
    ▼
 2. GitHub Actions détecte la PR
@@ -256,21 +187,13 @@ Poste les status checks sur GitHub.
    │
    ▼
 3. Workflow YAML s'exécute
-   ├── Job build-test: compile/test (optionnel)
-   └── Job code-review: analyse IA
+   ├── Job build-test : compile + tests
+   └── Job sonar-scan : analyse qualité (si build-test OK)
    │
    ▼
-4. ci_runner.py s'exécute
-   ├── [0] Test MCP
-   ├── [1] Récupère SHA
-   ├── [2] Post "pending"
-   ├── [3] Analyse (review_pr)
-   └── [4] Post résultat
-   │
-   ▼
-5. Résultat visible sur la PR
-   ├── Status check (vert/jaune/rouge)
-   └── Commentaire avec détails
+4. Résultat visible sur la PR
+   ├── Status checks GitHub (vert/rouge)
+   └── Rapport SonarQube (si configuré)
 ```
 
 ---
@@ -281,17 +204,14 @@ Poste les status checks sur GitHub.
 
 | Fichier | Description |
 |---------|-------------|
-| `.github/workflows/ci.yml` | Workflow GitHub Actions |
-| `requirements-ci.txt` | Dépendances Python pour le runner |
+| `.github/workflows/ci.yml` | Workflow GitHub Actions (build + SonarQube) |
 
 ### côté Code Auditor (source)
 
 | Fichier | Rôle |
 |---------|------|
-| `ci_cd/ci_deploy_agent.py` | Déploie le workflow |
-| `ci_cd/workflow_generator.py` | Génère le YAML |
-| `ci_cd/ci_runner.py` | Exécute l'analyse dans Actions |
-| `ci_cd/ci_status_reporter.py` | Poste les status |
+| `ci_cd/ci_deploy_agent.py` | Déploie le workflow sur le repo cible |
+| `ci_cd/workflow_generator.py` | Génère le YAML adapté au langage |
 
 ---
 
@@ -302,28 +222,12 @@ Configure dans : `Settings > Secrets > Actions`
 | Secret | Obligatoire | Description |
 |--------|-------------|-------------|
 | `GITHUB_TOKEN` | ✅ Oui | Fourni automatiquement par GitHub Actions |
-| `GOOGLE_API_KEY` | ✅ Oui | Clé API Gemini pour l'analyse IA |
-| `OPENROUTER_API_KEY` | ❌ Non | Alternative à Gemini (fallback) |
+| `SONAR_TOKEN` | ✅ Oui | Token d'analyse SonarQube |
+| `SONAR_HOST_URL` | ✅ Oui | URL SonarQube (ex: `https://sonarcloud.io`) |
 
 ---
 
 ## Dépannage courant
-
-### Erreur : `No module named 'ci_cd'`
-
-**Cause** : PYTHONPATH mal configuré
-
-**Solution** : Vérifier que le workflow YAML contient :
-```yaml
-env:
-  PYTHONPATH: "${{ github.workspace }}/code_auditor_tool"
-```
-
-### Erreur : `MCP server timeout`
-
-**Cause** : Node.js/npm non installé ou problème réseau
-
-**Solution** : Vérifier que le step "Setup Node.js 20" est présent
 
 ### Erreur : `401 Unauthorized`
 
@@ -331,14 +235,18 @@ env:
 
 **Solution** : Vérifier `GITHUB_TOKEN` et permissions du repo
 
+### Erreur : SonarQube analysis failed
+
+**Cause** : `SONAR_TOKEN` ou `SONAR_HOST_URL` manquant
+
+**Solution** : Ajouter les secrets dans `Settings > Secrets > Actions`
+
 ---
 
-## Résumé des validations ajoutées
+## Résumé des validations
 
 | Validation | Fichier | Quand exécuté ? |
 |------------|---------|-----------------|
 | Token GitHub valide | `ci_deploy_agent.py` | Avant déploiement |
 | Secrets présents | `ci_deploy_agent.py` | Avant déploiement (warning) |
 | YAML valide | `workflow_generator.py` | Avant push |
-| requirements-ci.txt | `ci_deploy_agent.py` | Génération auto si manquant |
-| Connexion MCP | `ci_runner.py` | Au démarrage dans Actions |

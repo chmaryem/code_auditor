@@ -321,27 +321,25 @@ class RAGAnalyzer:
     """
 
     def _check_content_cache(self, code: str) -> Optional[dict]:
-        """Vérifie le cache SQLite par hash du contenu (indépendant du chemin)."""
+        """Vérifie le cache Redis par hash du contenu (indépendant du chemin)."""
         try:
-            import sqlite3
-            from config import config
+            from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
             content_hash = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()
-            cache_db = config.CACHE_DIR / "analysis_cache.db"
-            if not cache_db.exists():
+            redis = get_mcp_redis()
+            # Lookup via index secondaire : content_hash → path_hash
+            path_hash = redis.get(f"{KEY_PREFIX}fch:{content_hash[:16]}")
+            if not path_hash:
                 return None
-            conn = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
-            row = conn.execute(
-                "SELECT analysis_text FROM file_cache WHERE content_hash = ? LIMIT 1",
-                (content_hash,),
-            ).fetchone()
-            conn.close()
-            if not row or not row[0]:
+            # Lire l'analyse depuis le hash principal
+            redis_key = f"{KEY_PREFIX}fc:{path_hash}"
+            analysis_text = redis.hget(redis_key, "analysis_text")
+            if not analysis_text:
                 return None
             from smart_git.git_hook import _count_severity_from_blocks
-            c, h, m, score = _count_severity_from_blocks(row[0])
+            c, h, m, score = _count_severity_from_blocks(analysis_text)
             logger.info("Cache hit SHA=%s... score=%.0f", content_hash[:8], score)
             return {
-                "analysis": f"[FROM WATCH CACHE]\n{row[0][:800]}",
+                "analysis": f"[FROM WATCH CACHE]\n{analysis_text[:800]}",
                 "critical": c, "high": h, "medium": m, "score": score,
                 "relevant_knowledge": [], "source": "watch_cache",
             }

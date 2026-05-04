@@ -223,10 +223,29 @@ class TestDiscoveryService:
         name = source_file.stem  # sans extension
         name_cap = name[:1].upper() + name[1:] if name else name
 
-        relative = source_file.relative_to(self.project_path)
-        rel_dir = relative.parent
+        try:
+            relative = source_file.relative_to(self.project_path)
+        except ValueError:
+            return None
 
-        # Si la convention contient un dossier explicite
+        rel_dir = relative.parent
+        rel_str = str(rel_dir).replace("\\", "/")
+
+        # ── Maven/Gradle : src/main/java → src/test/java ──────────────────
+        if "src/main/" in rel_str:
+            test_rel_str = rel_str.replace("src/main/", "src/test/", 1)
+            test_dir = self.project_path / test_rel_str
+            filename = convention.split("/")[-1] if "/" in convention else convention
+            filename = filename.format(name=name, name_cap=name_cap)
+            candidate = test_dir / filename
+            if candidate.exists():
+                return candidate
+            # Essayer aussi sans le format (juste le nom direct)
+            direct = test_dir / f"{name}Test{source_file.suffix}"
+            if direct.exists():
+                return direct
+
+        # ── Convention standard avec dossier explicite ─────────────────────
         if "/" in convention:
             parts = convention.split("/")
             test_dir = self.project_path / test_dir_hint / parts[0]
@@ -334,24 +353,54 @@ class TestDiscoveryService:
 
     @staticmethod
     def _is_public_entity(entity) -> bool:
-        """Détermine si une entité doit être testée (publique, non-helper)."""
-        # Gère à la fois les dict et les objets dataclass (CodeEntity)
+        """
+        Détermine si une entité doit être testée.
+
+        Règles :
+          1. Exclure les privés Python (_name) et Java (private)
+          2. Exclure les types non-testables (import, field, etc.)
+          3. NE PAS exclure aveuglément les getters/setters — seulement les
+             accesseurs triviaux d'un seul champ (getName → return name)
+          4. Garder les méthodes complexes même si elles commencent par get/set
+             (ex: getUsersWithOrders, setDataSource)
+        """
         if isinstance(entity, dict):
             etype = entity.get("type", "")
             name = entity.get("name", "")
+            visibility = entity.get("visibility", "public")
+            body_lines = entity.get("body_lines", 0)
         else:
             etype = getattr(entity, "type", "")
             name = getattr(entity, "name", "")
+            visibility = getattr(entity, "visibility", "public")
+            body_lines = getattr(entity, "body_lines", 0)
 
         # Ignorer les privés / internes
         if name.startswith("_"):
             return False
+        if visibility in ("private",):
+            return False
+
         if etype not in ("function", "method", "class", "constructor"):
             return False
 
-        # Ignorer les getters/setters triviaux
+        # Filtrage intelligent des getters/setters
+        # Seulement exclure les accesseurs TRIVIAUX :
+        #   - getName() / setName(x)  avec un seul mot après get/set
+        #   - ET le corps est très court (≤ 3 lignes ou non renseigné)
         if name.startswith("get") or name.startswith("set"):
-            return False
+            # Extraire le nom du champ : getName → "Name"
+            field_part = name[3:]
+            if field_part:
+                # Trivial = un seul mot CamelCase simple (Name, Id, Email)
+                # Non-trivial = mots composés (UsersWithOrders, DataSource)
+                import re
+                words = re.findall(r"[A-Z][a-z]*", field_part)
+                is_simple_accessor = len(words) <= 1
+                is_short_body = body_lines <= 3
+
+                if is_simple_accessor and is_short_body:
+                    return False
 
         return True
 

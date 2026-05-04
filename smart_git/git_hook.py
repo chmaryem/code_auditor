@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-import sqlite3
+from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -135,54 +135,44 @@ def _compute_file_hash(file_path: str) -> str:
         return ""
 
 
-def _read_analysis_fresh(abs_path: str, cache_db: Path) -> Optional[str]:
-    if not cache_db.exists():
-        return None
+def _read_analysis_fresh(abs_path: str, cache_db: Path = None) -> Optional[str]:
+    """Lit l'analyse depuis Redis MCP avec vérification de fraîcheur."""
     try:
-        conn = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
-        row  = conn.execute(
-            "SELECT analysis_text, content_hash FROM file_cache WHERE file_path = ?",
-            (abs_path,),
-        ).fetchone()
-        conn.close()
-
-        if not row or not row[0]:
+        redis = get_mcp_redis()
+        redis_key = f"{KEY_PREFIX}fc:{key_hash(abs_path)}"
+        data = redis.hgetall(redis_key)
+        if not data or not data.get("analysis_text"):
             return None
 
-        analysis_text = row[0]
-        cached_hash   = row[1] or ""
+        cached_hash = data.get("content_hash", "")
         current_hash = _compute_file_hash(abs_path)
         if not current_hash or current_hash != cached_hash:
             return None
 
-        return analysis_text
+        return data["analysis_text"]
     except Exception:
         return None
 
-def _get_recurring_patterns(abs_path: str, cache_db: Path, min_count: int = 2) -> List[dict]:
-    if not cache_db.exists():
-        return []
+def _get_recurring_patterns(abs_path: str, cache_db: Path = None, min_count: int = 2) -> List[dict]:
+    """Lit les patterns récurrents depuis Redis MCP."""
     try:
-        conn = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
-        rows = conn.execute("""
-            SELECT pattern_type, severity, occurrence_count, first_seen, promoted_to_kb
-            FROM episode_memory
-            WHERE file_path = ?
-              AND occurrence_count >= ?
-            ORDER BY occurrence_count DESC
-            LIMIT 5
-        """, (abs_path, min_count)).fetchall()
-        conn.close()
-        return [
-            {
-                "pattern":  r[0],
-                "severity": r[1],
-                "count":    r[2],
-                "first_seen": r[3],
-                "in_kb":    bool(r[4]),
-            }
-            for r in rows
-        ]
+        redis = get_mcp_redis()
+        scan_pattern = f"{KEY_PREFIX}em:{key_hash(abs_path)}:*"
+        keys = redis.scan_keys(scan_pattern)
+        results = []
+        for k in keys:
+            data = redis.hgetall(k)
+            count = int(data.get("occurrence_count", "0"))
+            if count >= min_count:
+                results.append({
+                    "pattern":    data.get("pattern_type", ""),
+                    "severity":   data.get("severity", "MEDIUM"),
+                    "count":      count,
+                    "first_seen": data.get("first_seen", ""),
+                    "in_kb":      data.get("promoted_to_kb", "0") == "1",
+                })
+        results.sort(key=lambda x: x["count"], reverse=True)
+        return results[:5]
     except Exception:
         return []
 
@@ -190,16 +180,14 @@ def _get_recurring_patterns(abs_path: str, cache_db: Path, min_count: int = 2) -
 def _compute_score_before(
     staged_files: list,
     project_path: Path,
-    cache_db: Path,
+    cache_db: Path = None,
 ) -> float:
+    """Calcule le score avant commit en lisant depuis Redis MCP."""
     import subprocess
 
     score_before = 0.0
-    if not cache_db.exists():
-        return score_before
-
     try:
-        conn = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
+        redis = get_mcp_redis()
         for file_info in staged_files:
             abs_path = str((project_path / file_info["path"]).resolve())
 
@@ -212,53 +200,45 @@ def _compute_score_before(
 
             prev_hash = hashlib.sha256(prev_result.stdout).hexdigest()
 
-            row = conn.execute(
-                "SELECT analysis_text FROM file_cache WHERE file_path = ? AND content_hash = ?",
-                (abs_path, prev_hash)
-            ).fetchone()
-
-            if row and row[0]:
-                _, _, _, file_score = _count_severity_from_blocks(row[0])
+            # Vérifier si le hash correspond au cache
+            redis_key = f"{KEY_PREFIX}fc:{key_hash(abs_path)}"
+            data = redis.hgetall(redis_key)
+            if data and data.get("content_hash") == prev_hash and data.get("analysis_text"):
+                _, _, _, file_score = _count_severity_from_blocks(data["analysis_text"])
                 score_before += file_score
-
-        conn.close()
     except Exception:
         pass
 
     return score_before
 
-def _find_dependents(file_path: str, project_path: Path, cache_db: Path) -> List[str]:
-   
+def _find_dependents(file_path: str, project_path: Path, cache_db: Path = None) -> List[str]:
+
     abs_path  = str(Path(file_path).resolve())
     file_name = Path(abs_path).stem
 
     try:
-        indexer_db = project_path / ".codeaudit" / "project_context.db"
-        if indexer_db.exists():
-            import json
-            conn = sqlite3.connect(f"file:{indexer_db}?mode=ro", uri=True)
-            row  = conn.execute(
-                "SELECT files FROM project_snapshot ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            conn.close()
-
-            if row and row[0]:
-                files_data = json.loads(row[0])
-                dependents = []
-                for fp, info in files_data.items():
-                    if not isinstance(info, dict):
-                        continue
-                    imports = info.get("imports", [])
-                    for imp in imports:
-                        imp_base = imp.split(".")[-1] if "." in imp else imp
-                        if (file_name.lower() in imp_base.lower()
-                                or imp_base.lower() in file_name.lower()):
-                            if (fp != abs_path
-                                    and Path(fp).suffix.lower() in WATCHED_EXTENSIONS):
-                                dependents.append(fp)
-                                break
-                if dependents:
-                    return dependents[:MAX_DEPS_PER_FILE]
+        import json
+        redis = get_mcp_redis()
+        ps_key = f"{KEY_PREFIX}ps:{key_hash(str(project_path))}"
+        raw = redis.get(ps_key)
+        if raw:
+            snapshot = json.loads(raw)
+            files_data = snapshot.get("files", {})
+            dependents = []
+            for fp, info in files_data.items():
+                if not isinstance(info, dict):
+                    continue
+                imports = info.get("imports", [])
+                for imp in imports:
+                    imp_base = imp.split(".")[-1] if "." in imp else imp
+                    if (file_name.lower() in imp_base.lower()
+                            or imp_base.lower() in file_name.lower()):
+                        if (fp != abs_path
+                                and Path(fp).suffix.lower() in WATCHED_EXTENSIONS):
+                            dependents.append(fp)
+                            break
+            if dependents:
+                return dependents[:MAX_DEPS_PER_FILE]
     except Exception:
         pass
 
@@ -343,22 +323,24 @@ def _analyze_dependent_live(
         result        = assistant_agent.analyze_code_with_rag(code=code, context=context)
         analysis_text = result.get("analysis", "")
 
-        # Save to cache for next commits
-        if analysis_text and cache_db.exists():
+        # Save to cache for next commits via Redis MCP
+        if analysis_text:
             try:
                 from datetime import datetime
+                redis = get_mcp_redis()
                 content_hash = _compute_file_hash(dep_path)
-                mtime  = path.stat().st_mtime
-                conn   = sqlite3.connect(str(cache_db), check_same_thread=False)
-                conn.execute("""
-                    INSERT OR REPLACE INTO file_cache
-                    (file_path, content_hash, last_modified,
-                     analysis_text, relevant_knowledge, dependencies, dependents, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?)
-                """, (dep_path, content_hash, mtime, analysis_text,
-                      "[]", "[]", "[]", datetime.now().isoformat()))
-                conn.commit()
-                conn.close()
+                mtime = path.stat().st_mtime
+                redis_key = f"{KEY_PREFIX}fc:{key_hash(dep_path)}"
+                redis.hset_dict(redis_key, {
+                    "file_path":          dep_path,
+                    "content_hash":       content_hash,
+                    "last_modified":      str(mtime),
+                    "analysis_text":      analysis_text,
+                    "relevant_knowledge": "[]",
+                    "dependencies":       "[]",
+                    "dependents":         "[]",
+                    "updated_at":         datetime.now().isoformat(),
+                })
             except Exception:
                 pass
 

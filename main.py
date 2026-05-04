@@ -429,27 +429,86 @@ def cmd_pr_merge_check(args):
 def cmd_generate_tests(args):
     """
     Génère des tests unitaires pour un fichier source donné.
-    Utilise le TestGeneratorAgent avec RAG pour produire des tests
-    cohérents avec les conventions du projet.
+    Utilise le TestGeneratorAgent avec RAG (test_patterns_kb + ProjectCodeIndexer)
+    pour produire des tests cohérents avec les conventions du projet.
     """
     from pathlib import Path
     from agents.test_generator_agent import TestGeneratorAgent
 
-    source_path = Path(args.path)
+    source_path = Path(args.path).resolve()
     if not source_path.exists():
         err(f"Fichier introuvable : {source_path}")
         return
 
-    project_path = Path(args.project) if args.project else source_path.parent
-    agent = TestGeneratorAgent(project_path)
+    project_path = Path(args.project).resolve() if args.project else source_path.parent
 
     hdr(f"GÉNÉRATION DE TESTS : {source_path.name}")
+    info(f"Projet : {project_path}")
+
+    # ── Initialiser le RAG pour les tests ──────────────────────────────────
+    test_kb = None
+    project_code_indexer = None
+    knowledge_graph_inst = None
+
+    try:
+        from services.llm_service import assistant_agent
+        from services.test_knowledge_loader import TestKnowledgeLoader
+        info("Chargement test_patterns_kb (RAG test patterns)...")
+        test_kb = TestKnowledgeLoader(embeddings=assistant_agent.embeddings)
+        n = test_kb.load()
+        stats = test_kb.get_stats()
+        info(f"test_patterns_kb : {n} chunks ({stats.get('by_language', {})})")
+    except Exception as e:
+        info(f"test_patterns_kb non disponible : {e}")
+
+    try:
+        from services.llm_service import assistant_agent
+        from services.knowledge_loader import ProjectCodeIndexer
+        info("Chargement ProjectCodeIndexer...")
+        project_code_indexer = ProjectCodeIndexer(embeddings=assistant_agent.embeddings)
+        project_code_indexer.index_project(project_path)
+    except Exception as e:
+        info(f"ProjectCodeIndexer non disponible : {e}")
+
+    try:
+        from services.knowledge_graph import knowledge_graph
+        knowledge_graph_inst = knowledge_graph
+    except Exception:
+        pass
+
+    # ── Générer les tests ──────────────────────────────────────────────────
+    agent = TestGeneratorAgent(
+        project_path=project_path,
+        test_kb=test_kb,
+        project_code_indexer=project_code_indexer,
+        knowledge_graph=knowledge_graph_inst,
+    )
+
+    info("Génération en cours (LLM + RAG)...\n")
     result = agent.generate_for_file(source_path, write=args.write)
 
+    if result.get("error"):
+        err(result["error"])
+        return
+
+    # ── Affichage résultat ─────────────────────────────────────────────────
     if result.get("test_file"):
         ok(f"Tests générés : {result['test_file']}")
+        info(f"Framework : {result.get('framework', '?')}")
+        info(f"Docs RAG utilisés : {result.get('rag_docs_used', 0)}")
+        if result.get("validated"):
+            ok("Validation structurelle : OK")
+        else:
+            info("Validation structurelle : echec (retry effectue)")
+
         if not args.write:
-            info("(mode preview — utilisez --write pour écrire)")
+            print(f"\n{Y}  Mode preview — le code ci-dessous n'a PAS été écrit sur disque.{E}")
+            print(f"{Y}  Relancez avec --write pour écrire le fichier.{E}\n")
+            print(f"{B}{'─' * 70}{E}")
+            print(result.get("test_code", ""))
+            print(f"{B}{'─' * 70}{E}")
+        else:
+            ok(f"Fichier écrit : {result['test_file']}")
     else:
         err(result.get("error", "Échec de la génération"))
 

@@ -19,7 +19,7 @@ Verdict de merge :
 from __future__ import annotations
 
 import logging
-import sqlite3
+from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -241,22 +241,17 @@ class GitBranchAnalyzer:
         fa.bugs_medium   = m
         fa.score = score
 
-    # ── Cache SQLite ──────────────────────────────────────────────────────────
+    # ── Cache Redis MCP ────────────────────────────────────────────────────────
 
     def _read_from_cache(self, abs_path: str) -> Optional[str]:
-        """Lit l'analyse depuis SQLite (connexion lecture seule)."""
-        if not self.cache_db.exists():
-            return None
+        """Lit l'analyse depuis Redis MCP."""
         try:
-            conn = sqlite3.connect(f"file:{self.cache_db}?mode=ro", uri=True)
-            row  = conn.execute(
-                "SELECT analysis_text FROM file_cache WHERE file_path = ?",
-                (abs_path,),
-            ).fetchone()
-            conn.close()
-            return row[0] if row and row[0] else None
+            redis = get_mcp_redis()
+            redis_key = f"{KEY_PREFIX}fc:{key_hash(abs_path)}"
+            analysis = redis.hget(redis_key, "analysis_text")
+            return analysis if analysis else None
         except Exception as e:
-            logger.debug("Cache read erreur %s : %s", abs_path, e)
+            logger.debug("Redis cache read erreur %s : %s", abs_path, e)
             return None
 
     # ── Analyse LLM (fallback) ────────────────────────────────────────────────

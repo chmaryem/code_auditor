@@ -175,6 +175,17 @@ class Orchestrator:
         # Brancher TestGapAgent
         self._test_gap_agent = TestGapAgent(self.project_path)
         self._test_proposal_notifier = TestProposalNotifier(print_lock=self._print_lock)
+
+        # Charger test_patterns_kb (collection ChromaDB séparée pour les patterns de test)
+        try:
+            from services.test_knowledge_loader import TestKnowledgeLoader
+            self._test_kb = TestKnowledgeLoader(embeddings=assistant_agent.embeddings)
+            n_test_chunks = self._test_kb.load()
+            print(f" test_patterns_kb : {n_test_chunks} chunks de patterns de test")
+        except Exception as e:
+            logger.debug("TestKnowledgeLoader non initialisé : %s", e)
+            self._test_kb = None
+
         print(" Test Gap Detection activé — surveillance des tests manquants")
 
         print(" System-Aware RAG + Knowledge Graph + Self-Improving + Test-Aware activés")
@@ -507,20 +518,16 @@ class Orchestrator:
         # ── ÉTAPE 4.7 : Test Gap Detection (0 token) ──────────────────────
         if hasattr(self, "_test_gap_agent") and self._test_gap_agent:
             try:
-                print(f"  [ÉTAPE 4.7] Test Gap Detection pour {file_path.name}")
+                logger.debug("Étape 4.7 — Test Gap Detection pour %s", file_path.name)
                 test_status = self._test_gap_agent.check(
                     source_file=file_path,
                     parsed_entities=parsed.get("entities", []),
                     change_info=change_info,
                 )
-                print(f"  [ÉTAPE 4.7] Résultat: needs_attention={test_status.needs_attention}, missing={test_status.missing}")
                 if test_status.needs_attention and hasattr(self, "_test_proposal_notifier"):
                     self._test_proposal_notifier.notify(test_status)
-                    print(f"  [ÉTAPE 4.7] Notification envoyée!")
+                    logger.info("Test gap détecté pour %s (impact=%d)", file_path.name, test_status.impact_score)
             except Exception as e:
-                print(f"  [ÉTAPE 4.7] ERREUR: {e}")
-                import traceback
-                traceback.print_exc()
                 logger.error("TestGapAgent erreur pour %s : %s", file_path.name, e)
 
         # ── ÉTAPE 5 : Mise à jour graphe NetworkX ─────────────────────────

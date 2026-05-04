@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-import sqlite3
+from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -278,26 +278,19 @@ class ConflictContextBuilder:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _get_file_entities(self, conflict_file: str) -> str:
-        """Lit les entités indexées du fichier depuis le cache project_indexer."""
-        db_path = self.project_path / ".codeaudit" / "project_context.db"
-        if not db_path.exists():
-            return ""
-
+        """Lit les entités indexées du fichier depuis Redis MCP (project_indexer cache)."""
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            row = conn.execute(
-                "SELECT files FROM project_snapshot ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            conn.close()
-
-            if not row:
+            redis = get_mcp_redis()
+            ps_key = f"{KEY_PREFIX}ps:{key_hash(str(self.project_path))}"
+            raw = redis.get(ps_key)
+            if not raw:
                 return ""
 
-            files_data = json.loads(row[0])
+            snapshot = json.loads(raw)
+            files_data = snapshot.get("files", {})
             if isinstance(files_data, str):
                 files_data = json.loads(files_data)
 
-            # Chercher l'entrée correspondante
             for fp, info in files_data.items():
                 if conflict_file in fp or Path(fp).name == Path(conflict_file).name:
                     entities = info.get("entities", [])
@@ -312,7 +305,7 @@ class ConflictContextBuilder:
                             )
                         return "\n".join(lines)
         except Exception as e:
-            logger.debug("Erreur lecture project_context.db : %s", e)
+            logger.debug("Erreur lecture project snapshot Redis : %s", e)
 
         return ""
 
@@ -321,32 +314,16 @@ class ConflictContextBuilder:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _get_watch_analysis(self, conflict_file: str) -> str:
-        """Lit l'analyse précédente depuis le cache SQLite du Watch."""
-        # Chercher le cache dans les emplacements habituels
-        for cache_dir in [
-            Path(__file__).parent.parent / "data" / "cache",
-            self.project_path / ".codeaudit",
-        ]:
-            db_path = cache_dir / "analysis_cache.db"
-            if not db_path.exists():
-                continue
-
-            try:
-                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-                abs_path = str((self.project_path / conflict_file).resolve())
-                row = conn.execute(
-                    "SELECT analysis_text FROM file_cache WHERE file_path = ?",
-                    (abs_path,)
-                ).fetchone()
-                conn.close()
-
-                if row and row[0]:
-                    # Tronquer à ~1000 chars pour le budget
-                    analysis = row[0][:1000]
-                    return f"  {analysis}"
-            except Exception:
-                continue
-
+        """Lit l'analyse précédente depuis Redis MCP."""
+        try:
+            redis = get_mcp_redis()
+            abs_path = str((self.project_path / conflict_file).resolve())
+            redis_key = f"{KEY_PREFIX}fc:{key_hash(abs_path)}"
+            analysis = redis.hget(redis_key, "analysis_text")
+            if analysis:
+                return f"  {analysis[:1000]}"
+        except Exception:
+            pass
         return ""
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -355,21 +332,15 @@ class ConflictContextBuilder:
 
     def _get_file_criticality(self, conflict_file: str) -> str:
         """Évalue la criticité du fichier (nombre de fichiers qui en dépendent)."""
-        db_path = self.project_path / ".codeaudit" / "project_context.db"
-        if not db_path.exists():
-            return ""
-
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            row = conn.execute(
-                "SELECT files FROM project_snapshot ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            conn.close()
-
-            if not row:
+            redis = get_mcp_redis()
+            ps_key = f"{KEY_PREFIX}ps:{key_hash(str(self.project_path))}"
+            raw = redis.get(ps_key)
+            if not raw:
                 return ""
 
-            files_data = json.loads(row[0])
+            snapshot = json.loads(raw)
+            files_data = snapshot.get("files", {})
             if isinstance(files_data, str):
                 files_data = json.loads(files_data)
 
@@ -391,27 +362,30 @@ class ConflictContextBuilder:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _get_episode_memory(self, conflict_file: str) -> str:
-        """Lit les patterns récurrents depuis episode_memory."""
-        cache_db = Path(__file__).parent.parent / "data" / "cache" / "analysis_cache.db"
-        if not cache_db.exists():
-            return ""
-
+        """Lit les patterns récurrents depuis Redis MCP."""
         try:
-            conn = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
+            redis = get_mcp_redis()
             abs_path = str((self.project_path / conflict_file).resolve())
-            rows = conn.execute(
-                "SELECT pattern_type, severity, occurrence_count "
-                "FROM episode_memory WHERE file_path = ? "
-                "ORDER BY occurrence_count DESC LIMIT 5",
-                (abs_path,)
-            ).fetchall()
-            conn.close()
+            scan_pattern = f"{KEY_PREFIX}em:{key_hash(abs_path)}:*"
+            keys = redis.scan_keys(scan_pattern)
 
-            if not rows:
+            if not keys:
                 return ""
 
+            results = []
+            for k in keys:
+                data = redis.hgetall(k)
+                results.append((
+                    data.get("pattern_type", ""),
+                    data.get("severity", "MEDIUM"),
+                    int(data.get("occurrence_count", "0")),
+                ))
+
+            results.sort(key=lambda x: x[2], reverse=True)
+            results = results[:5]
+
             lines = ["RECURRING PATTERNS (episode_memory):"]
-            for pattern, sev, count in rows:
+            for pattern, sev, count in results:
                 lines.append(f"  • [{sev}] {pattern} — seen {count}x")
             return "\n".join(lines)
         except Exception:

@@ -43,7 +43,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-import sqlite3
+from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
 import threading
 import time
 from dataclasses import dataclass, field
@@ -311,20 +311,34 @@ class GitSessionTracker:
         final_score = total_score * time_mult
 
         # Étape 5 : détecter les test gaps (0 token — scan rapide)
+        #   Crée de vrais objets TestGapStatus (pas des dicts) pour compatibilité
+        #   avec TestProposalNotifier qui accède à .source_file.name, .impact_score, etc.
         test_gaps = []
         try:
             from services.test_discovery import TestDiscoveryService
+            from agents.test_gap_agent import TestGapStatus
             discovery = TestDiscoveryService(self.project_path)
             for file_info in uncommitted:
                 file_path_abs = self.project_path / file_info["path"]
                 if not discovery.has_test_file(file_path_abs):
-                    test_gaps.append({
-                        "source_file": file_path_abs,
-                        "test_file": None,
-                        "missing": True,
-                        "impact_score": 50,
-                        "reason": f"aucun test pour {file_path_abs.name}",
-                    })
+                    # Calculer un impact_score réaliste selon le type de fichier
+                    impact = 30  # base
+                    fname = file_path_abs.name.lower()
+                    if "service" in fname or "controller" in fname:
+                        impact += 25  # fichier métier critique
+                    elif "util" in fname or "helper" in fname:
+                        impact += 10  # utilitaire
+                    if file_info.get("status") == "A":  # nouveau fichier
+                        impact += 20
+
+                    gap = TestGapStatus(
+                        source_file=file_path_abs,
+                        test_file=None,
+                        missing=True,
+                        impact_score=min(impact, 100),
+                        reason=f"aucun test pour {file_path_abs.name}",
+                    )
+                    test_gaps.append(gap)
         except Exception as e:
             logger.debug("TestDiscoveryService erreur : %s", e)
 
@@ -378,24 +392,16 @@ class GitSessionTracker:
 
     def _read_analysis_from_cache(self, file_path: str) -> Optional[str]:
         """
-        Lit le texte d'analyse depuis SQLite pour un fichier donné.
+        Lit le texte d'analyse depuis Redis MCP pour un fichier donné.
         Retourne None si le fichier n'est pas dans le cache.
-
-        Utilise une connexion SQLite séparée (lecture seule) pour éviter
-        tout conflit avec la connexion d'écriture de CacheService.
         """
-        if not self.cache_db.exists():
-            return None
         try:
-            conn = sqlite3.connect(f"file:{self.cache_db}?mode=ro", uri=True)
-            row  = conn.execute(
-                "SELECT analysis_text FROM file_cache WHERE file_path = ?",
-                (file_path,),
-            ).fetchone()
-            conn.close()
-            return row[0] if row and row[0] else None
+            redis = get_mcp_redis()
+            redis_key = f"{KEY_PREFIX}fc:{key_hash(file_path)}"
+            analysis = redis.hget(redis_key, "analysis_text")
+            return analysis if analysis else None
         except Exception as e:
-            logger.debug("SQLite read erreur pour %s : %s", file_path, e)
+            logger.debug("Redis read erreur pour %s : %s", file_path, e)
             return None
 
     #  Notification avec hysteresis + FIX 3 reminder timer
@@ -454,13 +460,15 @@ class GitSessionTracker:
                     logger.debug("GitNotifier.notify_reminder erreur : %s", e)
 
         # Notification des test gaps (pas liée au niveau de risque)
+        #   Utilise un TestProposalNotifier dédié — le self._notifier est un
+        #   GitNotifier qui n'a pas notify_batch(). On crée un notifier ad-hoc.
         if snapshot.test_gaps:
             try:
                 from agents.test_proposal_notifier import TestProposalNotifier
-                if isinstance(self._notifier, TestProposalNotifier):
-                    self._notifier.notify_batch(snapshot.test_gaps)
-                elif hasattr(self._notifier, "notify_test_gaps"):
-                    self._notifier.notify_test_gaps(snapshot.test_gaps)
+                # Récupérer le print_lock du GitNotifier si disponible
+                lock = getattr(self._notifier, "_lock", None) or self._lock
+                test_notifier = TestProposalNotifier(print_lock=lock)
+                test_notifier.notify_batch(snapshot.test_gaps)
             except Exception as e:
                 logger.debug("Test gap notification erreur : %s", e)
 

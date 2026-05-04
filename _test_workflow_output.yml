@@ -1,0 +1,109 @@
+name: "CI/CD — Build + SonarQube"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+  security-events: write
+
+jobs:
+  # ── Job 1 : Build & Test ──────────────────────────────────────
+  build-test:
+    name: "🔧 Build & Test (python/pip)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Requis pour SonarQube blame
+
+      - name: "Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: "Install"
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: "Tests"
+        run: pytest --tb=short -q
+        continue-on-error: true
+
+      - name: "📊 Upload Test Results"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            target/surefire-reports/
+            build/test-results/
+          retention-days: 5
+
+  # ── Job 2 : SonarQube Analysis ────────────────────────────────
+  sonar-scan:
+    name: "🔍 SonarQube Analysis"
+    needs: build-test  # Attend que build-test réussisse
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: always() && needs.build-test.result == 'success'
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Requis pour l'analyse complète
+
+      - name: "⚙️ Setup Java 17 (SonarQube requiert Java)"
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: "📦 Download Build Artifacts"
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: .
+        continue-on-error: true
+
+      - name: "🔍 SonarQube Scan (CLI)"
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          # Télécharger sonar-scanner si nécessaire
+          if ! command -v sonar-scanner &> /dev/null; then
+            wget -q https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+            unzip -q sonar-scanner-cli-*.zip
+            export PATH=$PWD/sonar-scanner-*/bin:$PATH
+          fi
+          
+          sonar-scanner \
+            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }} \
+            -Dsonar.sources=. \
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+            -Dsonar.token=${{ secrets.SONAR_TOKEN }}
+        continue-on-error: true
+
+      - name: "✅ SonarQube Quality Gate"
+        uses: sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        continue-on-error: true
+
+      - name: "📊 SonarQube Metrics"
+        run: |
+          echo "SonarQube analysis complete"
+          echo "Project: ${{ github.repository_owner }}_${{ github.event.repository.name }}"
+          echo "URL: ${{ secrets.SONAR_HOST_URL }}/dashboard?id=${{ github.repository_owner }}_${{ github.event.repository.name }}"
+        continue-on-error: true
