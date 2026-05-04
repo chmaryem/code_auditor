@@ -28,13 +28,14 @@ from __future__ import annotations
 
 import hashlib
 import re
-from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 _project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(_project_root))
+
+from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
 
 # ── Seuils ───────────────────────────────────────────────────────────────────
 STRICT_MODE     = True
