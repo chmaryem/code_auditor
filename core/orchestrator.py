@@ -37,15 +37,28 @@ class Orchestrator:
     """
     Point d'entrée unique pour toute demande d'analyse.
 
-    Usage :
+    Usage CLI (existant) :
         orch = Orchestrator(project_path)
         orch.initialize()
         orch.handle(file_changed_event(Path("fichier.py")))
         orch.stop()
+
+    Usage API (nouveau) :
+        orch = Orchestrator(project_path, on_result=my_callback)
+        orch.initialize()
+        result = orch.analyze_single(Path("fichier.py"))
+        # → AnalysisResultResponse dict
     """
 
-    def __init__(self, project_path: Path):
+    def __init__(self, project_path: Path, on_result=None):
         self.project_path    = project_path
+
+        # ── API support ───────────────────────────────────────────────────
+        # Callback appelé après chaque analyse (pour WebSocket broadcast)
+        # Signature : on_result(result_dict: dict) -> None
+        self._on_result = on_result
+        # Stockage des derniers résultats par fichier (pour l'API REST)
+        self._results: Dict[str, dict] = {}
 
         # Services / agents (initialisés dans initialize())
         self._cache          = None
@@ -203,6 +216,154 @@ class Orchestrator:
             if self._loop is not None and self._loop.is_running():
                 break
             time.sleep(0.1)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # API : Analyse synchrone one-shot (pour FastAPI)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def analyze_single(self, file_path: Path) -> dict:
+        """
+        Analyse synchrone one-shot d'un fichier — pour l'API REST.
+
+        Exécute le pipeline complet (parse → RAG → LLM → JSON) et retourne
+        un dict AnalysisResultResponse. N'imprime rien dans la console.
+
+        Cette méthode est le point d'entrée pour POST /analyze/file.
+        Elle réutilise les mêmes agents et services que le watch mode.
+
+        Args:
+            file_path: Chemin absolu du fichier à analyser
+
+        Returns:
+            dict compatible AnalysisResultResponse
+        """
+        import time as _time
+        from agents.code_agent     import code_agent
+        from agents.analysis_agent import build_context
+        from output.json_renderer  import JSONRenderer
+
+        start = _time.time()
+        renderer = JSONRenderer()
+
+        # ── 1. Lecture du fichier ─────────────────────────────────────────
+        try:
+            code = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return renderer.render_clean(file_path, f"Erreur lecture : {e}").model_dump()
+
+        # ── 2. Changement significatif ? ──────────────────────────────────
+        old_content = self._file_contents.get(str(file_path), "")
+        change_info = code_agent.analyze_change(old_content, code)
+
+        if not change_info["significant"] and old_content:
+            return renderer.render_clean(
+                file_path, f"RAS — {change_info['reason']}"
+            ).model_dump()
+
+        # ── 3. Parsing AST ────────────────────────────────────────────────
+        parsed = code_agent.parse(file_path)
+        if isinstance(parsed, str):
+            parsed = {"error": parsed, "entities": [], "imports": []}
+        if parsed.get("error"):
+            return renderer.render_clean(
+                file_path, f"Erreur parsing : {parsed['error']}"
+            ).model_dump()
+
+        # ── 4. Voisinage (graphe de dépendances) ─────────────────────────
+        neighborhood = {}
+        if hasattr(self, "_retriever_agent") and self._retriever_agent:
+            neighborhood = self._retriever_agent.get_neighborhood(file_path)
+            if isinstance(neighborhood, str):
+                neighborhood = {}
+
+        language = code_agent.detect_language(file_path)
+        neighborhood["_parsed_entities"] = parsed.get("entities", [])
+        neighborhood["language"] = language
+
+        # ── 5. RAG retrieval ──────────────────────────────────────────────
+        relevant_docs, rag_scores = [], []
+        if hasattr(self, "_retriever_agent") and self._retriever_agent:
+            try:
+                relevant_docs, rag_scores = self._retriever_agent.retrieve_system_aware(
+                    current_code      = code,
+                    neighborhood      = neighborhood,
+                    current_file_name = file_path.name,
+                    networkx_graph    = self._dependency_graph,
+                )
+            except Exception:
+                pass
+
+        # ── 6. Contexte enrichi ───────────────────────────────────────────
+        context = build_context(
+            file_path       = file_path,
+            neighborhood    = neighborhood,
+            project_indexer = self._project_indexer,
+            change_info     = change_info,
+        )
+        if isinstance(context, str):
+            context = {}
+        context["docs_used"] = len(relevant_docs)
+
+        # ── 7. Analyse LLM ────────────────────────────────────────────────
+        if not hasattr(self, "_analysis_agent") or not self._analysis_agent:
+            return renderer.render_clean(
+                file_path, "Pipeline non initialisé"
+            ).model_dump()
+
+        analysis = self._analysis_agent.analyze(
+            code=code, context=context,
+            docs=relevant_docs, scores=rag_scores,
+        )
+        if isinstance(analysis, str):
+            analysis = {"analysis": analysis, "relevant_knowledge": []}
+
+        # ── 8. Cache ──────────────────────────────────────────────────────
+        if self._cache:
+            self._cache.update_file_cache(
+                file_path, analysis,
+                context.get("dependencies", []),
+                context.get("dependents", []),
+            )
+        self._file_contents[str(file_path)] = code
+
+        # ── 9. Construire le résultat JSON ────────────────────────────────
+        elapsed = _time.time() - start
+        result = renderer.render_analysis(
+            raw_text  = analysis.get("analysis", ""),
+            file_path = file_path,
+            context   = context,
+            elapsed   = elapsed,
+            score     = change_info.get("score", 0),
+        )
+
+        result_dict = result.model_dump()
+
+        # Stocker le résultat pour consultation ultérieure
+        self._results[str(file_path)] = result_dict
+
+        # Notifier le callback (WebSocket broadcast)
+        if self._on_result:
+            try:
+                self._on_result(result_dict)
+            except Exception:
+                pass
+
+        self._stats["analyzed"] += 1
+        self._stats["time_total"] += elapsed
+
+        return result_dict
+
+    def get_last_result(self, file_path: Path) -> Optional[dict]:
+        """Retourne le dernier résultat d'analyse pour un fichier (ou None)."""
+        return self._results.get(str(file_path))
+
+    def get_all_results(self) -> Dict[str, dict]:
+        """Retourne tous les résultats d'analyse stockés."""
+        return dict(self._results)
+
+    def get_stats_dict(self) -> dict:
+        """Retourne les statistiques sous forme de dict (pour l'API)."""
+        return dict(self._stats)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Interface publique (thread-safe, synchrone)

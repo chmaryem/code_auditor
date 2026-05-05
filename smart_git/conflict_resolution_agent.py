@@ -1,7 +1,6 @@
 """
 conflict_resolution_agent.py — Résolution de conflits PR.
 
-ARCHITECTURE v6.2 — Pipeline RAG-enriched :
 
   Pipeline de résolution :
     1. get_pr_mergeable_status() — détection fiable (REST API direct + fallback MCP)

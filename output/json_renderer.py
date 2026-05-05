@@ -1,149 +1,243 @@
 """
-output/json_renderer.py — Rendu JSON pour API IDE
+output/json_renderer.py — Rendu JSON pour API FastAPI + VS Code extension.
 
-Remplace les sorties ANSI console_renderer.py par une API JSON structurée.
-Compatible LSP (Language Server Protocol) pour diagnostics.
+Convertit les réponses brutes du LLM en objets structurés AnalysisResultResponse.
+Compatible avec le format LSP Diagnostic pour les squiggly lines dans VS Code.
+
+Usage:
+    renderer = JSONRenderer()
+    result = renderer.render_analysis(raw_text, file_path, context, elapsed, score)
+    # → AnalysisResultResponse prêt pour l'API
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Optional
+import re
 from pathlib import Path
-import json
+from typing import List, Optional
+
+from api.models import (
+    AnalysisResultResponse,
+    IssueDiagnostic,
+    FixSuggestion,
+)
 
 
-@dataclass
-class Issue:
-    """Problème détecté dans le code."""
-    severity: str  # "CRITICAL" | "HIGH" | "MEDIUM" | "LOW"
-    message: str
-    line: Optional[int]
-    column: Optional[int]
-    code: str  # code snippet
-    suggestion: Optional[str] = None
-    
-    def to_dict(self) -> dict:
-        return asdict(self)
+# ── Mapping sévérité → LSP DiagnosticSeverity ────────────────────────────────
+# VS Code utilise ces niveaux pour les couleurs des squiggly lines :
+#   1 = Error (rouge)      → CRITICAL
+#   2 = Warning (orange)   → HIGH
+#   3 = Information (bleu) → MEDIUM
+#   4 = Hint (gris)        → LOW
 
-
-@dataclass
-class Fix:
-    """Correction suggérée."""
-    location: str
-    current_code: str
-    fixed_code: str
-    explanation: str
-    
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class AnalysisResult:
-    """Résultat complet d'une analyse."""
-    file_path: str
-    language: str
-    score: int  # 0-100 (importance du changement)
-    issues: list[Issue]
-    fixes: list[Fix]
-    elapsed_seconds: float
-    strategy: str  # "full_class" | "targeted_methods" | "block_fix"
-    
-    def to_dict(self) -> dict:
-        return {
-            "file_path": self.file_path,
-            "language": self.language,
-            "score": self.score,
-            "issues": [i.to_dict() for i in self.issues],
-            "fixes": [f.to_dict() for f in self.fixes],
-            "elapsed_seconds": self.elapsed_seconds,
-            "strategy": self.strategy,
-        }
-    
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
+LSP_SEVERITY_MAP = {
+    "CRITICAL": 1,
+    "HIGH": 2,
+    "MEDIUM": 3,
+    "LOW": 4,
+}
 
 
 class JSONRenderer:
     """
-    Rendu JSON pour communication IDE.
-    
-    Usage:
-        renderer = JSONRenderer()
-        result = renderer.render_analysis(text, file_path, context, elapsed)
-        print(result.to_json())  # → VS Code
+    Transforme la sortie texte du LLM en objets structurés pour l'API.
+
+    Gère les 3 stratégies de réponse du LLM :
+      - block_fix        : blocs ---FIX START--- individuels
+      - targeted_methods : blocs ---METHOD START--- avec méthodes réécrites
+      - full_class       : classe entière réécrite dans ---SOLUTION START---
+
+    Chaque stratégie produit le même format de sortie : AnalysisResultResponse.
     """
-    
+
     def render_analysis(
         self,
-        text: str,
+        raw_text: str,
         file_path: Path,
         context: dict,
         elapsed: float,
         score: int = 0,
-    ) -> AnalysisResult:
+    ) -> AnalysisResultResponse:
         """
-        Parse la réponse LLM et retourne un objet AnalysisResult.
-        
+        Parse la réponse LLM complète et retourne un résultat structuré.
+
         Args:
-            text: Réponse texte de l'analyse (avec FIX blocks)
-            file_path: Chemin du fichier analysé
-            context: Contexte du projet
-            elapsed: Temps d'analyse en secondes
-            score: Score d'importance du changement
+            raw_text  : Réponse textuelle brute du LLM
+            file_path : Chemin du fichier analysé
+            context   : Dictionnaire de contexte (language, dependencies, etc.)
+            elapsed   : Temps d'analyse en secondes
+            score     : Score d'importance du changement (0-100)
+
+        Returns:
+            AnalysisResultResponse prêt pour sérialisation JSON
         """
-        from output.console_renderer import parse_fix_blocks
-        
-        blocks = parse_fix_blocks(text)
-        issues = []
-        fixes = []
-        
-        for block in blocks:
-            issue = Issue(
-                severity=block.get("severity", "MEDIUM"),
-                message=block.get("problem", ""),
-                line=block.get("line_number"),
-                column=None,  # À extraire si disponible
-                code=block.get("current_code", ""),
-                suggestion=block.get("why", ""),
-            )
-            issues.append(issue)
-            
-            if block.get("fixed_code"):
-                fix = Fix(
-                    location=block.get("location", ""),
-                    current_code=block.get("current_code", ""),
-                    fixed_code=block.get("fixed_code", ""),
-                    explanation=block.get("why", ""),
-                )
-                fixes.append(fix)
-        
-        # Détecter stratégie depuis le texte
-        strategy = "block_fix"
-        if "--- SOLUTION START ---" in text:
-            strategy = "full_class"
-        elif "targeted" in text.lower():
-            strategy = "targeted_methods"
-        
+        strategy = self._detect_strategy(raw_text)
+        issues = self._parse_issues(raw_text)
+        fixes = self._parse_fixes(raw_text)
         language = context.get("language", "unknown")
-        
-        return AnalysisResult(
+
+        # Compter les docs RAG utilisés depuis le contexte
+        rag_docs = context.get("docs_used", 0)
+
+        return AnalysisResultResponse(
             file_path=str(file_path),
             language=language,
             score=score,
+            strategy=strategy,
             issues=issues,
             fixes=fixes,
-            elapsed_seconds=elapsed,
-            strategy=strategy,
+            elapsed_seconds=round(elapsed, 2),
+            rag_docs_used=rag_docs,
+            raw_analysis=raw_text,
         )
-    
-    def render_empty(self, file_path: Path, reason: str) -> dict:
-        """Résultat vide (fichier inchangé ou RAS)."""
-        return {
-            "file_path": str(file_path),
-            "score": 0,
-            "issues": [],
-            "fixes": [],
-            "message": reason,
-            "strategy": "none",
-        }
+
+    def render_clean(self, file_path: Path, reason: str) -> AnalysisResultResponse:
+        """Résultat vide quand le fichier est propre ou le changement mineur."""
+        return AnalysisResultResponse(
+            file_path=str(file_path),
+            score=0,
+            strategy="none",
+            raw_analysis=reason,
+        )
+
+    # ── Détection de la stratégie ─────────────────────────────────────────────
+
+    @staticmethod
+    def _detect_strategy(text: str) -> str:
+        """Détecte la stratégie choisie par le LLM depuis le bloc ---DECISION---."""
+        dec_match = re.search(
+            r"---DECISION---\s*(.*?)\s*---DECISION END---",
+            text, re.DOTALL | re.IGNORECASE,
+        )
+        if dec_match:
+            strat_match = re.search(
+                r"STRATEGY\s*:\s*(\w+)", dec_match.group(1), re.IGNORECASE
+            )
+            if strat_match:
+                s = strat_match.group(1).lower().strip()
+                if s in ("full_class", "targeted_methods", "block_fix"):
+                    return s
+
+        # Fallback : détecter par la présence de marqueurs
+        if "--- SOLUTION START ---" in text or "---SOLUTION START---" in text:
+            return "full_class"
+        if "---METHOD START:" in text:
+            return "targeted_methods"
+        return "block_fix"
+
+    # ── Parsing des issues (blocs ---FIX START---) ────────────────────────────
+
+    @staticmethod
+    def _parse_issues(text: str) -> List[IssueDiagnostic]:
+        """
+        Parse tous les blocs ---FIX START--- et retourne des IssueDiagnostic.
+
+        Format LLM attendu :
+            ---FIX START---
+            **PROBLEM**: description
+            **SEVERITY**: CRITICAL | HIGH | MEDIUM | LOW
+            **LOCATION**: method_name, line N
+            **CURRENT CODE**: ```lang\n...\n```
+            **FIXED CODE**: ```lang\n...\n```
+            **WHY**: explanation
+            ---FIX END---
+        """
+        issues: List[IssueDiagnostic] = []
+        parts = re.split(r'-{3,}\s*FIX START\s*-{3,}', text, flags=re.IGNORECASE)
+
+        for raw in parts[1:]:
+            end = re.search(r'-{3,}\s*FIX END\s*-{3,}', raw, re.IGNORECASE)
+            if end:
+                raw = raw[:end.start()]
+
+            problem = _extract_field(raw, "PROBLEM")
+            if not problem:
+                continue
+
+            sev_raw = _extract_field(raw, "SEVERITY").upper().split()[0] if _extract_field(raw, "SEVERITY") else "MEDIUM"
+            severity = sev_raw if sev_raw in LSP_SEVERITY_MAP else "MEDIUM"
+
+            location = _extract_field(raw, "LOCATION")
+            line_match = re.search(r'[:\s](\d{1,5})\b', location)
+
+            issues.append(IssueDiagnostic(
+                severity=severity,
+                message=problem,
+                line=int(line_match.group(1)) if line_match else None,
+                column=None,
+                source="code-auditor",
+                code_snippet=_extract_code_block(raw, "CURRENT CODE"),
+                suggestion=_extract_field(raw, "WHY"),
+            ))
+
+        return issues
+
+    # ── Parsing des fixes ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_fixes(text: str) -> List[FixSuggestion]:
+        """Parse les corrections proposées (current → fixed code)."""
+        fixes: List[FixSuggestion] = []
+        parts = re.split(r'-{3,}\s*FIX START\s*-{3,}', text, flags=re.IGNORECASE)
+
+        for raw in parts[1:]:
+            end = re.search(r'-{3,}\s*FIX END\s*-{3,}', raw, re.IGNORECASE)
+            if end:
+                raw = raw[:end.start()]
+
+            fixed_code = _extract_code_block(raw, "FIXED CODE")
+            if not fixed_code:
+                continue
+
+            fixes.append(FixSuggestion(
+                location=_extract_field(raw, "LOCATION"),
+                current_code=_extract_code_block(raw, "CURRENT CODE"),
+                fixed_code=fixed_code,
+                explanation=_extract_field(raw, "WHY"),
+            ))
+
+        # Aussi parser les blocs METHOD (targeted_methods strategy)
+        for m in re.finditer(
+            r"---METHOD START:\s*(\w+)---[^`]*```\w*\n(.*?)```[^-]*---METHOD END---",
+            text, re.DOTALL | re.IGNORECASE,
+        ):
+            fixes.append(FixSuggestion(
+                location=m.group(1),
+                current_code="",
+                fixed_code=m.group(2).rstrip(),
+                explanation=f"Méthode {m.group(1)} réécrite",
+            ))
+
+        # Aussi parser SOLUTION (full_class strategy)
+        sol_match = re.search(
+            r"---SOLUTION START---[^`]*```\w*\n(.*?)```[^-]*---SOLUTION END---",
+            text, re.DOTALL | re.IGNORECASE,
+        )
+        if sol_match:
+            fixes.append(FixSuggestion(
+                location="entire_file",
+                current_code="",
+                fixed_code=sol_match.group(1).rstrip(),
+                explanation="Classe complète réécrite (full_class strategy)",
+            ))
+
+        return fixes
+
+
+# ── Helpers internes ──────────────────────────────────────────────────────────
+
+def _extract_field(raw: str, field_name: str) -> str:
+    """Extrait la valeur d'un champ **FIELD**: value depuis le texte brut."""
+    m = re.search(
+        r'\*\*' + re.escape(field_name) + r'\*\*\s*:?\s*(.+?)(?=\n\s*\*\*|\Z)',
+        raw, re.DOTALL | re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else ""
+
+
+def _extract_code_block(raw: str, section: str) -> str:
+    """Extrait un bloc ```code``` après un champ **SECTION**."""
+    m = re.search(
+        r'\*\*' + re.escape(section) + r'\*\*.*?```\w*\n(.*?)```',
+        raw, re.DOTALL | re.IGNORECASE,
+    )
+    return m.group(1).rstrip() if m else ""

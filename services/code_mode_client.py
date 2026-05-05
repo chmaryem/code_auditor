@@ -1,31 +1,5 @@
 """
 code_mode_client.py — Client API pour le MCP Code Mode.
-
-FIX v6 — Correction du bug "GitHubClient has no attribute get_pull_request" :
-
-  CAUSE DU BUG :
-    Gemini générait du code utilisant les noms MCP bruts :
-      github.get_pull_request()         → n'existe pas (nom MCP, pas le wrapper)
-      github.get_pull_request_files()   → n'existe pas
-      github.create_pull_request_review() → n'existe pas
-    Car le system prompt disait "MCP tools available" et Gemini utilisait ces noms.
-
-  DOUBLE FIX :
-    1. Alias défensifs dans GitHubClient :
-       get_pull_request = get_pr_info                    (alias)
-       get_pull_request_files = get_pr_files             (alias)
-       create_pull_request_review = post_review          (alias)
-       get_file_contents = get_file_content              (alias, MCP name has 's')
-       push_files = push_file                            (alias, MCP name has 's')
-       Ainsi les DEUX nommages fonctionnent — quel que soit ce que Gemini génère.
-
-    2. System prompt corrigé dans code_mode_agent.py pour imposer les noms wrappers.
-
-  AUTRES FIXES v6 (hérités de v5) :
-    - RAGAnalyzer.analyze() : cache SQLite par hash contenu (0 token si cache hit)
-    - RAGAnalyzer.analyze() : fallback statique si quota 429 (score réel, pas 0)
-    - rag.count_severity(text) : parse un texte existant, 0 token LLM
-    - get_pr_mergeable_status() : délègue à mcp_github_service → mergeableState fiable
 """
 
 from __future__ import annotations
@@ -46,10 +20,6 @@ sys.path.insert(0, str(_project_root))
 
 logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Event loop manager (inchangé)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _LoopManager:
     def __init__(self):
@@ -92,9 +62,6 @@ class _LoopManager:
 _loop_manager = _LoopManager()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fallback statique (activé uniquement si quota 429 sur tous les modèles)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _StaticFallbackAnalyzer:
     """
@@ -144,24 +111,7 @@ class _StaticFallbackAnalyzer:
 
 _static_fallback = _StaticFallbackAnalyzer()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GitHubClient — wrappers MCP avec ALIAS défensifs
-# ─────────────────────────────────────────────────────────────────────────────
-
 class GitHubClient:
-    """
-    Client GitHub via MCP GitHub Server.
-
-    NOMMAGE DOUBLE (v6) :
-      Chaque opération a deux noms :
-        1. Nom wrapper (recommandé) : get_pr_info, get_pr_files, post_review…
-        2. Alias MCP brut : get_pull_request, get_pull_request_files, create_pull_request_review…
-
-      Les alias garantissent que le code généré par Gemini fonctionne
-      indépendamment du nommage qu'il choisit.
-    """
-
     def __init__(self):
         self._service = None
 
@@ -184,27 +134,20 @@ class GitHubClient:
             except Exception:
                 pass
 
-    # ── Discovery ─────────────────────────────────────────────────────────────
-
     def get_available_tools(self) -> List[str]:
         return sorted(self._ensure_connected()._available_tools)
 
     def get_tool_mapping(self) -> Dict[str, str]:
         return self._ensure_connected().get_tool_mapping()
 
-    # ── Pull Requests — wrappers ───────────────────────────────────────────────
-
+  
     def get_pr_info(self, owner: str, repo: str, pr_number: int) -> dict:
-        """Infos PR. Returns: {title, state, body, mergeable, base:{ref}, head:{ref,sha}}"""
         svc = self._ensure_connected()
         r = _loop_manager.run(svc.get_pull_request(owner, repo, pr_number))
         return r if isinstance(r, dict) else {}
 
     def get_pr_mergeable_status(self, owner: str, repo: str, pr_number: int) -> dict:
-        """
-        Détecte les conflits de manière fiable (polling + mergeableState).
-        Returns: {has_conflicts, mergeable, conflict_files, base_ref, head_ref, head_sha, pr_data}
-        """
+       
         svc = self._ensure_connected()
         r = _loop_manager.run(svc.get_pr_mergeable_status(owner, repo, pr_number), timeout=90)
         return r if isinstance(r, dict) else {
@@ -266,59 +209,38 @@ class GitHubClient:
         r = _loop_manager.run(svc.create_pull_request(owner, repo, title, body, head, base))
         return r if isinstance(r, dict) else {}
 
-    # ── ALIAS DÉFENSIFS (v6) ───────────────────────────────────────────────────
-    # Gemini génère parfois les noms MCP bruts au lieu des noms wrappers.
-    # Ces alias font fonctionner les deux nommages.
-
-    # get_pull_request → get_pr_info
     def get_pull_request(self, owner: str, repo: str, pr_number: int) -> dict:
         return self.get_pr_info(owner, repo, pr_number)
 
-    # get_pull_request_files → get_pr_files
     def get_pull_request_files(self, owner: str, repo: str, pr_number: int) -> list:
         return self.get_pr_files(owner, repo, pr_number)
 
-    # get_file_contents (MCP a un 's') → get_file_content
     def get_file_contents(self, owner: str, repo: str, path: str, ref: str = "main") -> str:
         return self.get_file_content(owner, repo, path, ref)
 
-    # create_pull_request_review → post_review
     def create_pull_request_review(self, owner: str, repo: str, pr_number: int,
                                    body: str, event: str, comments: list = None) -> dict:
         return self.post_review(owner, repo, pr_number, body, event, comments)
 
-    # push_files (MCP a un 's') → push_file
+
     def push_files(self, owner: str, repo: str, path: str, content: str,
                    message: str, branch: str) -> dict:
         return self.push_file(owner, repo, path, content, message, branch)
 
-    # add_issue_comment → post_comment (parfois utilisé pour les PR aussi)
     def add_issue_comment(self, owner: str, repo: str, issue_number: int, body: str) -> dict:
         return self.post_comment(owner, repo, issue_number, body)
 
-    # get_pull_request_reviews → get_pr_reviews
+   
     def get_pull_request_reviews(self, owner: str, repo: str, pr_number: int) -> list:
         return self.get_pr_reviews(owner, repo, pr_number)
 
-    # get_pull_request_status → get_pr_mergeable_status
+   
     def get_pull_request_status(self, owner: str, repo: str, pr_number: int) -> dict:
         return self.get_pr_mergeable_status(owner, repo, pr_number)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RAGAnalyzer — Pipeline complet ChromaDB + KG + Gemini PRÉSERVÉ
-# + Cache-first par hash contenu + Fallback statique si quota
-# ─────────────────────────────────────────────────────────────────────────────
-
 class RAGAnalyzer:
-    """
-    Pipeline RAG complet (ARCHITECTURE PRÉSERVÉE).
-
-    Ordre d'exécution :
-      1. Cache SQLite par hash SHA256 du contenu → 0 token si hit
-      2. Pipeline RAG : ChromaDB + KG + Gemini (assistant_agent.analyze_code_with_rag)
-      3. Si quota 429 → fallback statique (_StaticFallbackAnalyzer)
-    """
+  
 
     def _check_content_cache(self, code: str) -> Optional[dict]:
         """Vérifie le cache Redis par hash du contenu (indépendant du chemin)."""
@@ -326,7 +248,7 @@ class RAGAnalyzer:
             from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
             content_hash = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()
             redis = get_mcp_redis()
-            # Lookup via index secondaire : content_hash → path_hash
+            
             path_hash = redis.get(f"{KEY_PREFIX}fch:{content_hash[:16]}")
             if not path_hash:
                 return None
@@ -348,13 +270,6 @@ class RAGAnalyzer:
             return None
 
     def analyze(self, code: str, file_path: str, language: str, patch: str = "") -> dict:
-        """
-        Pipeline RAG complet avec cache-first et fallback statique.
-
-        1. Cache SQLite par hash contenu (0 token)
-        2. Pipeline RAG : ChromaDB + KG + Gemini
-        3. Si 429 → fallback statique
-        """
         # Couche 1 : Cache (0 token LLM)
         cached = self._check_content_cache(code)
         if cached is not None:
@@ -370,19 +285,14 @@ class RAGAnalyzer:
                     "Focus on the CHANGED lines from the patch/diff, "
                     "but consider the full file for context."
                 )
-            # Utiliser le chunking pour les gros fichiers (> 5000 chars)
-            # pour réduire la consommation de tokens par appel
+           
             if len(code) > 5000:
                 result = assistant_agent.analyze_code_chunked(code=code, context=context)
             else:
                 result = assistant_agent.analyze_code_with_rag(code=code, context=context)
             analysis_text = result.get("analysis", "")
 
-            # FIX v6.1 — Détecter le 429 caché dans le texte d'analyse.
-            # assistant_agent peut capturer le 429 en interne et retourner
-            # analysis="Error: 429 RESOURCE_EXHAUSTED..." au lieu de lever une exception.
-            # Dans ce cas, _count_severity_from_blocks() ne trouve aucun bloc → score=0.
-            # On bascule alors sur le fallback statique pour avoir un vrai score.
+    
             _quota_markers = ("429", "RESOURCE_EXHAUSTED", "quota", "rate limit")
             if analysis_text and any(m in analysis_text for m in _quota_markers):
                 logger.warning("RAG returned quota error in text → static fallback for %s", file_path)
@@ -410,21 +320,13 @@ class RAGAnalyzer:
             return {"analysis": f"Error: {e}", "critical": 0, "high": 0, "medium": 0, "score": 0}
 
     def count_severity(self, analysis_text: str) -> dict:
-        """
-        Parse un texte d'analyse existant pour extraire les counts.
-        0 token LLM. Utilisé quand cache.read_analysis() retourne un résultat.
-        """
+        
         try:
             from smart_git.git_hook import _count_severity_from_blocks
             c, h, m, score = _count_severity_from_blocks(analysis_text)
             return {"critical": c, "high": h, "medium": m, "score": score, "analysis": analysis_text}
         except Exception:
             return {"critical": 0, "high": 0, "medium": 0, "score": 0, "analysis": analysis_text}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# KnowledgeGraphClient, CacheClient, ConflictResolver (inchangés)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class KnowledgeGraphClient:
     def detect_patterns(self, code: str, language: str) -> list:
@@ -444,10 +346,7 @@ class KnowledgeGraphClient:
 
 class CacheClient:
     def read_analysis(self, file_path: str) -> Optional[str]:
-        """
-        Lit l'analyse depuis le cache SQLite du mode Watch.
-        Appeler AVANT rag.analyze() pour économiser les tokens LLM.
-        """
+      
         try:
             from config import config
             from smart_git.git_hook import _read_analysis_fresh
@@ -486,9 +385,6 @@ class ConflictResolver:
             return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Instances pré-initialisées (importées dans le sandbox)
-# ─────────────────────────────────────────────────────────────────────────────
 
 github   = GitHubClient()
 rag      = RAGAnalyzer()
@@ -497,12 +393,7 @@ cache    = CacheClient()
 resolver = ConflictResolver()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# API_DOCUMENTATION — injectée dans les system prompts (v6)
-# ─────────────────────────────────────────────────────────────────────────────
-
 API_DOCUMENTATION = """
-## Available API — code_mode_client (v6)
 
 ### RÈGLE CRITIQUE — Noms exacts des méthodes github.*
 UTILISE EXACTEMENT ces noms. NE PAS utiliser les noms MCP bruts.

@@ -1,26 +1,3 @@
-"""
-CacheService — Redis MCP thread-safe.
-
-Migration SQLite → Redis via MCP (redis/mcp-redis officiel).
-
-Architecture :
-  Toutes les opérations passent par MCPRedisService qui communique
-  avec redis-mcp-server via le protocole MCP (stdio).
-
-  L'interface publique est 100% identique à l'ancienne version SQLite.
-  Aucun consommateur n'a besoin de changer.
-
-Schéma Redis :
-  ca:fc:{path_hash}                    → Hash (file_cache)
-  ca:fch:{content_hash}               → String (content_hash → path_hash)
-  ca:em:{path_hash}:{pattern_hash}    → Hash (episode_memory)
-  ca:em:hotspots                       → Sorted Set (score = total_occurrences)
-  ca:gm:{id}                           → Hash (git_memory entry)
-  ca:gm:file:{path_hash}              → Sorted Set (score = timestamp)
-  ca:gm:next_id                        → String (auto-increment counter)
-  ca:ss:{session_id}                   → Hash (session_stats)
-  ca:meta:{key}                        → String (metadata)
-"""
 import hashlib
 import json
 import time
@@ -36,7 +13,7 @@ from services.mcp_redis_service import get_mcp_redis, key_hash, KEY_PREFIX
 class CacheService:
 
     def __init__(self, cache_dir: Path = None):
-        # cache_dir conservé pour compatibilité mais non utilisé par Redis
+       
         self.cache_dir = cache_dir or config.CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -45,16 +22,15 @@ class CacheService:
 
     @property
     def redis(self):
-        """Lazy init du client MCP Redis."""
+      
         if self._redis is None:
             self._redis = get_mcp_redis()
         return self._redis
 
-    # ── Key helpers ───────────────────────────────────────────────────────────
-
+ 
     @staticmethod
     def _fc_key(file_path: str) -> str:
-        """Clé Redis pour le cache d'un fichier."""
+       
         return f"{KEY_PREFIX}fc:{key_hash(file_path)}"
 
     @staticmethod
@@ -108,8 +84,7 @@ class CacheService:
             return True
         return self.compute_file_hash(file_path) != cached_hash
 
-    # ── Lecture ───────────────────────────────────────────────────────────────
-
+  
     def get_cached_analysis(self, file_path: Path) -> Optional[Dict[str, Any]]:
         file_key = str(file_path)
         redis_key = self._fc_key(file_key)
@@ -148,8 +123,6 @@ class CacheService:
             depts = []
         return {"dependencies": deps, "dependents": depts}
 
-    # ── Écriture ─────────────────────────────────────────────────────────────
-
     def update_file_cache(
         self,
         file_path:    Path,
@@ -176,14 +149,14 @@ class CacheService:
 
         with self._lock:
             self.redis.hset_dict(redis_key, mapping)
-            # Index secondaire : content_hash → path_hash
+           
             if current_hash:
                 self.redis.set(self._fch_key(current_hash), key_hash(file_key))
 
     def remove_file_from_cache(self, file_path: Path):
         file_key = str(file_path)
         redis_key = self._fc_key(file_key)
-        # Supprimer l'index content_hash d'abord
+    
         try:
             old_hash = self.redis.hget(redis_key, "content_hash")
             if old_hash:
@@ -200,8 +173,6 @@ class CacheService:
             self.redis.hset(redis_key, "dependencies", json.dumps(dependencies))
             self.redis.hset(redis_key, "dependents", json.dumps(dependents))
 
-    # ── save()/load() — no-ops pour compatibilité ────────────────────────────
-
     def save(self):
         """Compatibilité — Redis persiste automatiquement (appendonly yes)."""
         pass
@@ -210,8 +181,7 @@ class CacheService:
         """Compatibilité — Redis est toujours disponible."""
         pass
 
-    # ── Stats ─────────────────────────────────────────────────────────────────
-
+  
     def get_stats(self) -> Dict[str, Any]:
         try:
             keys = self.redis.scan_keys(f"{KEY_PREFIX}fc:*")
@@ -220,7 +190,7 @@ class CacheService:
         return {
             "total_files":      len(keys),
             "cache_file":       config.redis.url,
-            "cache_size_bytes": 0,  # Redis n'a pas de taille fichier
+            "cache_size_bytes": 0, 
         }
 
     def print_stats(self):
@@ -232,7 +202,7 @@ class CacheService:
             keys = self.redis.scan_keys(f"{KEY_PREFIX}fc:*")
             for k in keys:
                 self.redis.delete(k)
-            # Nettoyer les index content_hash aussi
+           
             fch_keys = self.redis.scan_keys(f"{KEY_PREFIX}fch:*")
             for k in fch_keys:
                 self.redis.delete(k)
@@ -268,7 +238,7 @@ class CacheService:
                 if session_id:
                     self.redis.hset(em_key, "last_session", session_id)
             else:
-                # Nouveau pattern
+               
                 mapping = {
                     "file_path":        file_path,
                     "pattern_type":     pattern_type,
@@ -281,7 +251,7 @@ class CacheService:
                 }
                 self.redis.hset_dict(em_key, mapping)
 
-            # Mettre à jour le sorted set hotspots
+          
             total = self._get_file_total_occurrences(file_path)
             self.redis.zadd(f"{KEY_PREFIX}em:hotspots", float(total), key_hash(file_path))
 
@@ -306,10 +276,7 @@ class CacheService:
         file_path:   str,
         min_count:   int = 2
     ) -> list:
-        """
-        Retourne les patterns récurrents d'un fichier.
-        Utile pour afficher : "Ce bug existe depuis 3 jours."
-        """
+       
         pattern = self._em_pattern(file_path)
         try:
             keys = self.redis.scan_keys(pattern)
@@ -338,10 +305,7 @@ class CacheService:
         return results
 
     def get_hotspot_files(self, top_n: int = 5) -> list:
-        """
-        Fichiers avec le plus de patterns récurrents non corrigés.
-        Utilise le sorted set em:hotspots pour le tri.
-        """
+        
         hotspot_key = f"{KEY_PREFIX}em:hotspots"
         try:
             top_members = self.redis.zrevrange(hotspot_key, 0, top_n - 1, with_scores=True)
@@ -398,13 +362,12 @@ class CacheService:
         em_key = self._em_key(file_path, pattern_type)
         self.redis.hset(em_key, "promoted_to_kb", "1")
 
-    # ── Git Memory ───────────────────────────────────────────────────────────
-
+   
     def save_commit_analysis(self, commit_hash: str, branch: str,
                              author: str, file_path: str,
                              critical: int, high: int, medium: int,
                              blocked: bool):
-        """Persiste le résultat d'analyse d'un fichier du commit."""
+       
         now = datetime.now().isoformat()
         now_ts = time.time()
 
@@ -426,14 +389,14 @@ class CacheService:
 
         with self._lock:
             self.redis.hset_dict(gm_key, mapping)
-            # Index par fichier (sorted set trié par timestamp)
+           
             self.redis.zadd(self._gm_file_key(file_path), now_ts, str(entry_id))
 
     def get_file_history(self, file_path: str, limit: int = 10) -> list:
         """Retourne l'historique des analyses d'un fichier."""
         zset_key = self._gm_file_key(file_path)
         try:
-            # Récupérer les IDs les plus récents (score = timestamp)
+          
             all_ids = self.redis.zrevrange(zset_key, 0, limit - 1)
         except Exception:
             return []
@@ -459,12 +422,12 @@ class CacheService:
         return rows
 
     def is_recurring_issue(self, file_path: str) -> bool:
-        """True si ce fichier a eu des CRITICAL dans les 2 dernières semaines."""
+       
         zset_key = self._gm_file_key(file_path)
-        cutoff = time.time() - (14 * 86400)  # 14 jours
+        cutoff = time.time() - (14 * 86400) 
 
         try:
-            # Récupérer les entrées des 14 derniers jours
+           
             all_ids = self.redis.zrange(zset_key, 0, -1, with_scores=True)
         except Exception:
             return False
@@ -487,5 +450,4 @@ class CacheService:
         return critical_count >= 2
 
 
-# Instance globale
 cache_service = CacheService()
