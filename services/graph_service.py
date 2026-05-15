@@ -804,6 +804,37 @@ from pathlib import Path as _Path
 from typing  import Optional as _Optional
 
 
+class DependencyExtractor:
+    """
+    Wrapper incrémental autour d'un nx.DiGraph pour le WatchGraph.
+
+    Expose:
+      - update_file(file_path, entities, imports) → met à jour les arêtes
+      - get_dependents(file_path)                → fichiers qui importent celui-ci
+    """
+
+    def __init__(self, graph: nx.DiGraph):
+        self.graph = graph
+
+    def update_file(
+        self,
+        file_path: _Path,
+        entities: list,
+        imports: list,
+    ) -> None:
+        """Met à jour le graphe après modification d'un fichier."""
+        update_graph(self.graph, file_path, {"entities": entities, "imports": imports})
+
+    def get_dependents(self, file_path: _Path) -> list[str]:
+        """Retourne les fichiers qui importent file_path (predecessors)."""
+        node_id = f"file:{file_path}"
+        return [
+            n.replace("file:", "")
+            for n in self.graph.predecessors(node_id)
+            if isinstance(n, str) and n.startswith("file:")
+        ]
+
+
 def resolve_import(imp, current_dir: _Path) -> _Optional[str]:
     """
     Résout un import relatif Python vers un chemin absolu de fichier.

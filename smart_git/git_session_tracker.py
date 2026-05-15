@@ -128,7 +128,6 @@ class SessionSnapshot:
     minutes_since_commit: int
     time_multiplier:     float
     stats: Dict[str, Any] = field(default_factory=dict)
-    test_gaps:           List[Any] = field(default_factory=list)  # TestGapStatus
 
     @property
     def total_critical(self) -> int:
@@ -310,39 +309,7 @@ class GitSessionTracker:
         # Score final avec facteur temps
         final_score = total_score * time_mult
 
-        # Étape 5 : détecter les test gaps (0 token — scan rapide)
-        #   Crée de vrais objets TestGapStatus (pas des dicts) pour compatibilité
-        #   avec TestProposalNotifier qui accède à .source_file.name, .impact_score, etc.
-        test_gaps = []
-        try:
-            from services.test_discovery import TestDiscoveryService
-            from agents.test_gap_agent import TestGapStatus
-            discovery = TestDiscoveryService(self.project_path)
-            for file_info in uncommitted:
-                file_path_abs = self.project_path / file_info["path"]
-                if not discovery.has_test_file(file_path_abs):
-                    # Calculer un impact_score réaliste selon le type de fichier
-                    impact = 30  # base
-                    fname = file_path_abs.name.lower()
-                    if "service" in fname or "controller" in fname:
-                        impact += 25  # fichier métier critique
-                    elif "util" in fname or "helper" in fname:
-                        impact += 10  # utilitaire
-                    if file_info.get("status") == "A":  # nouveau fichier
-                        impact += 20
-
-                    gap = TestGapStatus(
-                        source_file=file_path_abs,
-                        test_file=None,
-                        missing=True,
-                        impact_score=min(impact, 100),
-                        reason=f"aucun test pour {file_path_abs.name}",
-                    )
-                    test_gaps.append(gap)
-        except Exception as e:
-            logger.debug("TestDiscoveryService erreur : %s", e)
-
-        # Étape 6 : déterminer le niveau
+        # Étape 5 : déterminer le niveau
         level = _score_to_level(final_score)
 
         return SessionSnapshot(
@@ -353,7 +320,6 @@ class GitSessionTracker:
             minutes_since_commit = minutes,
             time_multiplier      = time_mult,
             stats                = stats,
-            test_gaps            = test_gaps,
         )
 
     def _assess_file_risk(self, file_path_abs: Path, file_info: Dict) -> FileRisk:
@@ -458,19 +424,6 @@ class GitSessionTracker:
                     self._notifier.notify(snapshot)
                 except Exception as e:
                     logger.debug("GitNotifier.notify_reminder erreur : %s", e)
-
-        # Notification des test gaps (pas liée au niveau de risque)
-        #   Utilise un TestProposalNotifier dédié — le self._notifier est un
-        #   GitNotifier qui n'a pas notify_batch(). On crée un notifier ad-hoc.
-        if snapshot.test_gaps:
-            try:
-                from agents.test_proposal_notifier import TestProposalNotifier
-                # Récupérer le print_lock du GitNotifier si disponible
-                lock = getattr(self._notifier, "_lock", None) or self._lock
-                test_notifier = TestProposalNotifier(print_lock=lock)
-                test_notifier.notify_batch(snapshot.test_gaps)
-            except Exception as e:
-                logger.debug("Test gap notification erreur : %s", e)
 
     # Accesseurs utiles
 

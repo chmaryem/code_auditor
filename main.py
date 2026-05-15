@@ -161,6 +161,18 @@ def cmd_project(args):
 
 # ── Commande : watch ──────────────────────────────────────────────────────────
 
+def _setup_langsmith_tracing():
+    """Configure LangSmith tracing if enabled in config."""
+    from config import config
+    if config.langgraph.langsmith_tracing and config.langgraph.langsmith_api_key:
+        import os
+        os.environ["LANGSMITH_TRACING"] = "true"
+        os.environ["LANGSMITH_API_KEY"] = config.langgraph.langsmith_api_key
+        os.environ["LANGSMITH_PROJECT"] = config.langgraph.langsmith_project
+        os.environ["LANGSMITH_ENDPOINT"] = config.langgraph.langsmith_endpoint
+        info("LangSmith tracing enabled — project: " + config.langgraph.langsmith_project)
+
+
 def cmd_watch(args):
     """Surveille un projet en temps réel + Smart Git Session Tracker."""
     try:
@@ -169,14 +181,262 @@ def cmd_watch(args):
         err("Module 'watchdog' manquant — installe-le : pip install watchdog")
         return
 
-    from core.orchestrator import Orchestrator
-    from core.events import file_changed_event
     from watchers.file_watcher import FileWatcher
+    from config import config
 
     project_path = Path(args.path)
     if not project_path.is_dir():
         err(f"Dossier introuvable : {project_path}")
         return
+
+    use_langgraph = getattr(args, 'langgraph', False) or config.langgraph.enabled
+
+    # ── LangGraph mode ────────────────────────────────────────────────────────
+    if use_langgraph:
+        hdr("MODE WATCH — LangGraph + LangChain Agents")
+        info(f"Projet : {project_path}")
+        info("Orchestration : LangGraph StateGraph (WatchGraph)")
+        info("Agents : LangChain (CodeAgent, RetrieverAgent, AnalysisAgent, LearningAgent)\n")
+
+        _setup_langsmith_tracing()
+
+        # ── Initialize services (same as legacy Orchestrator) ────────────────
+        from services.llm_service import CodeRAGSystemAPI
+        info("Initialisation System-Aware RAG...")
+        rag_system = CodeRAGSystemAPI()
+
+        # Project Indexer
+        project_indexer = None
+        try:
+            from services.project_indexer import get_project_index
+            project_indexer = get_project_index(project_path)
+            info(f" ProjectIndexer : {project_indexer.context.total_files} fichiers, "
+                 f"{project_indexer.context.total_entities} entités")
+        except Exception as e:
+            import logging, traceback
+            logging.getLogger(__name__).warning("ProjectIndexer init failed: %s", e)
+            traceback.print_exc()
+
+        # Dependency Graph
+        dep_graph = None
+        extractor = None
+        try:
+            from services.graph_service import dependency_builder, DependencyExtractor
+            dep_graph = dependency_builder.build_from_project(project_path)
+            extractor = DependencyExtractor(dep_graph)
+            info(f" Graphe : {dep_graph.number_of_nodes()} nœuds, "
+                 f"{dep_graph.number_of_edges()} arêtes")
+        except Exception as e:
+            import logging, traceback
+            logging.getLogger(__name__).warning("DependencyGraph init failed: %s", e)
+            traceback.print_exc()
+
+        # Knowledge Graph
+        try:
+            from services.knowledge_graph import knowledge_graph
+            if not knowledge_graph._built:
+                knowledge_graph.build(project_indexer=project_indexer)
+            info(f" KG : {knowledge_graph._graph.number_of_nodes()} concepts, "
+                 f"{knowledge_graph._graph.number_of_edges()} relations")
+        except Exception as e:
+            import logging, traceback
+            logging.getLogger(__name__).warning("KnowledgeGraph init failed: %s", e)
+            traceback.print_exc()
+
+        # Self-Improving RAG
+        try:
+            from agents.learning_agent import feedback_processor
+            if feedback_processor:
+                info(" Self-Improving RAG activé — fixes validés → KB enrichie")
+        except Exception:
+            pass
+
+        # Test Gap Detection
+        try:
+            from services.test_knowledge_loader import test_knowledge_loader
+            if test_knowledge_loader:
+                info(f" test_patterns_kb : {test_knowledge_loader.chunk_count()} chunks de patterns de test")
+                info(" Test Gap Detection activé — surveillance des tests manquants")
+        except Exception:
+            pass
+
+        # Retriever Agent initialization (for cross-encoder + full RAG)
+        try:
+            from agents.retriever_agent import retriever_agent
+            from services.knowledge_graph import knowledge_graph as kg_instance
+
+            retriever_agent.initialize(
+                graph=dep_graph,
+                project_indexer=project_indexer,
+                vector_store=rag_system.vector_store if rag_system else None,
+                project_code_indexer=project_indexer,
+                knowledge_graph=kg_instance if kg_instance._built else None,
+            )
+            info(" System-Aware RAG + Knowledge Graph + Cross-encoder activés")
+        except Exception as e:
+            import logging, traceback
+            logging.getLogger(__name__).warning("RetrieverAgent init failed: %s", e)
+            traceback.print_exc()
+
+        info(" Architecture LangGraph activée (StateGraph)\n")
+
+        # ── Smart Git Session Tracker ────────────────────────────────────────
+        git_tracker = None
+        try:
+            from smart_git.git_diff_parser import is_git_repo
+            if is_git_repo(project_path):
+                from smart_git.git_session_tracker import GitSessionTracker
+                from smart_git.git_notifier import GitNotifier
+                import threading
+
+                cache_db = config.CACHE_DIR / "analysis_cache.db"
+                notifier = GitNotifier(print_lock=threading.Lock())
+                git_tracker = GitSessionTracker(
+                    project_path=project_path,
+                    cache_db=cache_db,
+                    notifier=notifier,
+                    check_interval=180,
+                )
+                git_tracker.start()
+                info("Smart Git Tracker actif — surveillance accumulation de bugs\n")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug("GitSessionTracker non démarré : %s", e)
+
+        # ── LearningAgent lifecycle ──────────────────────────────────────────
+        from agents.learning_agent import learning_agent as _learning_agent
+        try:
+            _learning_agent.initialize(
+                llm=rag_system._llm if rag_system else None,
+                vector_store=rag_system.vector_store if rag_system else None,
+                kb_dir=config.KNOWLEDGE_BASE_DIR,
+                kb_loader=getattr(rag_system, '_kb_loader', None),
+                knowledge_graph=None,
+            )
+            _learning_agent.start()
+            info("LearningAgent démarré (Self-Improving RAG)\n")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug("LearningAgent init failed: %s", e)
+            _learning_agent = None
+
+        # ── File counter + shared resources ──────────────────────────────────
+        import threading
+        print_lock = threading.Lock()
+        file_counter = {
+            "analyzed": 0, "skipped": 0,
+            "skipped_hash": 0, "skipped_minor": 0,
+            "by_type": {},
+        }
+
+        from langchain_agents.graphs.watch_graph import invoke_watch
+
+        # ── Debounce / coalesce wrapper (0.8s) ───────────────────────────────
+        _COALESCE_DELAY = 0.8
+        _pending_timer = {}   # file_path → Timer
+        _pending_lock = threading.Lock()
+
+        def _debounced_invoke(file_path: Path):
+            """Execute invoke_watch after coalesce delay expires."""
+            with _pending_lock:
+                _pending_timer.pop(str(file_path), None)
+
+            result = invoke_watch(
+                file_path=str(file_path),
+                project_path=str(project_path),
+                project_indexer=project_indexer,
+                extractor=extractor,
+                rag_system=rag_system,
+                dep_graph=dep_graph,
+                cache=None,
+                print_lock=print_lock,
+                learning_agent=_learning_agent,
+                file_counter=file_counter,
+            )
+            if result.get("skip_reason"):
+                skip = result["skip_reason"]
+                file_counter["skipped"] += 1
+                if "hash" in str(skip).lower():
+                    file_counter["skipped_hash"] += 1
+                elif "minor" in str(skip).lower() or "score" in str(skip).lower():
+                    file_counter["skipped_minor"] += 1
+
+        def on_change_lg(file_path: Path, deleted: bool = False):
+            # ── File deletion handling ───────────────────────────────────
+            if deleted:
+                info(f"Fichier supprimé : {file_path.name}")
+                # Clean dependency graph
+                if dep_graph is not None:
+                    node_id = f"file:{file_path}"
+                    if dep_graph.has_node(node_id):
+                        dep_graph.remove_node(node_id)
+                        info(f"  Nœud supprimé du graphe de dépendances")
+                # Clean Redis cache
+                try:
+                    from langchain_agents.memory.redis_memory import AgentRedisMemory
+                    mem = AgentRedisMemory("code_agent")
+                    mem.delete(f"hash:{file_path}")
+                    mem.delete(f"content:{file_path}")
+                except Exception:
+                    pass
+                return
+
+            # ── Debounce: cancel previous timer, start new one ───────────
+            fp_key = str(file_path)
+            with _pending_lock:
+                old = _pending_timer.get(fp_key)
+                if old:
+                    old.cancel()
+                timer = threading.Timer(_COALESCE_DELAY, _debounced_invoke, args=[file_path])
+                timer.daemon = True
+                _pending_timer[fp_key] = timer
+                timer.start()
+
+        watcher = FileWatcher(project_path=project_path, callback=on_change_lg)
+        try:
+            watcher.watch()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            watcher.stop()
+            if git_tracker:
+                git_tracker.stop()
+            # Stop LearningAgent (flush pending KB rules)
+            if _learning_agent:
+                try:
+                    _learning_agent.stop()
+                except Exception:
+                    pass
+            # Cancel pending timers
+            with _pending_lock:
+                for t in _pending_timer.values():
+                    t.cancel()
+            # ── Detailed stats ───────────────────────────────────────────
+            total = file_counter['analyzed'] + file_counter['skipped']
+            print(f"\n {'═' * 60}")
+            print(f"\n Statistiques d'analyse :")
+            print(f"   Analysés           : {file_counter['analyzed']}")
+            print(f"   Ignorés (total)    : {file_counter['skipped']}")
+            if file_counter['skipped_hash']:
+                print(f"     ↳ Même contenu   : {file_counter['skipped_hash']}")
+            if file_counter['skipped_minor']:
+                print(f"     ↳ Mineur (<20)   : {file_counter['skipped_minor']}")
+            if file_counter.get('by_type'):
+                print(f"   Par type :")
+                for ct, n in file_counter['by_type'].items():
+                    print(f"     • {ct:20s} : {n}")
+            if _learning_agent:
+                la_stats = _learning_agent.get_stats()
+                if la_stats.get("received"):
+                    print(f"   Self-Improving RAG :")
+                    print(f"     Feedbacks reçus  : {la_stats['received']}")
+                    print(f"     Règles promues   : {la_stats.get('auto_promoted', 0) + la_stats.get('batch_promoted', 0)}")
+            print(f"\n {'═' * 60}\n")
+        return
+
+    # ── Legacy mode (Orchestrator) ────────────────────────────────────────────
+    from core.orchestrator import Orchestrator
+    from core.events import file_changed_event
 
     hdr("MODE WATCH — SURVEILLANCE TEMPS RÉEL")
     info(f"Projet : {project_path}\n")
@@ -188,15 +448,12 @@ def cmd_watch(args):
         orchestrator.handle(file_changed_event(file_path, deleted=deleted))
 
     # ── Smart Git Session Tracker ────────────────────────────────────────────
-    # Démarre en arrière-plan — lit le cache Watch et surveille l'accumulation
-    # de bugs non commités. Notifie le développeur si le score monte.
     git_tracker = None
     try:
         from smart_git.git_diff_parser import is_git_repo
         if is_git_repo(project_path):
             from smart_git.git_session_tracker import GitSessionTracker
             from smart_git.git_notifier import GitNotifier
-            from config import config
 
             cache_db    = config.CACHE_DIR / "analysis_cache.db"
             notifier    = GitNotifier(print_lock=orchestrator._print_lock)
@@ -204,14 +461,13 @@ def cmd_watch(args):
                 project_path   = project_path,
                 cache_db       = cache_db,
                 notifier       = notifier,
-                check_interval = 180,   # vérification toutes les 3 min
+                check_interval = 180,
             )
             git_tracker.start()
             info("Smart Git Tracker actif — surveillance accumulation de bugs\n")
     except Exception as e:
         import logging
         logging.getLogger(__name__).debug("GitSessionTracker non démarré : %s", e)
-    # ────────────────────────────────────────────────────────────────────────
 
     watcher = FileWatcher(project_path=project_path, callback=on_change)
     try:
@@ -361,6 +617,178 @@ def cmd_merge_hook(args):
         install_merge_hook(project_path)
 
 
+# ── Commande : ci-analyze (analyse manuelle d'un run/PR) ───────────────────────
+
+def cmd_ci_analyze(args):
+    """
+    Analyse manuelle d'un run GitHub Actions via le CIGraph IA.
+    Déclenche immédiatement une analyse complète et poste le commentaire PR.
+
+    Usage :
+      python main.py ci-analyze --repo owner/repo --pr 17
+      python main.py ci-analyze --repo owner/repo --branch feature/test-hook
+      python main.py ci-analyze --repo owner/repo --run-id 25855849812 --pr 17 --project-key sonar_key
+    """
+    import os, urllib.request, urllib.parse, json as _json
+    from pathlib import Path
+    from dotenv import load_dotenv
+    # Charger .env avec chemin absolu et override=True (force)
+    _env_path = Path(__file__).parent / ".env"
+    load_dotenv(dotenv_path=_env_path, override=True)
+    from langchain_agents.graphs.ci_graph import invoke_ci_run
+
+    repo        = args.repo
+    owner       = repo.split("/")[0]
+    repo_name   = repo.split("/")[-1]
+    pr_number   = getattr(args, "pr",          None)
+    run_id      = getattr(args, "run_id",      "") or ""
+    project_key = getattr(args, "project_key", "") or ""
+    branch      = getattr(args, "branch",      "") or ""
+
+    token = (
+        os.environ.get("GITHUB_TOKEN")
+        or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    )
+
+    # Debug : afficher les tokens disponibles
+    if not token:
+        print(f"{Y}[WARN] GITHUB_TOKEN non trouve dans l'environnement.{E}")
+        print(f"  Verifiez que votre .env contient : GITHUB_TOKEN=ghp_xxx")
+        print(f"  GITHUB_TOKEN={repr(os.environ.get('GITHUB_TOKEN'))} / GITHUB_PERSONAL_ACCESS_TOKEN={repr(os.environ.get('GITHUB_PERSONAL_ACCESS_TOKEN'))}")
+        return
+
+    # Auto-detect : si run_id non fourni -> dernier run du repo (ou de la branche)
+    if not run_id:
+        def _fetch_runs(branch_filter=""):
+            params = {"status": "completed", "per_page": "20"}
+            if branch_filter:
+                params["branch"] = branch_filter
+            url = (
+                f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs"
+                f"?{urllib.parse.urlencode(params)}"
+            )
+            req = urllib.request.Request(url)
+            req.add_header("Authorization", f"token {token}")
+            req.add_header("Accept", "application/vnd.github.v3+json")
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return _json.loads(r.read().decode()).get("workflow_runs", [])
+
+        try:
+            runs = []
+            # Strategie 1 : chercher par branche base (main) si PR fournie
+            if pr_number and branch:
+                runs = _fetch_runs("main") or _fetch_runs("")
+            elif branch:
+                # Les runs CI se font souvent sur main, pas la branche feature
+                runs = _fetch_runs(branch)
+                if not runs:
+                    info(f"Aucun run sur branch={branch}, recherche sans filtre...")
+                    runs = _fetch_runs("")
+
+            if not runs:
+                runs = _fetch_runs("")
+
+            if runs:
+                # Si pr_number fourni, privilegier les runs de la PR
+                target_run = runs[0]
+                if pr_number:
+                    for r in runs:
+                        prs = r.get("pull_requests", [])
+                        if any(p.get("number") == pr_number for p in prs):
+                            target_run = r
+                            info(f"Run associe a PR #{pr_number} trouve : {r['id']}")
+                            break
+
+                run_id = str(target_run["id"])
+                det_branch = target_run.get("head_branch", "")
+                info(f"Run ID auto-detecte : {run_id} (branch: {det_branch}, conclusion: {target_run.get('conclusion')})")
+                if not branch:
+                    branch = det_branch
+            else:
+                print(f"{R}[ERROR] Aucun run trouve pour {repo}{E}")
+                return
+        except Exception as e:
+            print(f"{R}[ERROR] Impossible de recuperer le dernier run : {e}{E}")
+            return
+
+    if not run_id:
+        print(f"{R}[ERROR] Fournissez --run-id ou verifiez votre GITHUB_TOKEN.{E}")
+        return
+
+    hdr(f"CI ANALYZE — Run #{run_id} | PR #{pr_number or '?'} | {repo}")
+    info(f"Branch      : {branch or '(auto)'}")
+    info(f"Project key : {project_key or '(non configuré)'}")
+    print()
+
+    result = invoke_ci_run(
+        run_id=run_id,
+        repo=repo,
+        owner=owner,
+        project_key=project_key,
+        pr_number=pr_number,
+        pr_branch=branch,
+        run_conclusion="",
+    )
+
+    print()
+    print(f"{'='*60}")
+    print(f"  Outcome       : {result.get('outcome', '?')}")
+    print(f"  Failure type  : {result.get('failure_type', '?')}")
+    print(f"  Stage echoue  : {result.get('stage_failed') or 'N/A'}")
+    print(f"  PR number     : {result.get('pr_number') or 'aucune'}")
+    print(f"  Comment poste : {'[OK]' if result.get('comment_posted') else '[NO]'}")
+    print(f"  Notification  : {result.get('notification_level', '?')}")
+    if result.get("root_cause"):
+        print(f"  Cause racine  : {result['root_cause'][:120]}...")
+    print(f"{'='*60}")
+
+
+# ── Commande : ci-poll (CI/CD Intelligence) ────────────────────────────────────
+
+def cmd_ci_poll(args):
+    """
+    Mode polling CI Intelligence (T7+T8) — surveille les GitHub Actions runs
+    et déclenche le CIGraph IA pour analyser chaque run terminé.
+
+    T7 : Les échecs publish/deploy sont aussi connectés au CIGraph.
+    T8 : Boucle polling configurable avec persistance Redis des runs vus.
+
+    Usage :
+      python main.py ci-poll --repo owner/repo
+      python main.py ci-poll --repo owner/repo --project-key sonar_key --interval 60
+      python main.py ci-poll --repo owner/repo --branch main --interval 30
+    """
+    from ci_cd.ci_poller import CIPoller
+
+    repo        = args.repo
+    project_key = getattr(args, "project_key", "") or ""
+    interval    = getattr(args, "interval", 120)
+    branch      = getattr(args, "branch", "") or ""
+    watch_jobs  = getattr(args, "watch_jobs", None)
+
+    hdr(f"MODE CI INTELLIGENCE — Polling ({repo})")
+    info(f"SonarCloud project : {project_key or '(non configuré)'}")
+    info(f"Intervalle polling : {interval}s")
+    info(f"Branche            : {branch or 'toutes'}")
+    info("T7 : publish/deploy connectés au CIGraph")
+    info("T8 : boucle polling avec mémoire Redis")
+    info("Ctrl+C pour arrêter\n")
+
+    try:
+        poller = CIPoller(
+            repo=repo,
+            interval=interval,
+            branch=branch,
+            project_key=project_key,
+            watch_jobs=watch_jobs,
+        )
+        poller.run()
+    except KeyboardInterrupt:
+        print(f"\n{Y}  Polling CI arrêté.{E}")
+    except Exception as e:
+        print(f"{R}✗ Erreur poller : {e}{E}")
+
+
 # ── Commande : ci-deploy (CI/CD) ──────────────────────────────────────────
 
 def cmd_ci_deploy(args):
@@ -373,9 +801,15 @@ def cmd_ci_deploy(args):
     from ci_cd.ci_deploy_agent import deploy_ci_workflow
 
     owner, repo = _parse_repo(args.repo)
-    auditor_repo = getattr(args, "auditor_repo", "chmaryem/code_auditor")
-    force = getattr(args, "force", False)
-    asyncio.run(deploy_ci_workflow(owner, repo, auditor_repo=auditor_repo, force=force))
+    auditor_repo   = getattr(args, "auditor_repo", "chmaryem/code_auditor")
+    force          = getattr(args, "force", False)
+    enable_deploy  = getattr(args, "enable_deploy", False)
+    asyncio.run(deploy_ci_workflow(
+        owner, repo,
+        auditor_repo=auditor_repo,
+        force=force,
+        enable_deploy=enable_deploy,
+    ))
 
 
 # ── Commande : pr-check (MCP Code Mode) ──────────────────────────────────
@@ -553,6 +987,8 @@ Exemples :
 
     sp = sub.add_parser("watch",   help="Surveiller en temps réel")
     sp.add_argument("path")
+    sp.add_argument("--langgraph", action="store_true",
+                    help="Use LangGraph orchestration (LangChain agents + StateGraph)")
 
     sp = sub.add_parser("git",        help="Analyser un commit Git donné")
     sp.add_argument("path")
@@ -582,9 +1018,27 @@ Exemples :
 
     # ── CI/CD Pipeline ──────────────────────────────────────────────────────
     sp = sub.add_parser("ci-deploy", help="Déployer le workflow CI/CD sur un repo GitHub")
-    sp.add_argument("--repo", required=True, help="owner/repo cible")
-    sp.add_argument("--auditor-repo", default="chmaryem/code_auditor", help="Repo de Code Auditor")
-    sp.add_argument("--force", action="store_true", help="Écraser le workflow existant")
+    sp.add_argument("--repo",          required=True, help="owner/repo cible")
+    sp.add_argument("--auditor-repo",  default="chmaryem/code_auditor", help="Repo de Code Auditor")
+    sp.add_argument("--branch",        default="main", help="Branche cible (defaut: main)")
+    sp.add_argument("--force",         action="store_true", help="Ecraser le workflow existant")
+    sp.add_argument("--enable-deploy", action="store_true", dest="enable_deploy",
+                    help="Activer Stage 6 : deploy SSH + docker compose (necessite DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY)")
+
+    sp = sub.add_parser("ci-poll", help="Surveiller les GitHub Actions runs et analyser les failures (CI Intelligence IA)")
+    sp.add_argument("--repo",        required=True,           help="owner/repo à surveiller")
+    sp.add_argument("--project-key", default="",              dest="project_key", help="Clé projet SonarCloud")
+    sp.add_argument("--interval",    type=int, default=120,   help="Intervalle de polling en secondes (défaut: 120)")
+    sp.add_argument("--branch",      default="",              help="Surveiller uniquement cette branche (défaut: toutes)")
+    sp.add_argument("--watch-jobs",  nargs="*",               dest="watch_jobs", help="Jobs spécifiques à surveiller")
+    sp.add_argument("--max-runs",    type=int, default=5,     dest="max_runs",   help="Runs à récupérer par poll (défaut: 5)")
+
+    sp = sub.add_parser("ci-analyze", help="Analyser manuellement un run GitHub Actions via le CIGraph IA")
+    sp.add_argument("--repo",        required=True,   help="owner/repo")
+    sp.add_argument("--run-id",      default="",      dest="run_id",      help="Run ID GitHub Actions")
+    sp.add_argument("--pr",          type=int,        default=None,        help="Numéro de la PR")
+    sp.add_argument("--branch",      default="",                           help="Branche (ex: feature/test-hook)")
+    sp.add_argument("--project-key", default="",      dest="project_key", help="Clé SonarCloud")
 
     sp = sub.add_parser("pr-check", help="Analyser une PR GitHub via MCP")
     sp.add_argument("--repo", required=True, help="owner/repo")
@@ -620,7 +1074,9 @@ def main():
         "resolve-conflicts": cmd_resolve_conflicts,
         "merge-hook": cmd_merge_hook,
         # CI/CD Pipeline
-        "ci-deploy": cmd_ci_deploy,
+        "ci-deploy":  cmd_ci_deploy,
+        "ci-poll":    cmd_ci_poll,
+        "ci-analyze": cmd_ci_analyze,    # analyse manuelle
         # MCP Code Mode
         "pr-check": cmd_pr_check,
         "pr-resolve": cmd_pr_resolve,

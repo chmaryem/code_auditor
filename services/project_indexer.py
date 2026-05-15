@@ -83,7 +83,6 @@ class ProjectIndexer:
         """Clé Redis pour le project snapshot."""
         return f"{KEY_PREFIX}ps:{key_hash(str(self.project_path))}"
 
-    # ── Build principal ───────────────────────────────────────────────────────
 
     def build_index(self, dependency_graph=None, force_rebuild: bool = False) -> ProjectContext:
         if not force_rebuild and self._load_from_cache():
@@ -150,7 +149,6 @@ class ProjectIndexer:
         print(f" Indexation terminée : {self.context.total_files} fichiers\n")
         return self.context
 
-    # ── Cache Redis MCP ────────────────────────────────────────────────────────
 
     def _save_to_cache(self):
         now = datetime.now().isoformat()
@@ -178,24 +176,33 @@ class ProjectIndexer:
             return False
         try:
             data = json.loads(raw)
-            files_data = data.get("files", {})
-            # Defensive: ensure files is a dict, not a string (cache corruption)
-            if isinstance(files_data, str):
-                logger.warning("Cache corruption: files_data is a string, resetting")
-                files_data = {}
-            self.context = ProjectContext(
-                total_files       = data.get("total_files", 0),
-                total_entities    = data.get("total_entities", 0),
-                languages         = data.get("languages", {}),
-                packages          = data.get("packages", []),
-                files             = files_data,
-                architecture_info = data.get("architecture", {}),
-            )
-            print(f" Index chargé depuis Redis : {self.context.total_files} fichiers\n")
-            return True
-        except Exception as e:
-            logger.warning("Erreur chargement index cache Redis : %s", e)
-            return False
+        except json.JSONDecodeError:
+            # Cache corrompu : probablement un dict Python avec single quotes
+            try:
+                import ast
+                data = ast.literal_eval(raw)
+                logger.warning(
+                    "Cache Redis corrompu (single quotes) — "
+                    "fallback ast.literal_eval pour %s", ps_key
+                )
+            except Exception:
+                logger.warning("Cache Redis illisible (ni JSON ni Python dict)")
+                return False
+        files_data = data.get("files", {})
+        # Defensive: ensure files is a dict, not a string (cache corruption)
+        if isinstance(files_data, str):
+            logger.warning("Cache corruption: files_data is a string, resetting")
+            files_data = {}
+        self.context = ProjectContext(
+            total_files       = data.get("total_files", 0),
+            total_entities    = data.get("total_entities", 0),
+            languages         = data.get("languages", {}),
+            packages          = data.get("packages", []),
+            files             = files_data,
+            architecture_info = data.get("architecture", {}),
+        )
+        print(f" Index chargé depuis Redis : {self.context.total_files} fichiers\n")
+        return True
 
     # ── Fichiers liés (logique originale conservée) ───────────────────────────
 

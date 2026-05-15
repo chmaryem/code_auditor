@@ -118,22 +118,30 @@ def _validate_secrets_for_repo(owner: str, repo: str) -> tuple[bool, list[str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def deploy_ci_workflow(
-    owner:        str,
-    repo:         str,
-    auditor_repo: str  = DEFAULT_AUDITOR,
-    branch:       str  = "main",
-    force:        bool = False,
+    owner:          str,
+    repo:           str,
+    auditor_repo:   str  = DEFAULT_AUDITOR,
+    branch:         str  = "main",
+    force:          bool = False,
+    enable_deploy:  bool = False,
 ) -> dict:
     """
-    Déploie le workflow CI/CD (build-test + sonar-scan) sur le repo cible.
+    Déploie le workflow CI/CD sur le repo cible.
+
+    Stages actifs :
+      1-5  : build-test, sonar, dep-scan, codeql, docker-trivy (toujours)
+      6    : publish Docker Hub                                  (toujours)
+      7    : deploy SSH + docker compose                         (si enable_deploy=True)
 
     Returns:
         dict: {success, message, profile, workflow_path}
     """
+    deploy_label = f"{_GR}ACTIVE{_R}" if enable_deploy else f"{_YL}desactive (--enable-deploy pour activer){_R}"
     print(f"\n  {_CY}{_B}Code Auditor — CI/CD Deploy{_R}")
     print(f"  {_DM}Repo cible    : {owner}/{repo}{_R}")
     print(f"  {_DM}Branche       : {branch}{_R}")
-    print(f"  {_DM}Auditor repo  : {auditor_repo}{_R}\n")
+    print(f"  {_DM}Auditor repo  : {auditor_repo}{_R}")
+    print(f"  {_DM}Stage Deploy  : {deploy_label}{_R}\n")
 
     # ── Validation 0 : Token GitHub ─────────────────────────────────────────
     print(f"  {_DM}[0/5] Validation du token GitHub...{_R}")
@@ -216,7 +224,13 @@ async def deploy_ci_workflow(
 
         from ci_cd.workflow_generator import generate_workflow, validate_workflow_strict
         checkout_path = os.environ.get("CODE_AUDITOR_CHECKOUT_PATH", "code_auditor_tool")
-        yaml_content = generate_workflow(profile, auditor_repo, checkout_path)
+        yaml_content = generate_workflow(
+            profile,
+            auditor_repo,
+            checkout_path,
+            enable_publish=True,
+            enable_deploy=enable_deploy,
+        )
 
         # ── Validation 3b : Valider le YAML avant push ─────────────────────────
         print(f"  {_DM}[3b/5] Validation du YAML...{_R}")
@@ -244,6 +258,13 @@ async def deploy_ci_workflow(
             print(f"\n  {_GR}{_B}Workflow CI/CD deploye !{_R}")
             print(f"  {_DM}Fichier  : {WORKFLOW_PATH}{_R}")
             print(f"  {_DM}Profil   : {profile.language} / {profile.build_system}{_R}")
+
+            # ── Step 5a : Pousser Dockerfile si absent ─────────────────────
+            _ensure_dockerfile(github, owner, repo, branch, profile)
+
+            # ── Step 5b : Pousser docker-compose.yml si absent ────────────
+            _ensure_docker_compose(github, owner, repo, branch, profile)
+
             _print_next_steps()
             return {
                 "success": True,
@@ -251,6 +272,7 @@ async def deploy_ci_workflow(
                 "profile": {
                     "language":     profile.language,
                     "build_system": profile.build_system,
+                    "has_dockerfile": profile.has_dockerfile,
                 },
                 "workflow_path": WORKFLOW_PATH,
             }
@@ -298,17 +320,133 @@ def _push_file(
     return _push_via_rest(owner, repo, path, content, message, branch)
 
 
+def _ensure_dockerfile(
+    github_client,
+    owner:   str,
+    repo:    str,
+    branch:  str,
+    profile,
+) -> None:
+    """
+    Verifie si un Dockerfile existe dans le repo.
+    S'il est absent, genere un template adapte au langage et le pousse.
+    """
+    from ci_cd.workflow_generator import _dockerfile_template
+
+    try:
+        existing = github_client.get_file_content(owner, repo, "Dockerfile", branch)
+    except Exception:
+        existing = None
+
+    if existing:
+        profile.has_dockerfile = True
+        print(f"  {_GR}✓ Dockerfile existant detecte — Trivy scan actif{_R}")
+        return
+
+    print(f"  {_YL}! Dockerfile absent — generation d'un template {profile.language}/{profile.build_system}...{_R}")
+    dockerfile_content = _dockerfile_template(profile)
+
+    result = _push_file(
+        github_client, owner, repo,
+        "Dockerfile",
+        dockerfile_content,
+        f"ci: add Dockerfile template ({profile.language}/{profile.build_system})",
+        branch,
+    )
+
+    if result:
+        profile.has_dockerfile = True
+        print(f"  {_GR}✓ Dockerfile genere et pousse (Trivy scan actif){_R}")
+        print(f"  {_DM}  → Dockerfile adapte a votre stack, personnalisable{_R}")
+    else:
+        print(f"  {_YL}! Impossible de pousser le Dockerfile — Trivy scan skippera{_R}")
+
+
+def _ensure_docker_compose(
+    github_client,
+    owner:   str,
+    repo:    str,
+    branch:  str,
+    profile,
+) -> None:
+    """
+    Verifie si un docker-compose.yml existe dans le repo.
+    S'il est absent, genere un template production-ready et le pousse.
+
+    Le nom d'image utilise le meme sanitize que le job publish :
+      lowercase(DOCKERHUB_USERNAME)/lowercase(repo sans tiret final):latest
+    """
+    try:
+        existing = github_client.get_file_content(owner, repo, "docker-compose.yml", branch)
+    except Exception:
+        existing = None
+
+    if existing:
+        print(f"  {_GR}✓ docker-compose.yml existant detecte — Deploy stage pret{_R}")
+        return
+
+    print(f"  {_YL}! docker-compose.yml absent — generation d'un template production-ready...{_R}")
+
+    port_map  = {"java": "8080", "python": "8000", "javascript": "3000", "typescript": "3000"}
+    port      = port_map.get(profile.language.lower(), "8080")
+    # Sanitize identique au step "Prepare image name" du job publish
+    repo_name = repo.rstrip("-").lower()
+
+    compose_content = f"""# docker-compose.yml — genere par Code Auditor
+# Utilisez les variables d'environnement pour personnaliser
+services:
+  app:
+    image: ${{DOCKERHUB_USERNAME:-votre-login}}/${{APP_NAME:-{repo}}}:latest
+    ports:
+      - \"{port}:{port}\"
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{port}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+"""
+
+    result = _push_file(
+        github_client, owner, repo,
+        "docker-compose.yml",
+        compose_content,
+        f"ci: add docker-compose.yml template ({profile.language})",
+        branch,
+    )
+
+    if result:
+        print(f"  {_GR}✓ docker-compose.yml genere et pousse{_R}")
+        print(f"  {_DM}  → Personnalisez DOCKERHUB_USERNAME et APP_NAME{_R}")
+    else:
+        print(f"  {_YL}! Impossible de pousser docker-compose.yml{_R}")
+
+
 def _print_next_steps() -> None:
-    """Affiche les instructions post-déploiement."""
+    """Affiche les instructions post-deploiement."""
     print(f"\n  {_CY}Prochaines etapes :{_R}")
-    print(f"  {_DM}1. Ajouter les Secrets GitHub :{_R}")
+    print(f"  {_DM}1. Secrets GitHub requis :{_R}")
     print(f"  {_DM}   Settings > Secrets > Actions > New repository secret{_R}")
-    print(f"  {_DM}   - SONAR_TOKEN    (Token d'analyse SonarQube){_R}")
-    print(f"  {_DM}   - SONAR_HOST_URL (URL SonarQube/SonarCloud){_R}")
-    print(f"  {_DM}2. Activer la Branch Protection (optionnel) :{_R}")
+    print(f"  {_DM}   - SONAR_TOKEN         (Token SonarCloud — sonarcloud.io){_R}")
+    print(f"  {_DM}   - SONAR_HOST_URL      (https://sonarcloud.io){_R}")
+    print(f"  {_DM}   - DOCKERHUB_USERNAME  (Login Docker Hub){_R}")
+    print(f"  {_DM}   - DOCKERHUB_TOKEN     (Token Docker Hub — hub.docker.com > Security){_R}")
+    print(f"  {_DM}   [Optionnel - Deploy SSH]{_R}")
+    print(f"  {_DM}   - DEPLOY_HOST         (IP ou hostname du serveur){_R}")
+    print(f"  {_DM}   - DEPLOY_USER         (User SSH, ex: ubuntu){_R}")
+    print(f"  {_DM}   - DEPLOY_SSH_KEY      (Cle privee SSH ed25519){_R}")
+    print(f"  {_DM}2. Variables GitHub Actions (optionnel) :{_R}")
+    print(f"  {_DM}   Settings > Variables > Actions{_R}")
+    print(f"  {_DM}   - DEPLOY_PATH  (/opt/monapp){_R}")
+    print(f"  {_DM}   - DEPLOY_URL   (https://monapp.example.com){_R}")
+    print(f"  {_DM}3. Branch Protection (recommande) :{_R}")
     print(f"  {_DM}   Settings > Branches > Add rule{_R}")
     print(f"  {_DM}   Cocher : Require status checks > build-test{_R}")
-    print(f"  {_DM}3. Ouvrir une PR pour tester !{_R}\n")
+    print(f"  {_DM}4. Ouvrir une PR pour tester le pipeline !{_R}\n")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

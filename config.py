@@ -102,7 +102,16 @@ class WatcherConfig(BaseModel):
 class RedisConfig(BaseModel):
     """Configuration pour la connexion Redis via MCP."""
     url:    str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    prefix: str = "ca:"  # Namespace isolation (code_auditor)
+    prefix: str = "ca:"  
+
+
+class LangGraphConfig(BaseModel):
+    """Configuration for LangGraph orchestration + LangSmith tracing."""
+    enabled:            bool = os.getenv("USE_LANGGRAPH", "false").lower() == "true"
+    langsmith_tracing:  bool = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
+    langsmith_api_key:  str  = os.getenv("LANGSMITH_API_KEY", "")
+    langsmith_project:  str  = os.getenv("LANGSMITH_PROJECT", "code-auditor")
+    langsmith_endpoint: str  = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 
 
 class Config:
@@ -116,11 +125,12 @@ class Config:
     for _d in [DATA_DIR, KNOWLEDGE_BASE_DIR, VECTOR_STORE_DIR, CACHE_DIR]:
         _d.mkdir(parents=True, exist_ok=True)
 
-    api      = APIConfig()
-    rag      = RAGConfig()
-    analysis = AnalysisConfig()
-    watcher  = WatcherConfig()
-    redis    = RedisConfig()
+    api       = APIConfig()
+    rag       = RAGConfig()
+    analysis  = AnalysisConfig()
+    watcher   = WatcherConfig()
+    redis     = RedisConfig()
+    langgraph = LangGraphConfig()
 
     HOST  = os.getenv("SERVER_HOST", "127.0.0.1")
     PORT  = int(os.getenv("SERVER_PORT", "8000"))

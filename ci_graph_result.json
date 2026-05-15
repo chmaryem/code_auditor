@@ -1,0 +1,92 @@
+{
+  "run_id": "25702220617",
+  "repo": "chmaryem/test-project-",
+  "owner": "chmaryem",
+  "project_key": "chmaryem_test-project-",
+  "pr_number": null,
+  "head_sha": "3d169ca343c295e35f5e1fe576eb23ef893703e0",
+  "logs": "=== 0_Container Scan (Trivy).txt ===\n﻿2026-05-11T22:57:33.0175255Z Current runner version: '2.334.0'\n2026-05-11T22:57:33.0199065Z ##[group]Runner Image Provisioner\n2026-05-11T22:57:33.0199883Z Hosted Compute Agent\n2026-05-11T22:57:33.0200561Z Version: 20260213.493\n2026-05-11T22:57:33.0201162Z Commit: 5c115507f6dd24b8de37d8bbe0bb4509d0cc0fa3\n2026-05-11T22:57:33.0201817Z Build Date: 2026-02-13T00:28:41Z\n2026-05-11T22:57:33.0202529Z Worker ID: {e57d67d2-8341-458a-bdf4-1c4eea342dac}\n2026-05-11T22:57:33.0203177Z Azure Region: westus\n2026-05-11T22:57:33.0203706Z ##[endgroup]\n2026-05-11T22:57:33.0205411Z ##[group]Operating System\n2026-05-11T22:57:33.0206039Z Ubuntu\n2026-05-11T22:57:33.0206476Z 24.04.4\n2026-05-11T22:57:33.0207027Z LTS\n2026-05-11T22:57:33.0207458Z ##[endgroup]\n2026-05-11T22:57:33.0207960Z ##[group]Runner Image\n2026-05-11T22:57:33.0208595Z Image: ubuntu-24.04\n2026-05-11T22:57:33.0209075Z Version: 20260413.86.1\n2026-05-11T22:57:33.0210263Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260413.86/images/ubuntu/Ubuntu2404-Readme.md\n2026-05-11T22:57:33.0211650Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260413.86\n2026-05-11T22:57:33.0212585Z ##[endgroup]\n2026-05-11T22:57:33.0213697Z ##[group]GITHUB_TOKEN Permissions\n2026-05-11T22:57:33.0215893Z Contents: read\n2026-05-11T22:57:33.0216523Z Metadata: read\n2026-05-11T22:57:33.0217030Z SecurityEvents: write\n2026-05-11T22:57:33.0217584Z ##[endgroup]\n2026-05-11T22:57:33.0219678Z Secret source: Actions\n2026-05-11T22:57:33.0220494Z Prepare workflow directory\n2026-05-11T22:57:33.0588618Z Prepare all required actions\n2026-05-11T22:57:33.0648094Z Getting action download info\n2026-05-11T22:57:33.5651830Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)\n2026-05-11T22:57:33.6879937Z Download action repository 'aquasecurity/trivy-action@master' (SHA:ed142fd0673e97e23eac54620cfb913e5ce36c25)\n2026-05-11T22:57:34.1039710Z Download action repository 'github/codeql-action@v3' (SHA:7fd177fa680c9881b53cdab4d346d32574c9f7f4)\n2026-05-11T22:57:35.0151895Z Download action repository 'actions/upload-artifact@v4' (SHA:ea165f8d65b6e75b540449e92b4886f43607fa02)\n2026-05-11T22:57:35.2592858Z Getting action download info\n2026-05-11T22:57:35.4772494Z Download action repository 'aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514' (SHA:3fb12ec12f41e471780db15c232d5dd185dcb514)\n2026-05-11T22:57:35.6989271Z Download action repository 'actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae' (SHA:27d5ce7f107fe9357f9df03efb73ab90386fccae)\n2026-05-11T22:57:36.2214869Z Getting action download info\n2026-05-11T22:57:36.4167693Z Download action repository 'actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb' (SHA:9255dc7a253b0ccc959486e2bca901246202afeb)\n2026-05-11T22:57:36.5528212Z Download action repository 'actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8' (SHA:8e8c483db84b4bee98b60c0593521ed34d9990e8)\n2026-05-11T22:57:36.6735602Z Getting action download info\n2026-05-11T22:57:36.9170647Z Getting action download info\n2026-05-11T22:57:37.1803240Z Complete job name: Container Scan (Trivy)\n2026-05-11T22:57:37.2453285Z ##[group]Run actions/checkout@v4\n2026-05-11T22:57:37.2453857Z with:\n2026-05-11T22:57:37.2454294Z   repository: chmaryem/test-project-\n2026-05-11T22:57:37.2454730Z   token: ***\n2026-05-11T22:57:37.2454928Z   ssh-strict: true\n2026-05-11T22:57:37.2455108Z   ssh-user: git\n2026-05-11T22:57:37.2455297Z   persist-credentials: true\n2026-05-11T22:57:37.2455514Z   clean: true\n2026-05-11T22:57:37.2455707Z   sparse-checkout-cone-mode: true\n2026-05-11T22:57:37.2455945Z   fetch-depth: 1\n2026-05-11T22:57:37.2456122Z   fetch-tags: false\n2026-05-11T22:57:37.2456309Z   show-progress: true\n2026-05-11T22:57:37.2456488Z   lfs: false\n2026-05-11T22:57:37.2456651Z   submodules: false\n2026-05-11T22:57:37.2456833Z   set-safe-directory: true\n2026-05-11T22:57:37.2457294Z ##[endgroup]\n2026-05-11T22:57:37.3579624Z Syncing repository: chmaryem/test-project-\n2026-05-11T22:57:37.3580954Z ##[group]Getting Git version info\n2026-05-11T22:57:37.3581474Z Working directory is '/home/runner/work/test-project-/test-project-'\n2026-05-11T22:57:37.3582382Z [command]/usr/bin/git version\n2026-05-11T22:57:37.3627857Z git version 2.53.0\n2026-05-11T22:57:37.3654851Z ##[endgroup]\n2026-05-11T22:57:37.3678001Z Temporarily overriding HOME='/home/runner/work/_temp/738183db-06cf-49a3-9468-e3bf356fd1dd' before making global git config changes\n2026-05-11T22:57:37.3679564Z Adding repository directory to the temporary git global config as a safe directory\n2026-05-11T22:57:37.3684364Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/test-project-/test-project-\n2026-05-11T22:57:37.3717571Z Deleting the contents of '/home/runner/work/test-project-/test-project-'\n2026-05-11T22:57:37.3721682Z ##[group]Initializing the repository\n2026-05-11T22:57:37.3726317Z [command]/usr/bin/git init /home/runner/work/test-project-/test-project-\n2026-05-11T22:57:37.3832857Z hint: Using 'master' as the name for the initial branch. This default branch name\n2026-05-11T22:57:37.3833859Z hint: will change to \"main\" in Git 3.0. To configure the initial branch name\n2026-05-11T22:57:37.3834852Z hint: to use in all of your new repositories, which will suppress this warning,\n2026-05-11T22:57:37.3835277Z hint: call:\n2026-05-11T22:57:37.3835460Z hint:\n2026-05-11T22:57:37.3835769Z hint: \tgit config --global init.defaultBranch <name>\n2026-05-11T22:57:37.3836092Z hint:\n2026-05-11T22:57:37.3836382Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and\n2026-05-11T22:57:37.3836900Z hint: 'development'. The just-created branch can be renamed via this command:\n2026-05-11T22:57:37.3837301Z hint:\n2026-05-11T22:57:37.3837485Z hint: \tgit branch -m <name>\n2026-05-11T22:57:37.3837712Z hint:\n2026-05-11T22:57:37.3838022Z hint: Disable this message with \"git config set advice.defaultBranchName false\"\n2026-05-11T22:57:37.3838579Z Initialized empty Git repository in /home/runner/work/test-project-/test-project-/.git/\n2026-05-11T22:57:37.3846357Z [command]/usr/bin/git remote add origin https://github.com/chmaryem/test-project-\n2026-05-11T22:57:37.3876450Z ##[endgroup]\n2026-05-11T22:57:37.3876895Z ##[group]Disabling automatic garbage collection\n2026-05-11T22:57:37.3881155Z [command]/usr/bin/git config --local gc.auto 0\n2026-05-11T22:57:37.3908854Z ##[endgroup]\n2026-05-11T22:57:37.3909329Z ##[group]Setting up auth\n2026-05-11T22:57:37.3916412Z [command]/usr/bin/git config --local --name-only --get-regexp core\\.sshCommand\n2026-05-11T22:57:37.3945865Z [command]/usr/bin/git submodule foreach --recursive sh -c \"git config --local --name-only --get-regexp 'core\\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\"\n2026-05-11T22:57:37.4242350Z [command]/usr/bin/git config --local --name-only --get-regexp http\\.https\\:\\/\\/github\\.com\\/\\.extraheader\n2026-05-11T22:57:37.4270972Z [command]/usr/bin/git submodule foreach --recursive sh -c \"git config --local --name-only --get-regexp 'http\\.https\\:\\/\\/github\\.com\\/\\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\"\n2026-05-11T22:57:37.4485490Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\\.gitdir:\n2026-05-11T22:57:37.4515407Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url\n2026-05-11T22:57:37.4735889Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***\n2026-05-11T22:57:37.4769508Z ##[endgroup]\n2026-05-11T22:57:37.4770217Z ##[group]Fetching the repository\n2026-05-11T22:57:37.4778543Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +3d169ca343c295e35f5e1fe576eb23ef893703e0:refs/remotes/origin/main\n2026-05-11T22:57:37.8905618Z From https://github.com/chma",
+  "stage_failed": "",
+  "run_conclusion": "failure",
+  "run_duration_seconds": 0,
+  "outcome": "failure",
+  "failure_type": "build",
+  "severity": "URGENT",
+  "sonar_gate": {
+    "status": "ERROR",
+    "conditions": [
+      {
+        "status": "ERROR",
+        "metricKey": "new_reliability_rating",
+        "comparator": "GT",
+        "periodIndex": 1,
+        "errorThreshold": "1",
+        "actualValue": "5"
+      },
+      {
+        "status": "OK",
+        "metricKey": "new_security_rating",
+        "comparator": "GT",
+        "periodIndex": 1,
+        "errorThreshold": "1",
+        "actualValue": "1"
+      },
+      {
+        "status": "OK",
+        "metricKey": "new_maintainability_rating",
+        "comparator": "GT",
+        "periodIndex": 1,
+        "errorThreshold": "1",
+        "actualValue": "1"
+      },
+      {
+        "status": "OK",
+        "metricKey": "new_security_hotspots_reviewed",
+        "comparator": "LT",
+        "periodIndex": 1,
+        "errorThreshold": "100",
+        "actualValue": "100.0"
+      }
+    ],
+    "source": "mcp_sonar"
+  },
+  "sonar_metrics": {
+    "coverage": "0.0",
+    "bugs": "2",
+    "reliability_rating": "5.0",
+    "code_smells": "41",
+    "duplicated_lines_density": "2.8",
+    "security_rating": "1.0",
+    "ncloc": "567",
+    "vulnerabilities": "0",
+    "sqale_rating": "1.0"
+  },
+  "sonar_issues": [
+    {
+      "key": "AZ4YjQafT8G0e_TwP7fJ",
+      "message": "Use try-with-resources or close this \"Connection\" in a \"finally\" clause.",
+      "severity": "BLOCKER",
+      "rule": "java:S2095",
+      "component": "chmaryem_test-project-:src/main/java/tn/esprit/sampleprojet/UserRepository.java",
+      "line": 100,
+      "effort": "5min"
+    }
+  ],
+  "similar_fixes": [
+    {
+      "error_hash": "24f651d5e219",
+      "count": 1,
+      "last_seen": "1778584689",
+      "stage": "",
+      "fix_applied": "Fix non disponible.",
+      "sample": "=== 0_Container Scan (Trivy).txt ===\n﻿2026-05-11T22:57:33.0175255Z Current runner version: '2.334.0'\n2026-05-11T22:57:33.0199065Z ##[group]Runner Image Provisioner\n2026-05-11T22:57:33.0199883Z Hosted Compute Agent\n2026-05-11T22:57:33.0200561Z Version: 20260213.493\n2026-05-11T22:57:33.0201162Z Commit: 5c115507f6dd24b8de37d8bbe0bb4509d0cc0fa3\n2026-05-11T22:57:33.0201817Z Build Date: 2026-02-13T00:28:41Z\n2026-05-11T22:57:33.0202529Z Worker ID: {e57d67d2-8341-458a-bdf4-1c4eea342dac}\n2026-05-11T22:57",
+      "similarity": 1.0
+    }
+  ],
+  "confidence": 1.0,
+  "root_cause": "Erreur similaire vue 1x (stage: ). Correspondance Redis : 100%.",
+  "suggested_fix": "Fix non disponible.",
+  "comment_posted": false,
+  "indexed": true,
+  "notification_level": "URGENT"
+}
