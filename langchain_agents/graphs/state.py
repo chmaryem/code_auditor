@@ -190,3 +190,64 @@ class CDState(TypedDict, total=False):
     comment_posted:    bool            # True if report posted to PR
     indexed:           bool            # True if recorded in Redis
     notification_level: str            # "OK" | "WARN" | "BLOCKED"
+
+# ── Chat Graph State ───────────────────────────────────────────────────────────
+
+class ChatState(TypedDict, total=False):
+    """
+    State for the ChatGraph pipeline.
+
+    Phase 1: Q&A / explain
+      user_message → intent_router → load_memory → load_file_context
+      → rag_retrieve → answer_question → memory_save → format_response
+
+    Phase 2: Code generation
+      intent_router → ... → [generate_completion | generate_class]
+      → validate_generated → memory_save → format_response
+    """
+
+    # ── Input ────────────────────────────────────────────────────────────────
+    session_id: str
+    user_message: str
+    project_path: str
+    target_file: Optional[str]
+    target_lang: str
+
+    # ── Intent routing ──────────────────────────────────────────────────────
+    intent: str          # "question" | "explain" | "complete_fn" | "new_class"
+    intent_params: Dict[str, Any]
+
+    # ── Loaded context ──────────────────────────────────────────────────────
+    file_code: str
+    file_analysis: Dict[str, Any]
+    dependencies: List[str]
+    dependents: List[str]
+    rag_docs: List[Dict[str, Any]]
+    rag_scores: List[float]
+    project_summary: Dict[str, Any]
+
+    # ── Phase 2 — Code generation ────────────────────────────────────────────
+    generation_target: str           # function name or class name to generate
+    generation_language: str         # "java" | "python" | "javascript" | "typescript"
+    generated_code: str              # raw generated code from LLM
+    generation_valid: bool           # passed syntax validation
+    generation_errors: List[str]     # validation error messages
+    project_patterns: Dict[str, Any] # detected naming conventions + existing classes
+    apply_to_disk: bool              # True if user wants to write file directly
+
+    # ── Conversation memory ─────────────────────────────────────────────────
+    history: List[Dict[str, Any]]
+    memory_key: str
+
+    # ── Output ──────────────────────────────────────────────────────────────
+    response: str
+    formatted_response: str
+    code_blocks: List[Dict[str, Any]]
+    suggested_files: List[str]
+
+    # ── Injected services ───────────────────────────────────────────────────
+    _rag_system: Any
+    _cache: Any
+    _indexer: Any
+    _dep_graph: Any
+

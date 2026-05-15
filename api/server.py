@@ -121,6 +121,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Chat Agent router (Phase 1 + Phase 2) ─────────────────────────────────────
+from api.chat_router import chat_router          # noqa: E402
+app.include_router(chat_router, prefix="/api")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # REST Endpoints
@@ -328,7 +332,7 @@ async def git_status(req: GitStatusRequest):
         raise HTTPException(404, f"Projet introuvable : {project_path}")
 
     try:
-        from smart_git.session_tracker import GitSessionTracker
+        from smart_git.git_session_tracker import GitSessionTracker
         tracker = GitSessionTracker(project_path)
         status = await asyncio.to_thread(tracker.get_session_status)
         return status
@@ -349,7 +353,7 @@ async def git_branch(req: GitBranchRequest):
         raise HTTPException(404, f"Projet introuvable : {project_path}")
 
     try:
-        from smart_git.branch_analyzer import BranchAnalyzer
+        from smart_git.git_branch_analyzer import BranchAnalyzer
         analyzer = BranchAnalyzer(project_path)
         result = await asyncio.to_thread(
             analyzer.analyze_branch, req.branch, req.base
@@ -505,9 +509,6 @@ async def websocket_endpoint(websocket: WebSocket):
         await _ws_manager.disconnect(websocket)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Point d'entrée — python -m api.server
-# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     """Lance le serveur uvicorn avec les options CLI."""

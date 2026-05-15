@@ -202,12 +202,25 @@ class CIPoller:
 
     # ── Main polling loop ─────────────────────────────────────────────────────
 
+    # ── CD job classifier ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_deploy_job(job_name: str) -> bool:
+        """Returns True if this job should be handled by CDGraph, not CIGraph."""
+        j = job_name.lower()
+        return any(k in j for k in ("deploy", "publish", "ssh", "compose", "release", "docker"))
+
+    # ── Main polling loop ─────────────────────────────────────────────────────
+
     def poll_once(self) -> int:
         """
         Un cycle de polling. Analyse les runs non encore traités.
+        CD jobs (deploy/publish) → CDGraph.
+        All other CI jobs        → CIGraph.
         Returns: nombre de runs analysés
         """
         from langchain_agents.graphs.ci_graph import invoke_ci_run
+        from langchain_agents.graphs.cd_graph import invoke_cd_run
 
         runs = self._fetch_completed_runs()
         analyzed = 0
@@ -251,31 +264,49 @@ class CIPoller:
                 run_id_str, conclusion, head_branch, stage_failed or "?", failure_type
             )
 
-            # Invoquer le CIGraph
+            # Route to CDGraph (deploy/publish) or CIGraph (all other jobs)
+            use_cd_graph = self._is_deploy_job(stage_failed or "")
+            graph_name   = "CDGraph" if use_cd_graph else "CIGraph"
+
             try:
                 logger.info(
-                    "[Poller] Invoque CIGraph — run=%s pr_number=%s branch=%s",
-                    run_id_str, pr_number, head_branch
+                    "[Poller] Invoque %s — run=%s pr_number=%s branch=%s",
+                    graph_name, run_id_str, pr_number, head_branch
                 )
-                result = invoke_ci_run(
-                    run_id=run_id_str,
-                    repo=self.repo,
-                    owner=self.owner,
-                    project_key=self.project_key,
-                    pr_number=pr_number,
-                    head_sha=head_sha,
-                    pr_branch=head_branch,      # Fallback PR lookup
-                    stage_failed=stage_failed,
-                    run_conclusion=conclusion,
-                    run_duration_seconds=duration,
-                )
+                if use_cd_graph:
+                    result = invoke_cd_run(
+                        run_id=run_id_str,
+                        repo=self.repo,
+                        owner=self.owner,
+                        project_key=self.project_key,
+                        pr_number=pr_number,
+                        head_sha=head_sha,
+                        pr_branch=head_branch,
+                        stage_failed=stage_failed,
+                        run_conclusion=conclusion,
+                        run_duration_seconds=duration,
+                    )
+                else:
+                    result = invoke_ci_run(
+                        run_id=run_id_str,
+                        repo=self.repo,
+                        owner=self.owner,
+                        project_key=self.project_key,
+                        pr_number=pr_number,
+                        head_sha=head_sha,
+                        pr_branch=head_branch,
+                        stage_failed=stage_failed,
+                        run_conclusion=conclusion,
+                        run_duration_seconds=duration,
+                    )
+
                 notif_level = result.get("notification_level", "INFO")
                 logger.info(
-                    "[Poller] Run %s analysé → notification=%s comment_posted=%s pr_number=%s",
-                    run_id_str, notif_level, result.get("comment_posted"), result.get("pr_number")
+                    "[Poller] Run %s (%s) → notification=%s comment=%s",
+                    run_id_str, graph_name, notif_level, result.get("comment_posted")
                 )
             except Exception as e:
-                logger.error("[Poller] CIGraph failed for run %s: %s", run_id_str, e)
+                logger.error("[Poller] %s failed for run %s: %s", graph_name, run_id_str, e)
 
             self._mark_processed(run_id_str)
             analyzed += 1

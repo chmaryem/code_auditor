@@ -812,6 +812,132 @@ def cmd_ci_deploy(args):
     ))
 
 
+# ── Commande : cd-score ──────────────────────────────────────────────
+
+def cmd_cd_score(args):
+    """
+    Calcule le Release Readiness Score avant un déploiement.
+    Aggrège CI, SonarCloud, sécurité, approvals PR, risk fichiers.
+    Verdict: DEPLOY_OK / DEPLOY_WARN / DEPLOY_BLOCKED
+    """
+    from smart_git.pr_analyzer import _parse_repo
+    from ci_cd.cd_release_scorer import CDReleaseScorer
+
+    owner, repo_name = _parse_repo(args.repo)
+    repo = f"{owner}/{repo_name}"
+
+    hdr("RELEASE READINESS SCORE")
+    info(f"Repo        : {repo}")
+    info(f"Commit SHA  : {args.sha[:8] if args.sha else 'HEAD'}")
+    info(f"Environment : {args.environment}")
+    if args.project_key:
+        info(f"SonarCloud  : {args.project_key}")
+
+    scorer = CDReleaseScorer()
+    report = scorer.score(
+        repo=repo,
+        owner=owner,
+        commit_sha=args.sha or "",
+        run_id=getattr(args, "run_id", "") or "",
+        project_key=args.project_key or "",
+        pr_number=args.pr or None,
+        environment=args.environment,
+    )
+
+    verdict_colors = {
+        "DEPLOY_OK":      G,
+        "DEPLOY_WARN":    Y,
+        "DEPLOY_BLOCKED": R,
+    }
+    vc = verdict_colors.get(report.verdict, Y)
+    print(f"\n{vc}{B}  Verdict : {report.verdict}{E}")
+    print(f"  Score   : {report.score:.0f}/100\n")
+
+    print(f"{B}  Component scores:{E}")
+    for name, s in report.component_scores.items():
+        bar = f"{G}█{E}" if s >= 15 else (f"{Y}█{E}" if s >= 7 else f"{R}█{E}")
+        print(f"    {bar} {name.replace('_', ' ').title():<22} {s:.1f}")
+
+    if report.blocking_reasons:
+        print(f"\n{R}{B}  Blocking:{E}")
+        for r in report.blocking_reasons:
+            print(f"{R}    ✗ {r}{E}")
+
+    if report.warnings:
+        print(f"\n{Y}  Warnings:{E}")
+        for w in report.warnings:
+            print(f"{Y}    ⚠ {w}{E}")
+
+
+# ── Commande : cd-status ─────────────────────────────────────────────
+
+def cmd_cd_status(args):
+    """
+    Affiche l'état courant d'un environnement de déploiement.
+    Montre le dernier déploiement réussi et les stats (success rate, durée).
+    """
+    from smart_git.pr_analyzer import _parse_repo
+    from ci_cd.cd_deploy_tracker import CDDeployTracker
+    import datetime
+
+    owner, repo_name = _parse_repo(args.repo)
+    repo = f"{owner}/{repo_name}"
+    env  = args.environment
+
+    hdr(f"CD STATUS — {repo} / {env}")
+
+    tracker = CDDeployTracker()
+    state   = tracker.get_env_state(repo, env)
+    last_ok = tracker.get_last_successful_deploy(repo, env)
+    stats   = tracker.get_deploy_stats(repo, env)
+    recent  = tracker.get_recent_deploys(repo, limit=5, env=env)
+
+    if not state:
+        print(f"{Y}  No deployment data found for {repo}/{env}{E}")
+        print(f"  Run `python main.py ci-poll` to start tracking deployments.")
+        return
+
+    status = state.get("status", "unknown")
+    sc = G if status == "success" else (R if status == "failed" else Y)
+    print(f"\n{B}  Current Environment:{E}")
+    print(f"    Status  : {sc}{status}{E}")
+    print(f"    Version : {state.get('version', 'N/A')}")
+    print(f"    SHA     : {state.get('commit_sha', 'N/A')[:8]}")
+    print(f"    Branch  : {state.get('branch', 'N/A')}")
+    print(f"    URL     : {state.get('deploy_url', 'N/A')}")
+
+    if last_ok:
+        ts = last_ok.get("success_at", 0)
+        dt = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "N/A"
+        print(f"\n{B}  Last Successful Deploy:{E}")
+        print(f"    Version  : {last_ok.get('version', 'N/A')}")
+        print(f"    SHA      : {last_ok.get('commit_sha', 'N/A')[:8]}")
+        print(f"    At       : {dt}")
+
+    print(f"\n{B}  Statistics (last 50 deploys):{E}")
+    sr = stats.get('success_rate', 0)
+    sc2 = G if sr >= 90 else (Y if sr >= 70 else R)
+    print(f"    Total    : {stats.get('total', 0)}")
+    print(f"    Success  : {stats.get('successes', 0)}")
+    print(f"    Failed   : {stats.get('failures', 0)}")
+    print(f"    Rate     : {sc2}{sr}%{E}")
+    avg = stats.get('avg_duration_s', 0)
+    print(f"    Avg time : {avg}s ({avg // 60}m{avg % 60:02d}s)")
+
+    if recent:
+        print(f"\n{B}  Recent deployments:{E}")
+        for d in recent:
+            ts  = d.get('started_at', 0)
+            dt2 = datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "?"
+            s   = d.get('status', '?')
+            sc3 = G if s == 'success' else (R if s == 'failed' else Y)
+            print(
+                f"    {sc3}{s:<8}{E}  "
+                f"ver={d.get('version', '?')[:20]:<20}  "
+                f"{dt2}"
+            )
+
+
 # ── Commande : pr-check (MCP Code Mode) ──────────────────────────────────
 
 def cmd_pr_check(args):
@@ -1040,6 +1166,17 @@ Exemples :
     sp.add_argument("--branch",      default="",                           help="Branche (ex: feature/test-hook)")
     sp.add_argument("--project-key", default="",      dest="project_key", help="Clé SonarCloud")
 
+    sp = sub.add_parser("cd-score", help="Release Readiness Score avant déploiement (CD Intelligence)")
+    sp.add_argument("--repo",        required=True,   help="owner/repo")
+    sp.add_argument("--sha",         default="",      help="Commit SHA à évaluer")
+    sp.add_argument("--pr",          type=int,        default=None,  help="Numéro PR associée")
+    sp.add_argument("--project-key", default="",      dest="project_key", help="Clé SonarCloud")
+    sp.add_argument("--environment", default="production", help="Environnement cible (défaut: production)")
+
+    sp = sub.add_parser("cd-status", help="État courant d'un environnement de déploiement")
+    sp.add_argument("--repo",        required=True,   help="owner/repo")
+    sp.add_argument("--environment", default="production", help="Environnement (défaut: production)")
+
     sp = sub.add_parser("pr-check", help="Analyser une PR GitHub via MCP")
     sp.add_argument("--repo", required=True, help="owner/repo")
     sp.add_argument("--pr", type=int, required=True, help="Numéro de la PR")
@@ -1057,7 +1194,194 @@ Exemples :
     sp.add_argument("--project", help="Chemin racine du projet (défaut: dossier du fichier)")
     sp.add_argument("--write", action="store_true", help="Écrire le fichier de test sur disque")
 
+    # ── Chat Agent ────────────────────────────────────────────────────────────
+    sp = sub.add_parser("chat", help="Project-aware ChatAgent (Phase 1+2) — Q&A / explain / generate")
+    sp.add_argument("--project",   default=".",  help="Project root path (default: current dir)")
+    sp.add_argument("--ask",       default="",   help="One-shot question (non-interactive mode)")
+    sp.add_argument("--session",   default="",   help="Existing session ID (continue a chat session)")
+    sp.add_argument("--file",      default="",   help="Optional target file path or filename")
+    # Phase 2 — code generation
+    sp.add_argument("--complete",  default="",   help="[Phase 2] Complete a function: 'findByEmail in UserService.java'")
+    sp.add_argument("--new-class", default="",   dest="new_class",
+                    help="[Phase 2] Generate a new class: 'ProductService'")
+    sp.add_argument("--lang",      default="",   help="[Phase 2] Language: java|python|javascript|typescript")
+    sp.add_argument("--write",     action="store_true",
+                    help="[Phase 2] Write generated file to disk (suggested path)")
+
+    # ── API Server ─────────────────────────────────────────────────────────────
+    sp = sub.add_parser("serve", help="Start FastAPI server (REST + WebSocket + ChatAgent API)")
+    sp.add_argument("--host",    default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    sp.add_argument("--port",    type=int, default=8765, help="Port (default: 8765)")
+    sp.add_argument("--project", default=".", help="Default project path for analysis endpoints")
+    sp.add_argument("--reload",  action="store_true", help="Hot-reload (dev mode)")
+
     return p
+
+# ── Commande : chat ───────────────────────────────────────────────────────────
+
+def cmd_chat(args):
+    """ChatAgent Phase 1+2 — Q&A / explain / complete function / generate class.
+
+    Modes:
+      --ask "..."       : one-shot question (Phase 1)
+      --complete "..."  : complete a function body (Phase 2)
+      --new-class NAME  : generate a new class (Phase 2)
+      (no flags)        : interactive REPL
+    """
+    from langchain_agents.graphs.chat_graph import invoke_chat
+
+    project = str(Path(args.project).resolve())
+
+    # ── Phase 2 : function completion ───────────────────────────────────────
+    if getattr(args, "complete", ""):
+        message = f"complete {args.complete}"
+        result  = invoke_chat(
+            message=message,
+            project_path=project,
+            session_id=args.session,
+            target_file=args.file,
+        )
+        _print_generation_result(result, args)
+        return
+
+    # ── Phase 2 : new class generation ──────────────────────────────────────
+    if getattr(args, "new_class", ""):
+        lang_part = f" in {args.lang}" if getattr(args, "lang", "") else ""
+        message   = f"create a {args.new_class} class{lang_part}"
+        result    = invoke_chat(
+            message=message,
+            project_path=project,
+            session_id=args.session,
+            target_file=args.file,
+        )
+        _print_generation_result(result, args)
+        return
+
+    # ── Phase 1 : one-shot Q&A ───────────────────────────────────────────────
+    if args.ask:
+        result = invoke_chat(
+            message=args.ask,
+            project_path=project,
+            session_id=args.session,
+            target_file=args.file,
+        )
+        output = result.get("formatted_response") or result.get("response", "")
+        print(output)
+        return
+
+    # ── Interactive REPL ─────────────────────────────────────────────────────
+    from services.chat_memory_service import chat_memory_service
+    session = args.session or chat_memory_service.new_session_id()
+
+    hdr("Code Auditor — ChatAgent (Phase 1+2)")
+    info(f"Projet  : {project}")
+    if args.file:
+        info(f"Fichier : {args.file}")
+    info(f"Session : {session}  (--session {session} pour reprendre)")
+    print(f"{Y}  Tape 'exit' ou Ctrl-C pour quitter.{E}")
+    print(f"{C}  Phase 2 : 'complete <fn> in <file>' | 'create a <ClassName> class'{E}\n")
+
+    while True:
+        try:
+            msg = input(f"{B}you>{E} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not msg:
+            continue
+        if msg.lower() in ("exit", "quit", "q"):
+            break
+
+        result  = invoke_chat(
+            message=msg,
+            project_path=project,
+            session_id=session,
+            target_file=args.file,
+        )
+        session = result.get("session_id", session)
+        output  = result.get("formatted_response") or result.get("response", "")
+        elapsed = result.get("stats", {}).get("elapsed", "?")
+        print(f"\n{G}assistant>{E} {output}\n")
+        print(f"{C}  [{elapsed}s]{E}\n")
+
+
+def _print_generation_result(result: dict, args) -> None:
+    """Print generated code result and optionally write to disk."""
+    output  = result.get("formatted_response") or result.get("response", "")
+    elapsed = result.get("stats", {}).get("elapsed", "?")
+
+    # Windows cp1252 terminals can't print emojis — encode safely
+    def _safe_print(text: str) -> None:
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            print(text.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+                sys.stdout.encoding or "utf-8", errors="replace"
+            ))
+
+    _safe_print(f"\n{G}assistant>{E}")
+    _safe_print(output)
+    _safe_print(f"\n{C}  [{elapsed}s]{E}")
+
+    # Write to disk if --write and suggested file path available
+    if getattr(args, "write", False):
+        suggested = (result.get("suggested_files") or [""])[0]
+        code      = result.get("generated_code", "")
+        if suggested and code:
+            out_path = Path(suggested)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(code, encoding="utf-8")
+            ok(f"Written to {out_path}")
+        else:
+            err("No suggested file path — cannot write to disk automatically.")
+
+
+
+def cmd_serve(args):
+    """Start the FastAPI server exposing REST + WebSocket + ChatAgent API.
+
+    Endpoints available after start:
+      GET  /health                    — server readiness check
+      POST /api/chat                  — Q&A / explain (Phase 1)
+      POST /api/chat/complete         — function completion (Phase 2)
+      POST /api/chat/generate         — new class generation (Phase 2)
+      GET  /api/chat/history/{id}     — conversation history
+      POST /analyze/file              — single file analysis
+      POST /analyze/project           — full project analysis
+      GET  /watch/status              — watch mode status
+      WS   /ws                        — real-time events
+      GET  /docs                      — Swagger UI
+
+    The VS Code plugin connects to this server.
+    """
+    import uvicorn
+    import logging as _logging
+    from pathlib import Path as _Path
+    import api.server as _srv
+
+    project = str(_Path(args.project).resolve())
+    _srv._default_project = _Path(project)
+
+    hdr(f"Code Auditor — API Server")
+    info(f"Projet  : {project}")
+    info(f"Adresse : http://{args.host}:{args.port}")
+    info(f"Docs    : http://{args.host}:{args.port}/docs")
+    info(f"Chat    : http://{args.host}:{args.port}/api/chat")
+    print(f"{C}  Ctrl-C pour arrêter.{E}\n")
+
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    uvicorn.run(
+        "api.server:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        log_level="info",
+    )
+
 
 
 def main():
@@ -1077,11 +1401,18 @@ def main():
         "ci-deploy":  cmd_ci_deploy,
         "ci-poll":    cmd_ci_poll,
         "ci-analyze": cmd_ci_analyze,    # analyse manuelle
+        # CD Intelligence
+        "cd-score":   cmd_cd_score,
+        "cd-status":  cmd_cd_status,
         # MCP Code Mode
-        "pr-check": cmd_pr_check,
-        "pr-resolve": cmd_pr_resolve,
+        "pr-check":       cmd_pr_check,
+        "pr-resolve":     cmd_pr_resolve,
         "pr-merge-check": cmd_pr_merge_check,
         "generate-tests": cmd_generate_tests,
+        # Chat Agent
+        "chat":           cmd_chat,
+        # API Server
+        "serve":          cmd_serve,
     }
     commands[args.command](args)
 
