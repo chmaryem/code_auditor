@@ -250,24 +250,31 @@ def node_rag_retrieve(state: WatchState) -> Dict[str, Any]:
 
 
 def node_git_session(state: WatchState) -> Dict[str, Any]:
-    """Node 9b: Git session monitoring (reads from Redis, 0 LLM token)."""
+    """Node 9b: Git session monitoring (reads from GitSessionTracker, 0 LLM token)."""
     from langchain_agents.agents.lc_git_session_agent import LCGitSessionAgent
 
     project_path = state.get("project_path", ".")
-    agent = LCGitSessionAgent(Path(project_path))
+    agent = LCGitSessionAgent()
 
-    git_session = agent.get_session_context()
-    if git_session and git_session.get("has_data"):
-        level = git_session.get("level", "CLEAN")
-        if level in ("WARN", "CRITICAL"):
-            alert = agent.format_alert(git_session)
-            if alert:
-                print(f"    🔥 {alert}")
-        else:
-            print(f"    📊 Git session: {level} (score={git_session.get('score', 0)})")
-        return {"git_session": git_session}
-    print("    📊 Git session: pas de données (vérifiez si des fichiers sont non-commités)")
-    return {"git_session": None}
+    git_session = agent.get_status(project_path)
+
+    if not git_session.get("success"):
+        logger.debug("git_session unavailable: %s", git_session.get("error"))
+        return {"git_session": None}
+
+    # Normalise: add has_data flag used by node_emit_ws_events
+    git_session["has_data"] = True
+    git_session["files_at_risk_count"] = len(git_session.get("files_at_risk", []))
+
+    level = git_session.get("level", "CLEAN")
+    score = git_session.get("score", 0)
+    if level in ("WARN", "CRITICAL"):
+        print(f"    🔥 Git session: {level} (score={score}, "
+              f"critical={git_session.get('total_critical', 0)})")
+    else:
+        print(f"    📊 Git session: {level} (score={score})")
+
+    return {"git_session": git_session}
 
 
 def node_build_context(state: WatchState) -> Dict[str, Any]:
@@ -423,32 +430,45 @@ def node_cache_results(state: WatchState) -> Dict[str, Any]:
 
         parsed_resp = parse_llm_response(result_text)
 
-        if parsed_resp["strategy"] == "full_class":
-            print(f"  Strategy : {_CY}full_class{_R} — {parsed_resp['reason'][:80]}")
-            print_solution(
-                solution_text=result_text, file_name=file_name,
-                changes=parsed_resp["payload"].get("changes", []),
-                language=language, elapsed=elapsed,
-                analyzed_count=analyzed_count, score=change_score,
-                impacted=preds,
-            )
-        elif parsed_resp["strategy"] == "targeted_methods":
-            methods = parsed_resp["payload"].get("methods", [])
-            print(f"  Strategy : {_CY}targeted_methods{_R} ({len(methods)} méthode(s))")
-            print_targeted_methods(
-                methods=methods, file_name=file_name,
-                remaining=parsed_resp["payload"].get("remaining_blocks", []),
-                elapsed=elapsed, analyzed_count=analyzed_count,
-                score=change_score, impacted=preds,
-            )
+        # Rich console output only in interactive terminal (CLI/dev mode).
+        # In API server mode (non-tty stdout) use structured logger to avoid
+        # flooding the server console with ANSI code dumps.
+        import sys as _sys
+        if _sys.stdout.isatty():
+            if parsed_resp["strategy"] == "full_class":
+                print(f"  Strategy : {_CY}full_class{_R} — {parsed_resp['reason'][:80]}")
+                print_solution(
+                    solution_text=result_text, file_name=file_name,
+                    changes=parsed_resp["payload"].get("changes", []),
+                    language=language, elapsed=elapsed,
+                    analyzed_count=analyzed_count, score=change_score,
+                    impacted=preds,
+                )
+            elif parsed_resp["strategy"] == "targeted_methods":
+                methods = parsed_resp["payload"].get("methods", [])
+                print(f"  Strategy : {_CY}targeted_methods{_R} ({len(methods)} méthode(s))")
+                print_targeted_methods(
+                    methods=methods, file_name=file_name,
+                    remaining=parsed_resp["payload"].get("remaining_blocks", []),
+                    elapsed=elapsed, analyzed_count=analyzed_count,
+                    score=change_score, impacted=preds,
+                )
+            else:
+                if parsed_resp["reason"]:
+                    print(f"  Strategy : {_CY}block_fix{_R} — {parsed_resp['reason'][:80]}")
+                print_results(
+                    text=result_text, file_name=file_name,
+                    context=state.get("context", {}), elapsed=elapsed,
+                    analyzed_count=analyzed_count, score=change_score,
+                    impacted=preds,
+                )
         else:
-            if parsed_resp["reason"]:
-                print(f"  Strategy : {_CY}block_fix{_R} — {parsed_resp['reason'][:80]}")
-            print_results(
-                text=result_text, file_name=file_name,
-                context=state.get("context", {}), elapsed=elapsed,
-                analyzed_count=analyzed_count, score=change_score,
-                impacted=preds,
+            logger.info(
+                "[CACHE] file=%s strategy=%s elapsed=%.1fs score=%d",
+                file_name,
+                parsed_resp.get("strategy", strategy),
+                elapsed,
+                change_score,
             )
     finally:
         if print_lock:
@@ -526,6 +546,21 @@ def node_analyze_dependents(state: WatchState) -> Dict[str, Any]:
             )
 
     if not dependents:
+        return {}
+
+    # Throttle: skip LLM analysis of dependents if the main analysis already
+    # took too long. This prevents cascading LLM calls from stalling the watch
+    # loop (root cause of the 481s latency). The dependency_impact WS event is
+    # still emitted by node_emit_ws_events regardless.
+    elapsed_so_far = time.time() - state.get("stats", {}).get("start_time", time.time())
+    if elapsed_so_far > 45.0:
+        logger.info(
+            "analyze_dependents SKIPPED (elapsed=%.0fs > 45s threshold). "
+            "File: %s. Would have analyzed: %s",
+            elapsed_so_far,
+            Path(state.get("file_path", "?")).name,
+            [Path(d).name for d in dependents[:3]],
+        )
         return {}
 
     # Skip if post-solution mode (avoid cascading rewrites)
@@ -664,6 +699,714 @@ def node_analyze_dependents(state: WatchState) -> Dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Node 15 — WebSocket Event Builder (VS Code plugin output)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _parse_issues_from_llm(text: str, file_path: str) -> list:
+    """
+    Extract structured issues from raw LLM analysis text.
+
+    Looks for patterns like:
+      - ISSUE: <title> | line <N> | severity <S> | rule <R>
+      - ## <title> (line N)
+      - ⚠ / ❌ / 🔴 prefixed lines with line numbers
+      - FIX BLOCK headers
+
+    Returns list of dicts compatible with vscode.Diagnostic.
+    """
+    import re
+
+    issues = []
+    seen: set = set()
+
+    # ── Severity keyword helpers ───────────────────────────────────────────────
+    _SEV_MAP = {
+        "critical": "critical", "error": "error",
+        "warning": "warning",   "warn": "warning",
+        "medium": "warning",    "info": "info",
+        "low": "info",          "high": "error",
+    }
+
+    def _norm_sev(raw: str) -> str:
+        return _SEV_MAP.get(raw.strip().lower(), "warning")
+
+    # ── Pattern 1: explicit ISSUE: lines ──────────────────────────────────────
+    # ISSUE: SQL Injection | line 42 | severity critical | rule security.sql_injection
+    p1 = re.compile(
+        r"ISSUE:\s*(?P<title>[^|\n]+)"
+        r"(?:\s*\|\s*line\s*(?P<line>\d+))?"
+        r"(?:\s*\|\s*severity\s*(?P<sev>\w+))?"
+        r"(?:\s*\|\s*rule\s*(?P<rule>[^\s|]+))?",
+        re.IGNORECASE,
+    )
+    for m in p1.finditer(text):
+        title = m.group("title").strip()
+        key = (title, m.group("line"))
+        if key in seen:
+            continue
+        seen.add(key)
+        issues.append({
+            "title":    title,
+            "message":  title,
+            "line":     int(m.group("line")) if m.group("line") else None,
+            "severity": _norm_sev(m.group("sev") or "warning"),
+            "rule":     m.group("rule") or "code-auditor",
+            "suggestion": "",
+        })
+
+    # ── Pattern 2: FIX BLOCK headers — «### Fix N: <title> (line N, severity)» ─
+    p2 = re.compile(
+        r"(?:#{1,3}|FIX\s*\d+[:.]?)\s*(?P<title>[^\n(]+)"
+        r"(?:\((?:[Ll]ine\s*)?(?P<line>\d+)(?:,\s*(?P<sev>\w+))?\))?",
+        re.IGNORECASE,
+    )
+    for m in p2.finditer(text):
+        title = m.group("title").strip(" :-")
+        if not title or len(title) < 5:
+            continue
+        key = (title, m.group("line"))
+        if key in seen:
+            continue
+        seen.add(key)
+        issues.append({
+            "title":    title,
+            "message":  title,
+            "line":     int(m.group("line")) if m.group("line") else None,
+            "severity": _norm_sev(m.group("sev") or "warning"),
+            "rule":     "code-auditor",
+            "suggestion": "",
+        })
+
+    # ── Pattern 3: emoji-prefixed lines with line numbers ─────────────────────
+    # ❌ Line 12: Missing null check
+    p3 = re.compile(
+        r"(?:❌|⚠️?|🔴|🟡|CRITICAL|ERROR|WARNING|BUG)\s*"
+        r"(?:[Ll]ine\s*(?P<line>\d+)\s*[:\-–]?\s*)?"
+        r"(?P<title>[^\n]{5,120})",
+    )
+    for m in p3.finditer(text):
+        title = m.group("title").strip()
+        key = (title[:40], m.group("line"))
+        if key in seen:
+            continue
+        seen.add(key)
+        # Derive severity from prefix
+        prefix = text[m.start(): m.start() + 10]
+        sev = "error" if any(x in prefix for x in ("❌", "🔴", "CRITICAL", "ERROR")) else "warning"
+        issues.append({
+            "title":    title[:120],
+            "message":  title[:120],
+            "line":     int(m.group("line")) if m.group("line") else None,
+            "severity": sev,
+            "rule":     "code-auditor",
+            "suggestion": "",
+        })
+
+    # ── Enrich suggestions from nearby «Suggestion:» lines ────────────────────
+    sug_pattern = re.compile(r"[Ss]uggestion[:\-–]\s*(?P<sug>[^\n]{5,200})")
+    suggestions = [m.group("sug").strip() for m in sug_pattern.finditer(text)]
+    for i, issue in enumerate(issues):
+        if i < len(suggestions):
+            issue["suggestion"] = suggestions[i]
+
+    return issues[:20]   # cap at 20 issues per file
+
+def _extract_fixes_from_llm(
+    text: str,
+    file_path: str,
+    language: str,
+    source_code: str = "",
+    strategy: str = "",
+) -> list:
+    """
+    Extract suggested fixes from the raw LLM output for VS Code.
+
+    Produces fixes that the plugin can apply only when both fields exist:
+      - current_code
+      - fixed_code
+
+    Supports:
+      1. parse_fix_blocks()
+      2. diff snippets: - old / + new
+      3. full_class code blocks: replace whole file
+      4. targeted Java method blocks: replace one method when possible
+    """
+    import re
+    from pathlib import Path
+
+    fixes = []
+    file_name = Path(file_path).name
+
+    def _safe_line(value):
+        try:
+            return int(value) if value is not None else None
+        except Exception:
+            return None
+
+    def _add_fix(
+        title: str,
+        current_code: str,
+        fixed_code: str,
+        explanation: str = "",
+        line=None,
+        apply_mode: str = "replace_snippet",
+    ):
+        current_code = str(current_code or "").strip()
+        fixed_code = str(fixed_code or "").strip()
+
+        if not current_code or not fixed_code:
+            return
+
+        if current_code == fixed_code:
+            return
+
+        # Avoid extremely tiny unsafe replacements
+        if len(current_code) < 3 or len(fixed_code) < 3:
+            return
+
+        fixes.append({
+            "title": str(title or "Suggested fix")[:160],
+            "file_path": file_path,
+            "file": file_name,
+            "line": _safe_line(line),
+            "current_code": current_code,
+            "fixed_code": fixed_code,
+            "explanation": str(explanation or "Suggested Code Auditor fix."),
+            "fix_preview": _build_fix_preview(current_code, fixed_code),
+            "language": language,
+            "apply_mode": apply_mode,
+        })
+
+    def _build_fix_preview(current_code: str, fixed_code: str, max_chars: int = 1200) -> str:
+        current_code = str(current_code or "").strip()
+        fixed_code = str(fixed_code or "").strip()
+
+        preview = f"- {current_code}\n+ {fixed_code}"
+
+        if len(preview) > max_chars:
+            preview = preview[:max_chars] + "\n... preview truncated ..."
+
+        return preview
+
+    def _extract_code_blocks(raw: str) -> list:
+        blocks = []
+
+        code_block_pattern = re.compile(
+            r"```(?P<lang>[a-zA-Z0-9_+-]*)\s*(?P<code>.*?)```",
+            re.DOTALL,
+        )
+
+        for match in code_block_pattern.finditer(raw or ""):
+            block_lang = (match.group("lang") or "").strip().lower()
+            code = (match.group("code") or "").strip()
+
+            if not code:
+                continue
+
+            blocks.append({
+                "language": block_lang,
+                "code": code,
+            })
+
+        return blocks
+
+    def _looks_like_full_java_class(code: str) -> bool:
+        return (
+            "class " in code
+            and ("public class " in code or "class " in code)
+            and ("{" in code and "}" in code)
+        )
+
+    def _extract_java_method_name(code: str) -> str:
+        m = re.search(
+            r"(?:public|private|protected)?\s*(?:static\s+)?[\w<>\[\], ?]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*\{",
+            code,
+        )
+        return m.group(1) if m else ""
+
+    def _find_java_method_in_source(source: str, method_name: str) -> str:
+        if not source or not method_name:
+            return ""
+
+        signature = re.search(
+            rf"(?:public|private|protected)?\s*(?:static\s+)?[\w<>\[\], ?]+\s+{re.escape(method_name)}\s*\([^)]*\)\s*\{{",
+            source,
+        )
+
+        if not signature:
+            return ""
+
+        start = signature.start()
+        brace_start = source.find("{", signature.start())
+
+        if brace_start < 0:
+            return ""
+
+        depth = 0
+        for i in range(brace_start, len(source)):
+            ch = source[i]
+
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+
+                if depth == 0:
+                    return source[start:i + 1].strip()
+
+        return ""
+
+    # ── 1. Existing parser from console_renderer ─────────────────────────────
+    try:
+        from output.console_renderer import parse_fix_blocks
+
+        blocks = parse_fix_blocks(text) or []
+
+        for idx, block in enumerate(blocks):
+            current_code = (
+                block.get("current_code")
+                or block.get("before")
+                or block.get("old_code")
+                or block.get("original")
+                or ""
+            )
+
+            fixed_code = (
+                block.get("fixed_code")
+                or block.get("after")
+                or block.get("new_code")
+                or block.get("replacement")
+                or ""
+            )
+
+            title = (
+                block.get("title")
+                or block.get("problem")
+                or block.get("location")
+                or f"Suggested fix {idx + 1}"
+            )
+
+            explanation = (
+                block.get("why")
+                or block.get("explanation")
+                or block.get("problem")
+                or "Suggested fix"
+            )
+
+            _add_fix(
+                title=title,
+                current_code=current_code,
+                fixed_code=fixed_code,
+                explanation=explanation,
+                line=block.get("line"),
+                apply_mode="replace_snippet",
+            )
+
+    except Exception as e:
+        logger.debug("parse_fix_blocks failed while extracting WS fixes: %s", e)
+
+    # ── 2. Diff-style snippets ───────────────────────────────────────────────
+    diff_pattern = re.compile(
+        r"(?m)^\s*-\s*(?P<old>[^\n]+)\n\s*\+\s*(?P<new>[^\n]+)"
+    )
+
+    for match in diff_pattern.finditer(text or ""):
+        old = match.group("old").strip()
+        new = match.group("new").strip()
+
+        before = text[max(0, match.start() - 400):match.start()]
+        line_match = re.search(r"(?:line|Line|ligne|Ligne)\s*[:#]?\s*(\d+)", before)
+        line = int(line_match.group(1)) if line_match else None
+
+        _add_fix(
+            title=f"Replace code at line {line or '?'}",
+            current_code=old,
+            fixed_code=new,
+            explanation="Suggested replacement extracted from analysis diff.",
+            line=line,
+            apply_mode="replace_snippet",
+        )
+
+    # ── 3. Code block fallback ───────────────────────────────────────────────
+    code_blocks = _extract_code_blocks(text)
+
+    for block in code_blocks:
+        code = block["code"]
+
+        # Full Java class: replace whole file.
+        if language == "java" and _looks_like_full_java_class(code):
+            if source_code.strip():
+                _add_fix(
+                    title=f"Replace full file {file_name}",
+                    current_code=source_code,
+                    fixed_code=code,
+                    explanation="Full-class fix generated by Code Auditor. Review before applying.",
+                    line=1,
+                    apply_mode="full_file",
+                )
+                continue
+
+        # Targeted Java method: replace method if we can find current method.
+        if language == "java":
+            method_name = _extract_java_method_name(code)
+
+            if method_name:
+                current_method = _find_java_method_in_source(source_code, method_name)
+
+                if current_method:
+                    _add_fix(
+                        title=f"Replace method {method_name}",
+                        current_code=current_method,
+                        fixed_code=code,
+                        explanation=f"Suggested replacement for method {method_name}.",
+                        line=None,
+                        apply_mode="replace_method",
+                    )
+
+    # ── 4. Deduplicate ───────────────────────────────────────────────────────
+    deduped = []
+    seen = set()
+
+    for fix in fixes:
+        key = (
+            fix.get("apply_mode", ""),
+            fix.get("current_code", "")[:120],
+            fix.get("fixed_code", "")[:120],
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(fix)
+
+    logger.info(
+        "[WS] fixes extracted for %s: %d",
+        file_name,
+        len(deduped),
+    )
+
+    return deduped[:10]
+
+
+def _attach_fixes_to_issues(issues: list, fixes: list) -> list:
+    """
+    Attach fix fields to issues so the VS Code plugin can show
+    Apply / Explain / Ignore without guessing.
+    """
+    if not issues or not fixes:
+        return issues
+
+    enriched = []
+
+    for idx, issue in enumerate(issues):
+        item = dict(issue)
+        issue_line = item.get("line")
+        matching_fix = None
+
+        if issue_line is not None:
+            for fix in fixes:
+                if fix.get("line") == issue_line:
+                    matching_fix = fix
+                    break
+
+        if matching_fix is None and idx < len(fixes):
+            matching_fix = fixes[idx]
+
+        if matching_fix:
+            item["current_code"] = matching_fix.get("current_code", "")
+            item["fixed_code"] = matching_fix.get("fixed_code", "")
+            item["fix_preview"] = matching_fix.get("fix_preview", "")
+            item["fix_explanation"] = matching_fix.get("explanation", "")
+
+            if not item.get("suggestion"):
+                item["suggestion"] = matching_fix.get("explanation", "")
+
+        enriched.append(item)
+
+    return enriched
+
+def node_emit_ws_events(state: WatchState) -> Dict[str, Any]:
+    """
+    Node 15: Build all WebSocket events for the VS Code plugin (schema v2.0).
+
+    Improvements over v1:
+      - parse_structured_output() replaces fragile regex parsers
+        (falls back to regex if LLM did not produce <STRUCTURED_OUTPUT>)
+      - diff_hunks computed via difflib for targeted code changes
+      - request_id (UUID) for event correlation plugin ↔ server
+      - elapsed_ms, analyzed_at, schema_version, file_name, change_score
+      - fix_available / fix_id cross-references between issues and fixes
+      - full_class fixes: current_code/fixed_code truncated; diff_hunks used
+
+    Events emitted:
+      • analysis_result    — structured issues[] + fixes[] (schema_version=2.0)
+      • dependency_impact  — impacted files list
+      • test_gap           — missing test warning
+      • git_recommendation — commit recommended / blocked
+      • known_issue        — recurring Redis pattern if any
+    """
+    import uuid
+
+    file_path   = state.get("file_path", "")
+    language    = state.get("language", "unknown")
+    analysis    = state.get("analysis", {})
+    raw_text    = analysis.get("analysis", "") if isinstance(analysis, dict) else str(analysis)
+    source_code = state.get("code", "")
+
+    # ── Metadata ──────────────────────────────────────────────────────────────
+    request_id  = str(uuid.uuid4())
+    analyzed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    start_time  = state.get("stats", {}).get("start_time", time.time())
+    elapsed_ms  = int((time.time() - start_time) * 1000)
+
+    events: list = []
+
+    # ── 1. analysis_result ────────────────────────────────────────────────────
+    # Try structured output first (JSON produced by STEP 3 in the LLM prompt)
+    try:
+        from langchain_agents.agents.lc_analysis_agent import parse_structured_output
+        structured = parse_structured_output(raw_text)
+    except Exception:
+        structured = {}
+
+    if structured.get("issues") is not None:
+        # ── Structured path — clean JSON from LLM ────────────────────────────
+        issues_raw      = structured.get("issues", [])
+        fixes_raw       = structured.get("fixes", [])
+        strategy        = structured.get("strategy") or state.get("strategy", "block_fix")
+        strategy_reason = structured.get("strategy_reason", "")
+        logger.info(
+            "[WS] structured output used for %s: strategy=%s issues=%d fixes=%d",
+            Path(file_path).name, strategy, len(issues_raw), len(fixes_raw),
+        )
+    else:
+        # ── Fallback — regex parsers (for LLMs that ignored STEP 3) ──────────
+        issues_raw = _parse_issues_from_llm(raw_text, file_path)
+        fixes_raw  = _extract_fixes_from_llm(
+            raw_text, file_path, language,
+            source_code=source_code,
+            strategy=state.get("strategy", "block_fix"),
+        )
+        strategy        = state.get("strategy", "block_fix")
+        strategy_reason = ""
+        logger.info(
+            "[WS] regex fallback used for %s: issues=%d fixes=%d raw_len=%d",
+            Path(file_path).name, len(issues_raw), len(fixes_raw), len(raw_text or ""),
+        )
+
+    # ── Enrich fixes: add UUIDs + diff_hunks ─────────────────────────────────
+    try:
+        from api.diff_utils import compute_diff_hunks, truncate_code_for_ws
+        _diff_available = True
+    except ImportError:
+        _diff_available = False
+
+    enriched_fixes = []
+    for fix in fixes_raw:
+        current    = str(fix.get("current_code", "")).strip()
+        fixed      = str(fix.get("fixed_code",   "")).strip()
+        apply_mode = str(fix.get("apply_mode", "replace_snippet"))
+        fix_id     = str(uuid.uuid4())
+
+        diff_hunks = []
+        if _diff_available and current and fixed and current != fixed:
+            try:
+                diff_hunks = compute_diff_hunks(current, fixed)
+            except Exception as exc:
+                logger.debug("diff_hunks failed: %s", exc)
+
+        # Truncate blobs for full_file to keep WS payload lean
+        if _diff_available and apply_mode == "full_file" and (
+            len(current) > 300 or len(fixed) > 300
+        ):
+            current_ws = truncate_code_for_ws(current)
+            fixed_ws   = truncate_code_for_ws(fixed)
+        else:
+            current_ws = current
+            fixed_ws   = fixed
+
+        enriched_fixes.append({
+            "id":           fix_id,
+            "issue_id":     fix.get("issue_id"),
+            "title":        str(fix.get("title", "Suggested fix"))[:160],
+            "apply_mode":   apply_mode,
+            "file_path":    file_path,
+            "line":         fix.get("line"),
+            "diff_hunks":   diff_hunks,
+            "current_code": current_ws,
+            "fixed_code":   fixed_ws,
+            "explanation":  str(fix.get("explanation", fix.get("why", "")))[:500],
+            "language":     language,
+        })
+
+    # ── Attach UUIDs + fix_available to issues ────────────────────────────────
+    enriched_issues = []
+    for idx, issue in enumerate(issues_raw):
+        issue_id   = str(uuid.uuid4())
+        fix_id_ref = enriched_fixes[idx]["id"] if idx < len(enriched_fixes) else None
+        enriched_issues.append({
+            **issue,
+            "id":            issue_id,
+            "fix_available": fix_id_ref is not None,
+            "fix_id":        fix_id_ref,
+        })
+
+    # Also enrich issues with current_code/fixed_code (compat with WatchInlineManager)
+    enriched_issues = _attach_fixes_to_issues(enriched_issues, enriched_fixes)
+
+    # ── Severity summary (worst-case across all issues) ───────────────────────
+    _sev_order = {"critical": 4, "error": 3, "warning": 2, "info": 1}
+    top_sev    = max(
+        (_sev_order.get(str(i.get("severity", "info")).lower(), 1) for i in enriched_issues),
+        default=1,
+    )
+    sev_label  = {4: "critical", 3: "error", 2: "warning", 1: "info"}[top_sev]
+
+    events.append({
+        "type":            "analysis_result",
+        "schema_version":  "2.0",
+        "request_id":      request_id,
+        "file_path":       file_path,
+        "file_name":       Path(file_path).name,
+        "language":        language,
+        "severity":        sev_label,
+        "strategy":        strategy,
+        "strategy_reason": strategy_reason,
+        "change_score":    int(state.get("change_info", {}).get("score", 0)),
+        "issues":          enriched_issues,
+        "fixes":           enriched_fixes,
+        "elapsed_ms":      elapsed_ms,
+        "analyzed_at":     analyzed_at,
+        "rag_docs_used":   len(state.get("rag_docs", [])),
+    })
+
+    # ── 2. dependency_impact ──────────────────────────────────────────────────
+    impacted = (
+        state.get("dependents_to_analyze")
+        or state.get("neighborhood", {}).get("predecessors", [])
+    )
+
+    if impacted:
+        n    = len(impacted)
+        risk = "high" if n > 5 else ("medium" if n >= 2 else "low")
+
+        events.append({
+            "type":           "dependency_impact",
+            "schema_version": "2.0",
+            "request_id":     request_id,
+            "file_path":      file_path,
+            "impacted_files": impacted,
+            "risk":           risk,
+            "reason": (
+                f"{Path(file_path).name} exports symbols used by "
+                f"{n} dependent file(s)"
+            ),
+            "analyzed_at":    analyzed_at,
+        })
+
+    # ── 3. test_gap ───────────────────────────────────────────────────────────
+    test_gap = state.get("test_gap")
+
+    if test_gap:
+        related = [test_gap.get("test_file")] if test_gap.get("test_file") else []
+
+        events.append({
+            "type":               "test_gap",
+            "schema_version":     "2.0",
+            "request_id":         request_id,
+            "file_path":          file_path,
+            "severity":           "warning",
+            "missing_tests":      test_gap.get("missing", True),
+            "related_test_files": related,
+            "recommendation":     test_gap.get("reason", "Generate or update tests"),
+            "analyzed_at":        analyzed_at,
+        })
+
+    # ── 4. git_recommendation ─────────────────────────────────────────────────
+    git_session = state.get("git_session")
+
+    if git_session and git_session.get("has_data"):
+        level      = git_session.get("level", "CLEAN")
+        n_critical = git_session.get("total_critical", 0)
+        files_risk = git_session.get("files_at_risk_count", 0)
+
+        should_commit = level == "CLEAN" and n_critical == 0
+        status_str    = "recommended" if should_commit else "not_recommended"
+        risk_str      = "low" if should_commit else ("high" if level == "CRITICAL" else "medium")
+
+        blocking: list = []
+        if n_critical > 0:
+            blocking.append(f"{n_critical} critical issue(s) not yet committed")
+        if files_risk > 0:
+            blocking.append(f"{files_risk} file(s) at risk")
+        if test_gap:
+            blocking.append(f"Missing tests for {Path(file_path).name}")
+
+        msg = (
+            "Your changes look stable. Commit recommended."
+            if should_commit
+            else f"Commit not recommended: {'; '.join(blocking) or 'issues detected'}."
+        )
+
+        events.append({
+            "type":                     "git_recommendation",
+            "schema_version":           "2.0",
+            "request_id":               request_id,
+            "status":                   status_str,
+            "should_commit":            should_commit,
+            "message":                  msg,
+            "modified_files":           len(git_session.get("files_at_risk", [])),
+            "staged_files":             0,
+            "risk":                     risk_str,
+            "blocking_reasons":         blocking,
+            "suggested_commit_message": "",
+            "analyzed_at":              analyzed_at,
+        })
+
+    # ── 5. known_issue ────────────────────────────────────────────────────────
+    try:
+        from langchain_agents.memory.redis_memory import PatternMemory
+
+        pm  = PatternMemory()
+        top = pm.get_top_patterns(language, n=5)
+
+        for p in top:
+            if p.get("count", 0) >= 3 and p.get("pattern", "") in raw_text:
+                events.append({
+                    "type":           "known_issue",
+                    "schema_version": "2.0",
+                    "request_id":     request_id,
+                    "file_path":      file_path,
+                    "issue_title":    p["pattern"],
+                    "similarity":     round(min(p["count"] / 10.0, 1.0), 2),
+                    "previous_fix":   p.get("fix", ""),
+                    "seen_count":     p["count"],
+                    "analyzed_at":    analyzed_at,
+                })
+                break
+    except Exception:
+        pass
+
+    logger.info(
+        "[WS] events built for %s: types=%s strategy=%s issues=%d fixes=%d elapsed=%dms",
+        Path(file_path).name,
+        [e["type"] for e in events],
+        strategy,
+        len(enriched_issues),
+        len(enriched_fixes),
+        elapsed_ms,
+    )
+
+    return {
+        "issues":    enriched_issues,
+        "ws_events": events,
+    }
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Conditional Edge Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -700,59 +1443,53 @@ def build_watch_graph():
     """
     Build and compile the WatchGraph — the LangGraph orchestrator.
 
-    Returns a CompiledGraph that can be invoked with:
-        graph.invoke({"file_path": "/path/to/file.py", ...})
-
     Graph topology:
         hash_check ──→ read_file ──→ change_filter ──→ parse_ast
         ──→ index_chromadb ──→ update_kg ──→ update_dep_graph
         ──→ test_gap_detect ──→ get_neighborhood ──→ rag_retrieve ──→ git_session
         ──→ build_context ──→ llm_analyze ──→ cache_results ──→ learn_feedback
-        ──→ [if deps] analyze_dependents ──→ END
+        ──→ [if deps] analyze_dependents ──→ emit_ws_events ──→ END
+        ──→ [no deps]                    ──→ emit_ws_events ──→ END
     """
     graph = StateGraph(WatchState)
 
     # ── Add nodes ────────────────────────────────────────────────────────────
-    graph.add_node("hash_check",        node_hash_check)
-    graph.add_node("read_file",         node_read_file)
-    graph.add_node("change_filter",     node_change_filter)
-    graph.add_node("parse_ast",         node_parse_ast)
-    graph.add_node("index_chromadb",    node_index_chromadb)
-    graph.add_node("update_kg",         node_update_kg)
-    graph.add_node("update_dep_graph",  node_update_dep_graph)
-    graph.add_node("test_gap_detect",   node_test_gap_detect)
-    graph.add_node("get_neighborhood",  node_get_neighborhood)
-    graph.add_node("rag_retrieve",      node_rag_retrieve)
-    graph.add_node("git_session",       node_git_session)
-    graph.add_node("build_context",     node_build_context)
-    graph.add_node("llm_analyze",       node_llm_analyze)
-    graph.add_node("cache_results",     node_cache_results)
-    graph.add_node("learn_feedback",    node_learn_feedback)
+    graph.add_node("hash_check",         node_hash_check)
+    graph.add_node("read_file",          node_read_file)
+    graph.add_node("change_filter",      node_change_filter)
+    graph.add_node("parse_ast",          node_parse_ast)
+    graph.add_node("index_chromadb",     node_index_chromadb)
+    graph.add_node("update_kg",          node_update_kg)
+    graph.add_node("update_dep_graph",   node_update_dep_graph)
+    graph.add_node("test_gap_detect",    node_test_gap_detect)
+    graph.add_node("get_neighborhood",   node_get_neighborhood)
+    graph.add_node("rag_retrieve",       node_rag_retrieve)
+    graph.add_node("git_session",        node_git_session)
+    graph.add_node("build_context",      node_build_context)
+    graph.add_node("llm_analyze",        node_llm_analyze)
+    graph.add_node("cache_results",      node_cache_results)
+    graph.add_node("learn_feedback",     node_learn_feedback)
     graph.add_node("analyze_dependents", node_analyze_dependents)
+    graph.add_node("emit_ws_events",     node_emit_ws_events)   # NEW ← Node 15
 
     # ── Entry point ──────────────────────────────────────────────────────────
     graph.set_entry_point("hash_check")
 
     # ── Edges ────────────────────────────────────────────────────────────────
-    # Node 1 → conditional: skip or continue
     graph.add_conditional_edges("hash_check", should_continue_or_skip, {
         "continue": "read_file",
         "skip":     END,
     })
-
-    # Node 2 → conditional: unsupported language → skip
     graph.add_conditional_edges("read_file", should_continue_or_skip, {
         "continue": "change_filter",
         "skip":     END,
     })
-
-    # Node 3 → conditional: minor change → skip
     graph.add_conditional_edges("change_filter", should_continue_or_skip, {
         "continue": "parse_ast",
         "skip":     END,
     })
 
-    # Nodes 4-13: sequential pipeline
+    # Sequential pipeline
     graph.add_edge("parse_ast",         "index_chromadb")
     graph.add_edge("index_chromadb",    "update_kg")
     graph.add_edge("update_kg",         "update_dep_graph")
@@ -765,16 +1502,14 @@ def build_watch_graph():
     graph.add_edge("llm_analyze",       "cache_results")
     graph.add_edge("cache_results",     "learn_feedback")
 
-    # Node 13 → conditional: dependents or END
+    # Dependents branch → both paths converge at emit_ws_events
     graph.add_conditional_edges("learn_feedback", has_dependents, {
         "yes": "analyze_dependents",
-        "no":  END,
+        "no":  "emit_ws_events",
     })
+    graph.add_edge("analyze_dependents", "emit_ws_events")
+    graph.add_edge("emit_ws_events",     END)
 
-    # Node 14 → END
-    graph.add_edge("analyze_dependents", END)
-
-    # ── Compile ──────────────────────────────────────────────────────────────
     return graph.compile()
 
 

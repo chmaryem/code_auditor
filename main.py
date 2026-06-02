@@ -24,9 +24,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-
-
-# ── Couleurs console ──────────────────────────────────────────────────────────
 G  = "\033[92m"
 R  = "\033[91m"
 Y  = "\033[93m"
@@ -42,8 +39,6 @@ def hdr(msg):
     print(f"{B}{msg.center(70)}{E}")
     print(f"{B}{'='*70}{E}\n")
 
-
-# ── Commande : file ───────────────────────────────────────────────────────────
 
 def cmd_file(args):
     """Analyse un seul fichier."""
@@ -80,7 +75,6 @@ def cmd_file(args):
     ok("Analyse terminée")
 
 
-# ── Commande : project ────────────────────────────────────────────────────────
 
 def cmd_project(args):
     """Analyse un projet complet."""
@@ -159,7 +153,6 @@ def cmd_project(args):
         ok("\nVous pouvez appliquer les corrections en toute sécurité.")
 
 
-# ── Commande : watch ──────────────────────────────────────────────────────────
 
 def _setup_langsmith_tracing():
     """Configure LangSmith tracing if enabled in config."""
@@ -176,7 +169,7 @@ def _setup_langsmith_tracing():
 def cmd_watch(args):
     """Surveille un projet en temps réel + Smart Git Session Tracker."""
     try:
-        import watchdog  # noqa
+        import watchdog 
     except ImportError:
         err("Module 'watchdog' manquant — installe-le : pip install watchdog")
         return
@@ -191,7 +184,7 @@ def cmd_watch(args):
 
     use_langgraph = getattr(args, 'langgraph', False) or config.langgraph.enabled
 
-    # ── LangGraph mode ────────────────────────────────────────────────────────
+   
     if use_langgraph:
         hdr("MODE WATCH — LangGraph + LangChain Agents")
         info(f"Projet : {project_path}")
@@ -200,7 +193,7 @@ def cmd_watch(args):
 
         _setup_langsmith_tracing()
 
-        # ── Initialize services (same as legacy Orchestrator) ────────────────
+       
         from services.llm_service import CodeRAGSystemAPI
         info("Initialisation System-Aware RAG...")
         rag_system = CodeRAGSystemAPI()
@@ -217,7 +210,7 @@ def cmd_watch(args):
             logging.getLogger(__name__).warning("ProjectIndexer init failed: %s", e)
             traceback.print_exc()
 
-        # Dependency Graph
+      
         dep_graph = None
         extractor = None
         try:
@@ -485,64 +478,79 @@ def cmd_watch(args):
 
 def cmd_git_status(args):
     """Affiche l'état de la session courante (accumulation de bugs non commités)."""
-    from smart_git.git_session_tracker import GitSessionTracker
-    from smart_git.git_report import session_report
-    from smart_git.git_diff_parser import is_git_repo
-    from config import config
+    from langchain_agents.graphs.smart_git_graph import invoke_smart_git
 
-    project_path = Path(args.path)
-    if not is_git_repo(project_path):
-        err(f"Pas un dépôt Git : {project_path}")
-        return
+    project_path = Path(args.path).resolve()
+    debug = getattr(args, "debug", False)
 
-    cache_db = config.CACHE_DIR / "analysis_cache.db"
-    tracker  = GitSessionTracker(project_path=project_path, cache_db=cache_db)
-    snapshot = tracker.force_check()
+    hdr("GIT STATUS — Multi-Agent Analysis")
+    info(f"Projet : {project_path}")
+    if debug:
+        info("Mode DEBUG activé\n")
 
-    if snapshot:
-        print(session_report(snapshot))
-        if snapshot.files_unanalyzed:
-            info(f"{len(snapshot.files_unanalyzed)} fichier(s) sans analyse Watch.")
-            info("Conseil : python main.py watch <projet> pour analyser en temps réel.")
-    else:
-        err("Impossible de calculer le score de session.")
+    result = invoke_smart_git(
+        message="git status",
+        project_path=str(project_path),
+    )
+
+    # Extract and display results
+    response = result.get("response", "")
+    session_snapshot = result.get("session_snapshot", {})
+    stats = result.get("stats", {})
+
+    if response:
+        print(f"\n{response}")
+
+    # Debug info
+    if debug:
+        print(f"\n{C}[DEBUG]{E}")
+        print(f"  Intent: {result.get('intent', '?')}")
+        print(f"  Confidence: {result.get('confidence', '?')}")
+        print(f"  Safe mode: {result.get('safe_mode', '?')}")
+        print(f"  Elapsed: {stats.get('elapsed', '?')}s")
+        if result.get("errors"):
+            print(f"  Errors: {result['errors']}")
 
 
 # ── Commande : git branch ──────────────────────────────────────────────────────
 
 def cmd_git_branch(args):
     """Analyse une branche feature vs sa base et donne un verdict de merge."""
-    from smart_git.git_branch_analyzer import GitBranchAnalyzer
-    from smart_git.git_report import branch_report, save_branch_report_json
-    from smart_git.git_diff_parser import is_git_repo
-    from config import config
+    from langchain_agents.graphs.smart_git_graph import invoke_smart_git
 
-    project_path = Path(args.path)
-    if not is_git_repo(project_path):
-        err(f"Pas un dépôt Git : {project_path}")
-        return
+    project_path = Path(args.path).resolve()
+    branch = getattr(args, "branch", "HEAD")
+    base = getattr(args, "base", "main")
+    debug = getattr(args, "debug", False)
 
-    branch   = getattr(args, "branch", "HEAD")
-    base     = getattr(args, "base",   "main")
-    save_json = getattr(args, "report", False)
+    hdr(f"BRANCH READINESS — {branch} vs {base}")
+    info(f"Projet : {project_path}")
+    if debug:
+        info("Mode DEBUG activé\n")
 
-    hdr(f"ANALYSE BRANCHE — {branch} vs {base}")
+    result = invoke_smart_git(
+        message=f"branch readiness {branch} vs {base}",
+        project_path=str(project_path),
+        branch=branch,
+        base=base,
+    )
 
-    cache_db = config.CACHE_DIR / "analysis_cache.db"
-    analyzer = GitBranchAnalyzer(project_path=project_path, cache_db=cache_db)
+    # Extract and display results
+    response = result.get("response", "")
+    branch_report = result.get("branch_report", {})
+    stats = result.get("stats", {})
 
-    try:
-        report = analyzer.analyze(branch=branch, base=base)
-    except RuntimeError as e:
-        err(str(e))
-        return
+    if response:
+        print(f"\n{response}")
 
-    print(branch_report(report))
-
-    if save_json:
-        out_dir  = config.CACHE_DIR.parent / "git_reports"
-        out_path = save_branch_report_json(report, out_dir)
-        ok(f"Rapport JSON sauvegardé : {out_path}")
+    # Debug info
+    if debug:
+        print(f"\n{C}[DEBUG]{E}")
+        print(f"  Intent: {result.get('intent', '?')}")
+        print(f"  Confidence: {result.get('confidence', '?')}")
+        print(f"  Elapsed: {stats.get('elapsed', '?')}s")
+        if result.get("errors"):
+            print(f"  Errors: {result['errors']}")
 
 
 # ── Commande : git commit ──────────────────────────────────────────────────────
@@ -592,13 +600,87 @@ def cmd_hook(args):
 
 def cmd_resolve_conflicts(args):
     """
-    Résout les conflits de merge locaux via le LLM.
+    Résout les conflits de merge locaux via le multi-agent Smart Git.
     Après un 'git merge' qui produit des conflits, cette commande
-    envoie chaque fichier en conflit au LLM pour résolution automatique.
+    envoie une demande au graph pour résolution automatique.
     """
-    from smart_git.git_conflict_resolver import resolve_all_conflicts
+    from langchain_agents.graphs.smart_git_graph import invoke_smart_git
+
     project_path = Path(args.path).resolve()
-    resolve_all_conflicts(project_path)
+    debug = getattr(args, "debug", False)
+
+    hdr("CONFLICT RESOLUTION — Multi-Agent Analysis")
+    info(f"Projet : {project_path}\n")
+    if debug:
+        info("Mode DEBUG activé\n")
+
+    result = invoke_smart_git(
+        message="resolve conflicts dry run",
+        project_path=str(project_path),
+    )
+
+    # Extract and display results
+    response = result.get("response", "")
+    conflict_report = result.get("conflict_report", {})
+    stats = result.get("stats", {})
+
+    if response:
+        print(f"\n{response}")
+
+    # Debug info
+    if debug:
+        print(f"\n{C}[DEBUG]{E}")
+        print(f"  Intent: {result.get('intent', '?')}")
+        print(f"  Safe mode: {result.get('safe_mode', '?')}")
+        print(f"  Elapsed: {stats.get('elapsed', '?')}s")
+        if result.get("errors"):
+            print(f"  Errors: {result['errors']}")
+        if conflict_report:
+            print(f"  Conflict report keys: {list(conflict_report.keys())}")
+
+
+# ── Commande : commit-msg ──────────────────────────────────────────────────────
+
+def cmd_commit_msg(args):
+    """
+    Génère un message de commit basé sur les changements actuels.
+    Utilise le multi-agent Smart Git pour analyser les diffs.
+    """
+    from langchain_agents.graphs.smart_git_graph import invoke_smart_git
+
+    project_path = Path(args.path).resolve()
+    debug = getattr(args, "debug", False)
+
+    hdr("COMMIT MESSAGE GENERATION — Multi-Agent Analysis")
+    info(f"Projet : {project_path}\n")
+    if debug:
+        info("Mode DEBUG activé\n")
+
+    result = invoke_smart_git(
+        message="generate commit message",
+        project_path=str(project_path),
+    )
+
+    # Extract and display results
+    response = result.get("response", "")
+    commit_message = result.get("commit_message", "")
+    changes = result.get("changes", {})
+    stats = result.get("stats", {})
+
+    if commit_message:
+        print(f"\n{B}Proposed commit message:{E}")
+        print(f"{C}{commit_message}{E}\n")
+
+    if response:
+        print(f"\n{response}\n")
+
+    # Debug info
+    if debug:
+        print(f"\n{C}[DEBUG]{E}")
+        print(f"  Intent: {result.get('intent', '?')}")
+        print(f"  Elapsed: {stats.get('elapsed', '?')}s")
+        if result.get("errors"):
+            print(f"  Errors: {result['errors']}")
 
 
 # ── Commande : merge-hook ──────────────────────────────────────────────────
@@ -869,7 +951,6 @@ def cmd_cd_score(args):
             print(f"{Y}    ⚠ {w}{E}")
 
 
-# ── Commande : cd-status ─────────────────────────────────────────────
 
 def cmd_cd_status(args):
     """
@@ -1122,12 +1203,14 @@ Exemples :
 
     sp = sub.add_parser("git-status", help="Afficher l'état de la session (bugs accumulés non commités)")
     sp.add_argument("path")
+    sp.add_argument("--debug", action="store_true", help="Afficher les détails du graph (intents, état, temps)")
 
     sp = sub.add_parser("git-branch", help="Analyser une branche avant merge")
     sp.add_argument("path")
     sp.add_argument("--branch", default="HEAD", help="Branche à analyser (défaut: HEAD)")
     sp.add_argument("--base",   default="main",  help="Branche de base (défaut: main)")
     sp.add_argument("--report", action="store_true", help="Sauvegarder le rapport en JSON")
+    sp.add_argument("--debug", action="store_true", help="Afficher les détails du graph (intents, état, temps)")
 
     sp = sub.add_parser("hook",       help="Installer/désinstaller le pre-commit hook Git")
     sp.add_argument("path")
@@ -1137,6 +1220,11 @@ Exemples :
     # ── Smart Git Merge commands ────────────────────────────────────────────
     sp = sub.add_parser("resolve-conflicts", help="Résoudre les conflits de merge locaux via LLM")
     sp.add_argument("path", help="Chemin du projet Git")
+    sp.add_argument("--debug", action="store_true", help="Afficher les détails du graph (intents, état, temps)")
+
+    sp = sub.add_parser("commit-msg", help="Générer un message de commit basé sur les changements actuels")
+    sp.add_argument("path", help="Chemin du projet Git")
+    sp.add_argument("--debug", action="store_true", help="Afficher les détails du graph (intents, état, temps)")
 
     sp = sub.add_parser("merge-hook", help="Installer/désinstaller le pre-merge hook")
     sp.add_argument("path", help="Chemin du projet Git")
@@ -1382,8 +1470,7 @@ def cmd_serve(args):
         log_level="info",
     )
 
-
-
+    
 def main():
     parser = build_parser()
     args   = parser.parse_args()
@@ -1396,6 +1483,7 @@ def main():
         "git-branch": cmd_git_branch, "hook": cmd_hook,
         # Smart Git Merge
         "resolve-conflicts": cmd_resolve_conflicts,
+        "commit-msg": cmd_commit_msg,
         "merge-hook": cmd_merge_hook,
         # CI/CD Pipeline
         "ci-deploy":  cmd_ci_deploy,

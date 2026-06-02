@@ -25,7 +25,129 @@ from langchain_agents.tools.analysis_tools import (
 )
 from langchain_agents.memory.redis_memory import AgentRedisMemory, AnalysisCacheMemory
 
+import json
+import re as _re
+
 logger = logging.getLogger(__name__)
+
+
+def parse_structured_output(text: str) -> dict:
+    """
+    Extrait et valide le bloc JSON <STRUCTURED_OUTPUT> de la réponse LLM.
+
+    Le LLM est invité (via le prompt) à terminer sa réponse par un bloc :
+        <STRUCTURED_OUTPUT>
+        { "strategy": "...", "strategy_reason": "...", "issues": [...], "fixes": [...] }
+        </STRUCTURED_OUTPUT>
+
+    Si ce bloc est absent ou malformé, retourne un dict vide — les appelants
+    (node_emit_ws_events) reviennent alors aux parseurs regex de fallback.
+
+    Args:
+        text: Texte brut de la réponse LLM (analysis["analysis"]).
+
+    Returns:
+        Dict avec les clés :
+            strategy        (str)  : "full_class" | "targeted_methods" | "block_fix"
+            strategy_reason (str)  : explication courte, max 100 chars
+            issues          (list) : liste de dicts conformes à WSIssueV2
+            fixes           (list) : liste de dicts conformes à WSFixV2
+        Ou {} si le bloc n'est pas trouvé / JSON invalide.
+    """
+    if not text:
+        return {}
+
+    # Chercher le bloc délimité
+    match = _re.search(
+        r"<STRUCTURED_OUTPUT>\s*(.*?)\s*</STRUCTURED_OUTPUT>",
+        text,
+        _re.DOTALL,
+    )
+    if not match:
+        return {}
+
+    raw_json = match.group(1).strip()
+
+    # Retirer les balises de code markdown si présentes : ```json ... ```
+    raw_json = _re.sub(r"^```[a-z]*\s*", "", raw_json)
+    raw_json = _re.sub(r"\s*```$", "", raw_json)
+
+    try:
+        data = json.loads(raw_json)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.debug("parse_structured_output: JSON parse failed: %s", exc)
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    # Normalisation légère — garantit les clés attendues
+    return {
+        "strategy":        str(data.get("strategy", "block_fix")),
+        "strategy_reason": str(data.get("strategy_reason", ""))[:120],
+        "issues":          _normalize_issues(data.get("issues", [])),
+        "fixes":           _normalize_fixes(data.get("fixes", [])),
+    }
+
+
+def _normalize_issues(raw: list) -> list:
+    """Sanitise la liste d'issues pour garantir les types attendus."""
+    if not isinstance(raw, list):
+        return []
+    normalized = []
+    _sev_valid = {"critical", "error", "warning", "info"}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        sev = str(item.get("severity", "warning")).lower()
+        if sev not in _sev_valid:
+            sev = "warning"
+        normalized.append({
+            "title":      str(item.get("title", ""))[:120],
+            "message":    str(item.get("message", item.get("title", "")))[:500],
+            "line":       _safe_int(item.get("line")),
+            "column":     _safe_int(item.get("column")),
+            "end_line":   _safe_int(item.get("end_line")),
+            "end_column": _safe_int(item.get("end_column")),
+            "severity":   sev,
+            "rule":       str(item.get("rule", "code-auditor"))[:80],
+            "suggestion": str(item.get("suggestion", ""))[:300],
+        })
+    return normalized[:20]   # cap at 20 issues
+
+
+def _normalize_fixes(raw: list) -> list:
+    """Sanitise la liste de fixes pour garantir les types attendus."""
+    if not isinstance(raw, list):
+        return []
+    normalized = []
+    _mode_valid = {"replace_snippet", "replace_method", "full_file"}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        mode = str(item.get("apply_mode", "replace_snippet"))
+        if mode not in _mode_valid:
+            mode = "replace_snippet"
+        current = str(item.get("current_code", "")).strip()
+        fixed   = str(item.get("fixed_code",   "")).strip()
+        if not current or not fixed or current == fixed:
+            continue
+        normalized.append({
+            "title":        str(item.get("title", "Suggested fix"))[:160],
+            "explanation":  str(item.get("explanation", ""))[:500],
+            "line":         _safe_int(item.get("line")),
+            "apply_mode":   mode,
+            "current_code": current,
+            "fixed_code":   fixed,
+        })
+    return normalized[:10]   # cap at 10 fixes
+
+
+def _safe_int(value) -> "int | None":
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _build_llm_with_fallback():
@@ -193,6 +315,7 @@ from agents.analysis_agent import (
 __all__ = [
     "LCAnalysisAgent",
     "lc_analysis_agent",
+    "parse_structured_output",
     "parse_llm_response",
     "build_context",
     "build_system_impact_section",

@@ -11,10 +11,9 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Délais de backoff en cas de quota 429 (secondes) - 4 tentatives pour le modèle
+
 _BACKOFF = [10, 30, 60, 120]
 
-# Erreurs qui déclenchent le backoff ou le passage au provider suivant
 _QUOTA_ERRORS = ("429", "RESOURCE_EXHAUSTED", "quota", "RateLimitError", "rate_limit", "503", "524")
 _AUTH_ERRORS  = ("401", "403", "AuthenticationError", "invalid_api_key", "API_KEY_INVALID")
 
@@ -25,54 +24,86 @@ def _is_auth_error(err: str) -> bool:
     return any(k in err for k in _AUTH_ERRORS)
 
 
-# ── HTTP-direct callers (utilisés par invoke_with_fallback UNIQUEMENT) ────────
-# Raison : langchain_openai/langchain_google_genai déclenchent un import
-# PyTorch au chargement → fbgemm.dll manquant sur Windows → crash.
-# Ces 2 fonctions font le même appel REST en urllib stdlib (0 dépendance).
-# Les _build_*_llm() restent intacts pour le multi-agent LangGraph.
 
 def _call_openrouter_http(prompt: str, api_key: str, model: str, max_tokens: int = 2048) -> str:
-    import json, urllib.request
-    payload = json.dumps({
+    import requests
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type":  "application/json",
-            "HTTP-Referer":  "https://github.com/code-auditor",
-            "X-Title":       "Code Auditor",
-        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost",
+        "X-Title": "Code Auditor",
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=(15, 180),
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"OpenRouter HTTP {response.status_code}: {response.text[:1000]}"
+        )
+
+    data = response.json()
     choices = data.get("choices", [])
+
     if not choices:
         raise ValueError(f"OpenRouter: réponse vide — {data}")
+
     return choices[0]["message"]["content"]
 
 
-def _call_gemini_http(prompt: str, api_key: str, model: str = "gemini-2.0-flash", max_tokens: int = 2048) -> str:
-    import json, urllib.request
+def _call_gemini_http(prompt: str, api_key: str, model: str = "gemini-2.5-flash", max_tokens: int = 2048) -> str:
+    import requests
+
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
         f":generateContent?key={api_key}"
     )
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.0},
-    }).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0.0,
+        },
+    }
+
+    response = requests.post(
+        url,
+        json=payload,
+        timeout=(15, 180),
+    )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Gemini HTTP {response.status_code}: {response.text[:1000]}"
+        )
+
+    data = response.json()
     candidates = data.get("candidates", [])
+
     if not candidates:
         raise ValueError(f"Gemini: réponse vide — {data}")
+
     return candidates[0]["content"]["parts"][0]["text"]
 
 

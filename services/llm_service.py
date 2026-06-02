@@ -690,7 +690,52 @@ IF STRATEGY = block_fix:
   **WHY**: [one sentence]
   ---FIX END---
 
+
+═══════════════════════════════════════════════════════════════
+STEP 3 — STRUCTURED OUTPUT (MANDATORY — include after your analysis)
+═══════════════════════════════════════════════════════════════
+After completing your analysis and fix blocks, you MUST append this machine-readable
+summary. Use EXACTLY the markers below — the API parser depends on them.
+
+<STRUCTURED_OUTPUT>
+{{
+  "strategy": "full_class|targeted_methods|block_fix",
+  "strategy_reason": "one sentence max 100 chars explaining why",
+  "issues": [
+    {{
+      "title": "short issue title",
+      "message": "detailed description",
+      "line": <integer or null>,
+      "column": <integer or null>,
+      "end_line": <integer or null>,
+      "severity": "critical|error|warning|info",
+      "rule": "category.rule_name",
+      "suggestion": "how to fix in one sentence"
+    }}
+  ],
+  "fixes": [
+    {{
+      "title": "fix title",
+      "explanation": "why this change is needed",
+      "line": <integer or null>,
+      "apply_mode": "replace_snippet|replace_method|full_file",
+      "current_code": "exact code to replace (copy from CURRENT CODE block)",
+      "fixed_code": "replacement code (copy from FIXED CODE block)"
+    }}
+  ]
+}}
+</STRUCTURED_OUTPUT>
+
+Rules for STRUCTURED_OUTPUT:
+- strategy must match exactly what you chose in ---DECISION---
+- issues must include EVERY problem you reported, one entry per issue
+- fixes must parallel the ---FIX START--- blocks you produced (one-to-one)
+- For full_class strategy: fixes[0].apply_mode = "full_file", current_code = first 3 lines of original class, fixed_code = first 3 lines of your solution
+- All strings must be valid JSON (escape quotes, no raw newlines inside strings — use \\n)
+- If there are no issues, output: "issues": [], "fixes": []
+
 ANALYZE NOW — START WITH ---DECISION---:"""
+
 
         return prompt
 

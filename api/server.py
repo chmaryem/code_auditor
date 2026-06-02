@@ -1,28 +1,35 @@
 """
-api/server.py — Serveur FastAPI pour Code Auditor.
+api/server.py — Code Auditor FastAPI Server (Multi-Agent v8).
 
-Ce serveur expose toute la puissance du moteur d'analyse via :
-  - REST  : endpoints synchrones pour analyse one-shot
-  - WebSocket : streaming temps réel pour le watch mode
+Architecture 100% LangGraph :
+  - WatchGraph    : watch mode (remplace legacy Orchestrator)
+  - SmartGitGraph : git status / branch / conflicts
+  - CIGraph       : CI/CD intelligence
+  - ChatGraph     : conversational agent (Phase 1 + Phase 2)
 
-L'extension VS Code lance ce serveur automatiquement en subprocess
-et communique avec lui via HTTP (REST) et WS (WebSocket).
+Routers :
+  /api/chat/*      → chat_router.py     (ChatGraph)
+  /api/git/*       → git_router.py      (SmartGitGraph)
+  /api/ci/*        → ci_router.py       (CIGraph)
+  /api/watch/*     → watch endpoints    (WatchGraph)
+  /analyze/file    → WatchGraph one-shot
+  /analyze/project → project_analyzer (legacy OK)
+  /ws              → WebSocket watch events
 
 Démarrage :
-    python -m api.server                    # port par défaut : 8765
-    python -m api.server --port 9000        # port custom
-    python -m api.server --project /path    # projet par défaut
+    python -m api.server
+    python -m api.server --port 9000 --project /path/to/project
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import sys
-import time
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,187 +47,309 @@ from api.models import (
     GenerateTestsResponse,
     HealthResponse,
     WSEvent,
+    IssueDiagnostic,
+    FixSuggestion,
 )
 from api.websocket_manager import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
-# ── État global du serveur ────────────────────────────────────────────────────
-# L'orchestrateur et le watcher sont partagés entre les requêtes.
-# Ils sont initialisés au démarrage dans le lifespan.
+# ── Shared state ──────────────────────────────────────────────────────────────
 
-_orchestrator = None
-_file_watcher = None
-_ws_manager = ConnectionManager()
+_ws_manager       = ConnectionManager()
 _server_start_time: float = 0.0
-_default_project: Path = Path(".")
+_default_project: Path    = Path(".")
+
+# Multi-agent shared services (injected at startup)
+_watch_services: Dict[str, Any] = {}   # project_indexer, extractor, rag_system, dep_graph
+_watch_active: Dict[str, Any]   = {}   # project_path → {thread, counter, timers, lock}
+_watch_last_events: Dict[str, Any] = {}  # project_path → latest ws_events snapshot
+
+# Main asyncio event loop — captured at startup so background threads can broadcast
+_main_loop: asyncio.AbstractEventLoop | None = None
 
 
-# ── Lifespan (startup / shutdown) ────────────────────────────────────────────
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Initialise l'orchestrateur au démarrage du serveur.
-    L'extension VS Code peut ensuite envoyer des requêtes immédiatement.
+    Startup : initialize multi-agent services in background.
+    Shutdown : stop watchers + learning agent.
     """
-    global _orchestrator, _server_start_time
+    global _server_start_time, _watch_services, _main_loop
+
+    # Capture the running asyncio event loop BEFORE any background threads start
+    _main_loop = asyncio.get_running_loop()
 
     _server_start_time = time.time()
-    logger.info("Démarrage du serveur Code Auditor API...")
+    logger.info("Code Auditor API v8 — démarrage (multi-agent mode)")
 
-    # Initialisation de l'orchestrateur dans un thread séparé
-    # (l'initialisation est lourde : embeddings, ChromaDB, Redis MCP)
-    from core.orchestrator import Orchestrator
+    def _init_services():
+        """Background init — heavy services (embeddings, ChromaDB, dep graph)."""
+        global _watch_services
 
-    def _on_result_callback(result: dict):
-        """Callback appelé quand le watch mode produit un résultat."""
-        asyncio.run_coroutine_threadsafe(
-            _ws_manager.broadcast({
-                "type": "analysis_result",
-                "data": result,
-            }),
-            asyncio.get_event_loop(),
-        )
+        services: Dict[str, Any] = {}
 
-    _orchestrator = Orchestrator(
-        project_path=_default_project,
-        on_result=_on_result_callback,
-    )
+        # RAG system
+        try:
+            from services.llm_service import CodeRAGSystemAPI
+            services["rag_system"] = CodeRAGSystemAPI()
+            logger.info("RAG system initialisé")
+        except Exception as e:
+            logger.warning("RAG system init failed: %s", e)
 
-    # Initialisation dans un thread (bloquant, ~10-30s)
-    init_thread = threading.Thread(target=_orchestrator.initialize, daemon=True)
-    init_thread.start()
+        # Project Indexer
+        try:
+            from services.project_indexer import get_project_index
+            services["project_indexer"] = get_project_index(_default_project)
+            logger.info("ProjectIndexer initialisé")
+        except Exception as e:
+            logger.warning("ProjectIndexer init failed: %s", e)
 
-    logger.info("Orchestrateur en cours d'initialisation (background)...")
+        # Dependency graph
+        try:
+            from services.graph_service import dependency_builder, DependencyExtractor
+            dep_graph = dependency_builder.build_from_project(_default_project)
+            services["dep_graph"]  = dep_graph
+            services["extractor"] = DependencyExtractor(dep_graph)
+            logger.info("DependencyGraph: %d nœuds", dep_graph.number_of_nodes())
+        except Exception as e:
+            logger.warning("DependencyGraph init failed: %s", e)
+
+        # Knowledge Graph
+        try:
+            from services.knowledge_graph import knowledge_graph
+            if not knowledge_graph._built:
+                knowledge_graph.build(project_indexer=services.get("project_indexer"))
+            logger.info("KnowledgeGraph initialisé")
+        except Exception as e:
+            logger.warning("KnowledgeGraph init failed: %s", e)
+
+        # RetrieverAgent
+        try:
+            from agents.retriever_agent import retriever_agent
+            from services.knowledge_graph import knowledge_graph as kg
+            rag = services.get("rag_system")
+            retriever_agent.initialize(
+                graph=services.get("dep_graph"),
+                project_indexer=services.get("project_indexer"),
+                vector_store=rag.vector_store if rag else None,
+                project_code_indexer=services.get("project_indexer"),
+                knowledge_graph=kg if kg._built else None,
+            )
+        except Exception as e:
+            logger.warning("RetrieverAgent init failed: %s", e)
+
+        # LearningAgent
+        try:
+            from agents.learning_agent import learning_agent as la
+            rag = services.get("rag_system")
+            from config import config
+            la.initialize(
+                llm=rag._llm if rag else None,
+                vector_store=rag.vector_store if rag else None,
+                kb_dir=config.KNOWLEDGE_BASE_DIR,
+            )
+            la.start()
+        except Exception as e:
+            logger.warning("LearningAgent init failed: %s", e)
+
+        _watch_services = services
+        logger.info("Services multi-agents initialisés (%d)", len(services))
+
+    threading.Thread(target=_init_services, daemon=True).start()
 
     yield
 
-    # Shutdown
+    # ── Shutdown ──────────────────────────────────────────────────────────────
     logger.info("Arrêt du serveur...")
-    if _file_watcher:
-        _file_watcher.stop()
-    if _orchestrator:
-        _orchestrator.stop()
+
+    # Stop active watchers
+    for _proj, ctx in list(_watch_active.items()):
+        watcher = ctx.get("watcher")
+        if watcher:
+            try:
+                watcher.stop()
+            except Exception:
+                pass
+        for t in ctx.get("timers", {}).values():
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    # Stop LearningAgent
+    try:
+        from agents.learning_agent import learning_agent as la
+        la.stop()
+    except Exception:
+        pass
 
 
-# ── App FastAPI ───────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Code Auditor API",
-    description="API REST + WebSocket pour l'analyse intelligente de code",
-    version="7.0.0",
+    description="REST + WebSocket — 100% multi-agent LangGraph architecture",
+    version="8.0.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # VS Code extension
+    # Restricted to local origins only — never wildcard in production.
+    # VS Code extension host (Node.js) does not send an Origin header for
+    # WebSocket connections, so this restriction only affects webview fetch calls.
+    allow_origins=[
+        "http://localhost:8765",
+        "http://localhost:8000",
+        "http://127.0.0.1:8765",
+        "http://127.0.0.1:8000",
+    ],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# ── Chat Agent router (Phase 1 + Phase 2) ─────────────────────────────────────
-from api.chat_router import chat_router          # noqa: E402
-app.include_router(chat_router, prefix="/api")
+# ── Routers ───────────────────────────────────────────────────────────────────
+from api.chat_router        import chat_router          # noqa: E402
+from api.git_router         import git_router           # noqa: E402
+from api.ci_router          import ci_router            # noqa: E402
+from api.diagnostics_router import diagnostics_router, feedback_router  # noqa: E402
+from api.code_actions_router import code_actions_router  # noqa: E402
+from api.mcp_router         import mcp_router            # noqa: E402
+
+app.include_router(chat_router,        prefix="/api")
+app.include_router(git_router,         prefix="/api")
+app.include_router(ci_router,          prefix="/api")
+app.include_router(diagnostics_router, prefix="/api")
+app.include_router(feedback_router,    prefix="/api")
+app.include_router(code_actions_router, prefix="/api")
+app.include_router(mcp_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# REST Endpoints
+# Health
 # ══════════════════════════════════════════════════════════════════════════════
-
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """
-    Health check — appelé par l'extension VS Code pour savoir
-    quand le serveur est prêt à recevoir des requêtes.
-
-    Services vérifiés :
-      - orchestrator : pipeline d'analyse initialisé
-      - redis        : cache MCP connecté
-      - chromadb     : vector store chargé
-    """
-    orch_ready = _orchestrator is not None and _orchestrator._is_running or (
-        hasattr(_orchestrator, "_analysis_agent") and _orchestrator._analysis_agent
-    )
-
-    services = {
-        "orchestrator": bool(orch_ready),
-        "redis": False,
-        "chromadb": False,
+    services_ready = {
+        "rag_system":       "rag_system"       in _watch_services,
+        "project_indexer":  "project_indexer"  in _watch_services,
+        "dep_graph":        "dep_graph"         in _watch_services,
+        "watch_active":     len(_watch_active) > 0,
     }
 
-    # Vérifier Redis
-    if _orchestrator and _orchestrator._cache:
-        try:
-            services["redis"] = True
-        except Exception:
-            pass
+    redis_ok = False
+    try:
+        from services.mcp_redis_service import get_mcp_redis
+        get_mcp_redis().ping()
+        redis_ok = True
+    except Exception:
+        pass
 
-    # Vérifier ChromaDB
-    if orch_ready:
-        try:
-            services["chromadb"] = True
-        except Exception:
-            pass
-
-    uptime = round(time.time() - _server_start_time, 1) if _server_start_time else 0
+    services_ready["redis"] = redis_ok
+    ready = services_ready["rag_system"]
 
     return HealthResponse(
-        status="ready" if orch_ready else "initializing",
-        version="7.0.0",
-        services={**services, "uptime_seconds": uptime},
+        status="ready" if ready else "initializing",
+        version="8.0.0",
+        services={
+            **services_ready,
+            "uptime_seconds": round(time.time() - _server_start_time, 1),
+            "watch_projects": list(_watch_active.keys()),
+        },
     )
 
 
-# ── Analyse de fichier ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Analyze File (WatchGraph one-shot)
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/analyze/file", response_model=AnalysisResultResponse)
 async def analyze_file(req: AnalyzeFileRequest):
     """
-    Analyse un fichier unique avec le pipeline complet :
-    Parse AST → RAG retrieval → LLM analysis → JSON structuré.
-
-    C'est l'équivalent API de `python main.py file <path>`.
+    Analyse un fichier unique via le WatchGraph (pipeline complet).
+    Remplace l'ancien endpoint basé sur le legacy Orchestrator.
     """
-    if not _orchestrator:
-        raise HTTPException(503, "Serveur en cours d'initialisation")
-
     file_path = Path(req.file_path)
     if not file_path.exists():
         raise HTTPException(404, f"Fichier introuvable : {file_path}")
 
-    if not file_path.is_file():
-        raise HTTPException(400, f"Ce n'est pas un fichier : {file_path}")
+    project_path = Path(req.project_path).resolve() if req.project_path else file_path.parent
 
-    # Exécuter l'analyse dans un thread (le pipeline LLM est bloquant)
     try:
+        from langchain_agents.graphs.watch_graph import invoke_watch
         result = await asyncio.to_thread(
-            _orchestrator.analyze_single, file_path
+            invoke_watch,
+            file_path=str(file_path),
+            project_path=str(project_path),
+            project_indexer=_watch_services.get("project_indexer"),
+            extractor=_watch_services.get("extractor"),
+            rag_system=_watch_services.get("rag_system"),
+            dep_graph=_watch_services.get("dep_graph"),
         )
     except Exception as e:
-        logger.exception("Erreur analyse %s", file_path)
-        raise HTTPException(500, f"Erreur d'analyse : {e}")
+        logger.exception("analyze_file error: %s", e)
+        raise HTTPException(500, f"Erreur WatchGraph : {e}")
 
-    return result
+    language = result.get("language", "unknown")
+    strategy = result.get("strategy", "block_fix")
+    elapsed  = result.get("stats", {}).get("elapsed", 0.0)
+
+    # Map structured issues from node_emit_ws_events (v2.0) → IssueDiagnostic
+    raw_issues = result.get("issues") or []
+    issues = [
+        IssueDiagnostic(
+            severity=i.get("severity", "warning"),
+            message=i.get("message", i.get("title", "")),
+            line=i.get("line"),
+            column=i.get("column"),
+            source="code-auditor",
+            code_snippet="",
+            suggestion=i.get("suggestion", ""),
+        )
+        for i in raw_issues
+    ]
+
+    # Extract fixes from ws_events (built by node_emit_ws_events v2.0)
+    # Bug fix: was hardcoded to fixes=[] — fixes are now included in the response.
+    ws_events = result.get("ws_events") or []
+    ar_event  = next((e for e in ws_events if e.get("type") == "analysis_result"), {})
+    raw_fixes = ar_event.get("fixes") or []
+    fixes = [
+        FixSuggestion(
+            location=str(f.get("title", f.get("file", ""))),
+            current_code=str(f.get("current_code", ""))[:500],
+            fixed_code=str(f.get("fixed_code", ""))[:500],
+            explanation=str(f.get("explanation", "")),
+        )
+        for f in raw_fixes[:5]
+    ]
+
+    return AnalysisResultResponse(
+        file_path=str(file_path),
+        language=language,
+        score=int(result.get("change_info", {}).get("score", 0)),
+        strategy=strategy,
+        issues=issues,
+        fixes=fixes,
+        elapsed_seconds=elapsed,
+        rag_docs_used=len(result.get("rag_docs", [])),
+        raw_analysis="",  # omit raw LLM text — use WS events instead
+    )
 
 
-# ── Analyse de projet ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Analyze Project
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/analyze/project", response_model=ProjectAnalysisResponse)
 async def analyze_project(req: AnalyzeProjectRequest):
-    """
-    Analyse architecturale d'un projet complet.
-    Identifie les fichiers critiques, les dépendances circulaires,
-    les modules orphelins, et génère un plan de refactoring.
-
-    Équivalent API de `python main.py project <path>`.
-    """
-    if not _orchestrator:
-        raise HTTPException(503, "Serveur en cours d'initialisation")
-
+    """Analyse architecturale d'un projet complet."""
     project_path = Path(req.project_path)
     if not project_path.exists():
         raise HTTPException(404, f"Projet introuvable : {project_path}")
@@ -233,12 +362,10 @@ async def analyze_project(req: AnalyzeProjectRequest):
             req.max_files,
         )
     except Exception as e:
-        logger.exception("Erreur analyse projet %s", project_path)
+        logger.exception("analyze_project error")
         raise HTTPException(500, f"Erreur : {e}")
 
-    # Convertir le résultat interne en format API
     structure = result.get("structure_analysis", {})
-
     return ProjectAnalysisResponse(
         project_path=str(project_path),
         files_analyzed=len(result.get("file_analyses", {})),
@@ -250,194 +377,316 @@ async def analyze_project(req: AnalyzeProjectRequest):
     )
 
 
-# ── Watch Mode ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Watch Mode — WatchGraph
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/watch/start")
 async def watch_start(req: WatchStartRequest):
     """
-    Démarre la surveillance en temps réel d'un projet.
-    Les résultats sont envoyés via WebSocket à tous les clients connectés.
-
-    Équivalent API de `python main.py watch <path>`.
+    Démarre la surveillance en temps réel via WatchGraph.
+    Les événements sont broadcastés via WebSocket.
     """
-    global _file_watcher
+    project_path = Path(req.project_path).resolve()
+    proj_key     = str(project_path)
 
-    if not _orchestrator:
-        raise HTTPException(503, "Serveur en cours d'initialisation")
-
-    if _file_watcher and _file_watcher.is_running:
-        return {"status": "already_running", "project_path": str(_file_watcher.project_path)}
-
-    project_path = Path(req.project_path)
     if not project_path.exists():
         raise HTTPException(404, f"Projet introuvable : {project_path}")
 
+    if proj_key in _watch_active:
+        return {"status": "already_running", "project_path": proj_key}
+
+    from langchain_agents.graphs.watch_graph import invoke_watch
     from watchers.file_watcher import FileWatcher
 
-    def on_file_change(file_path: Path, deleted: bool = False):
-        """Callback du watcher — déclenche l'analyse via l'orchestrateur."""
-        if deleted:
-            return
-        _orchestrator.handle(
-            __import__("core.events", fromlist=["file_changed_event"]).file_changed_event(file_path)
+    print_lock   = threading.Lock()
+    file_counter = {"analyzed": 0, "skipped": 0, "skipped_hash": 0, "skipped_minor": 0}
+    pending_timers: Dict[str, Any] = {}
+    pending_lock = threading.Lock()
+    COALESCE_DELAY = 0.8
+
+    def _debounced(fp: Path):
+        with pending_lock:
+            pending_timers.pop(str(fp), None)
+
+        result = invoke_watch(
+            file_path=str(fp),
+            project_path=proj_key,
+            project_indexer=_watch_services.get("project_indexer"),
+            extractor=_watch_services.get("extractor"),
+            rag_system=_watch_services.get("rag_system"),
+            dep_graph=_watch_services.get("dep_graph"),
+            print_lock=print_lock,
+            file_counter=file_counter,
         )
 
-    _file_watcher = FileWatcher(
-        project_path=project_path,
-        callback=on_file_change,
-    )
+        # ── Broadcast all WebSocket events built by node_emit_ws_events ────────
+        ws_events = result.get("ws_events") or []
 
-    # Démarrer dans un thread pour ne pas bloquer FastAPI
-    threading.Thread(target=_file_watcher.start, daemon=True).start()
+        # Use the pre-captured main event loop — safe to call from any thread
+        loop = _main_loop
+        if loop is None or not loop.is_running():
+            logger.warning("_debounced: main event loop unavailable, WS broadcast skipped")
+            return
 
-    return {"status": "started", "project_path": str(project_path)}
+        if ws_events:
+            # Store latest snapshot for TreeView initialisation
+            _watch_last_events[proj_key] = {
+                "file_path": str(fp),
+                "timestamp": time.time(),
+                "events":    ws_events,
+            }
+            for event in ws_events:
+                asyncio.run_coroutine_threadsafe(
+                    _ws_manager.broadcast(event),
+                    loop,
+                )
+        else:
+            # Fallback: always send at least a basic watch_event
+            analysis = result.get("analysis", {})
+            raw_text  = analysis.get("analysis", "") if isinstance(analysis, dict) else ""
+            asyncio.run_coroutine_threadsafe(
+                _ws_manager.broadcast({
+                    "type":        "watch_event",
+                    "file_path":   str(fp),
+                    "file":        fp.name,
+                    "strategy":    result.get("strategy", "block_fix"),
+                    "language":    result.get("language", "?"),
+                    "skip_reason": result.get("skip_reason"),
+                    "raw_analysis": raw_text[:2000],
+                }),
+                loop,
+            )
+
+        # diagnostics_update removed (schema v2.0):
+        # The analysis_result event (schema_version=2.0) already includes issues[]
+        # with full diagnostic data (line, column, end_line, severity, rule, suggestion).
+        # WatchController.ts routes analysis_result → applyDiagnostics() directly,
+        # making this separate broadcast redundant and costly (double WS message).
+
+        if result.get("skip_reason"):
+            file_counter["skipped"] += 1
+
+    def on_change(fp: Path, deleted: bool = False):
+        logger.info("[WATCH DEBUG] on_change called: %s deleted=%s", fp, deleted)
+
+        if deleted:
+            loop = _main_loop
+            if loop is None or not loop.is_running():
+                logger.warning("on_change deleted: main event loop unavailable, WS broadcast skipped")
+                return
+
+            asyncio.run_coroutine_threadsafe(
+                _ws_manager.broadcast({
+                    "type": "file_deleted",
+                    "file": fp.name,
+                    "file_path": str(fp),
+                }),
+                loop,
+            )
+            return
+
+        fp_key = str(fp)
+
+        with pending_lock:
+            old = pending_timers.get(fp_key)
+            if old:
+                old.cancel()
+
+            t = threading.Timer(COALESCE_DELAY, _debounced, args=[fp])
+            t.daemon = True
+            pending_timers[fp_key] = t
+            t.start()
+
+    try:
+        watcher = FileWatcher(project_path=project_path, callback=on_change)
+
+        watch_method = getattr(watcher, "watch", None) or getattr(watcher, "start", None)
+        if watch_method is None:
+            raise RuntimeError("FileWatcher has no watch() or start() method")
+
+        t = threading.Thread(target=watch_method, daemon=True)
+        t.start()
+
+        _watch_active[proj_key] = {
+            "watcher":  watcher,
+            "thread":   t,
+            "counter":  file_counter,
+            "timers":   pending_timers,
+            "lock":     pending_lock,
+            "started":  time.time(),
+        }
+
+        logger.info("Watch started for project: %s", proj_key)
+        return {"status": "started", "project_path": proj_key}
+
+    except Exception as e:
+        logger.exception("watch_start failed for project %s: %s", proj_key, e)
+        raise HTTPException(500, f"watch_start failed: {type(e).__name__}: {e}")
 
 
 @app.post("/watch/stop")
-async def watch_stop():
-    """Arrête la surveillance en temps réel."""
-    global _file_watcher
-
-    if not _file_watcher or not _file_watcher.is_running:
+async def watch_stop(req: WatchStartRequest):
+    """Arrête la surveillance d'un projet."""
+    proj_key = str(Path(req.project_path).resolve())
+    ctx = _watch_active.pop(proj_key, None)
+    if not ctx:
         return {"status": "not_running"}
 
-    _file_watcher.stop()
-    return {"status": "stopped", "files_processed": _file_watcher.files_processed}
+    try:
+        ctx["watcher"].stop()
+    except Exception:
+        pass
+    for t in ctx.get("timers", {}).values():
+        try:
+            t.cancel()
+        except Exception:
+            pass
+
+    return {"status": "stopped", "files_analyzed": ctx["counter"].get("analyzed", 0)}
 
 
 @app.get("/watch/status", response_model=WatchStatusResponse)
 async def watch_status():
-    """Retourne l'état actuel du watcher."""
-    if not _file_watcher:
+    """État de tous les watchers actifs."""
+    if not _watch_active:
         return WatchStatusResponse(is_running=False)
 
+    total = sum(c["counter"].get("analyzed", 0) for c in _watch_active.values())
+    first_proj = next(iter(_watch_active))
+
     return WatchStatusResponse(
-        is_running=_file_watcher.is_running,
-        project_path=str(_file_watcher.project_path),
-        files_processed=_file_watcher.files_processed,
-        stats=_orchestrator.get_stats_dict() if _orchestrator else {},
+        is_running=True,
+        project_path=first_proj,
+        files_processed=total,
+        stats={
+            "projects":  list(_watch_active.keys()),
+            "counters":  {p: c["counter"] for p, c in _watch_active.items()},
+        },
     )
 
 
-# ── Git Intelligence ──────────────────────────────────────────────────────────
-
-@app.post("/git/status")
-async def git_status(req: GitStatusRequest):
+@app.get("/watch/events/latest")
+async def watch_events_latest(project_path: str = ""):
     """
-    Retourne le statut de session Git (bugs accumulés, score).
-    Équivalent API de `python main.py git-status <path>`.
+    Retourne le dernier snapshot d'événements WS pour un projet.
+    Utilisé par le plugin VS Code pour initialiser la TreeView au démarrage.
+
+    Query param: ?project_path=C:/path/to/project  (optionnel)
     """
-    project_path = Path(req.project_path)
-    if not project_path.exists():
-        raise HTTPException(404, f"Projet introuvable : {project_path}")
+    if project_path:
+        key = str(Path(project_path).resolve())
+        snapshot = _watch_last_events.get(key)
+        if not snapshot:
+            return {"events": [], "project_path": key, "has_data": False}
+        return {**snapshot, "has_data": True}
 
-    try:
-        from smart_git.git_session_tracker import GitSessionTracker
-        tracker = GitSessionTracker(project_path)
-        status = await asyncio.to_thread(tracker.get_session_status)
-        return status
-    except ImportError:
-        raise HTTPException(501, "Module smart_git non disponible")
-    except Exception as e:
-        raise HTTPException(500, f"Erreur git status : {e}")
+    # No project specified → return latest across all projects
+    if not _watch_last_events:
+        return {"events": [], "has_data": False}
 
-
-@app.post("/git/branch")
-async def git_branch(req: GitBranchRequest):
-    """
-    Analyse une branche Git vs sa base et retourne un verdict de merge.
-    Équivalent API de `python main.py git-branch <branch> --base <main>`.
-    """
-    project_path = Path(req.project_path)
-    if not project_path.exists():
-        raise HTTPException(404, f"Projet introuvable : {project_path}")
-
-    try:
-        from smart_git.git_branch_analyzer import BranchAnalyzer
-        analyzer = BranchAnalyzer(project_path)
-        result = await asyncio.to_thread(
-            analyzer.analyze_branch, req.branch, req.base
-        )
-        return result
-    except ImportError:
-        raise HTTPException(501, "Module smart_git non disponible")
-    except Exception as e:
-        raise HTTPException(500, f"Erreur branch analysis : {e}")
+    latest = max(_watch_last_events.values(), key=lambda s: s["timestamp"])
+    return {**latest, "has_data": True}
 
 
-# ── Generate Tests ────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Generate Tests
+# ══════════════════════════════════════════════════════════════════════════════
 @app.post("/generate-tests", response_model=GenerateTestsResponse)
 async def generate_tests(req: GenerateTestsRequest):
-    """
-    Génère des tests unitaires pour un fichier source.
-    Utilise le pipeline RAG + TestGeneratorAgent.
-
-    Équivalent API de `python main.py generate-tests <path>`.
-    """
+    """Génère des tests unitaires via TestGeneratorAgent (RAG)."""
     file_path = Path(req.file_path)
+
     if not file_path.exists():
         raise HTTPException(404, f"Fichier introuvable : {file_path}")
 
     try:
-        from agents.test_generator_agent import test_generator_agent
+        from agents.test_generator_agent import TestGeneratorAgent
+
+        project_path = Path(req.project_path).resolve() if req.project_path else file_path.parent
+        agent = TestGeneratorAgent(project_path=project_path)
+
         result = await asyncio.to_thread(
-            test_generator_agent.generate_tests,
+            agent.generate_for_file,
             file_path,
-            Path(req.project_path) if req.project_path else file_path.parent,
             req.write,
         )
+
+        if not isinstance(result, dict):
+            logger.warning("generate_tests returned non-dict result: %r", result)
+            result = {
+                "error": "Le générateur de tests a retourné une réponse invalide.",
+                "test_file": "",
+                "test_code": "",
+                "framework": "",
+                "rag_docs_used": 0,
+                "validated": False,
+            }
+
+        test_file = result.get("test_file")
+        test_code = result.get("test_code")
+        framework = result.get("framework")
+        rag_docs_used = result.get("rag_docs_used")
+        validated = result.get("validated")
+        error = result.get("error")
+
         return GenerateTestsResponse(
-            test_file=str(result.get("test_file", "")),
-            test_code=result.get("test_code", ""),
-            framework=result.get("framework", ""),
-            rag_docs_used=result.get("rag_docs_used", 0),
-            validated=result.get("validated", False),
+            test_file=str(test_file or ""),
+            test_code=str(test_code or ""),
+            framework=str(framework or ""),
+            rag_docs_used=int(rag_docs_used or 0),
+            validated=bool(validated or False),
+            error=str(error or ""),
         )
-    except ImportError:
-        raise HTTPException(501, "Module test_generator non disponible")
+
+    except HTTPException:
+        raise
+
     except Exception as e:
-        logger.exception("Erreur generate-tests %s", file_path)
-        raise HTTPException(500, f"Erreur : {e}")
+        logger.exception("generate_tests error")
 
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur génération tests : {type(e).__name__}: {e}",
+        )
 
-# ── Stats ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Stats
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/stats")
 async def get_stats():
-    """Retourne les statistiques du serveur et du moteur d'analyse."""
-    stats = _orchestrator.get_stats_dict() if _orchestrator else {}
+    total_analyzed = sum(c["counter"].get("analyzed", 0) for c in _watch_active.values())
+    total_skipped  = sum(c["counter"].get("skipped",  0) for c in _watch_active.values())
     return {
         "server": {
             "uptime_seconds": round(time.time() - _server_start_time, 1),
-            "ws_clients": _ws_manager.active_count,
-            "watcher_running": _file_watcher.is_running if _file_watcher else False,
+            "version":        "8.0.0",
+            "ws_clients":     _ws_manager.active_count,
+            "watch_projects": len(_watch_active),
         },
-        "engine": stats,
-        "results_cached": len(_orchestrator.get_all_results()) if _orchestrator else 0,
+        "watch": {
+            "total_analyzed": total_analyzed,
+            "total_skipped":  total_skipped,
+            "projects":       list(_watch_active.keys()),
+        },
+        "services": {k: True for k in _watch_services},
     }
 
 
-# ── Résultats stockés ────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Legacy Compat — /results stub
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/results")
-async def get_all_results():
-    """Retourne tous les résultats d'analyse stockés en mémoire."""
-    if not _orchestrator:
-        return {}
-    return _orchestrator.get_all_results()
-
-
-@app.get("/results/{file_path:path}")
-async def get_file_result(file_path: str):
-    """Retourne le dernier résultat d'analyse pour un fichier spécifique."""
-    if not _orchestrator:
-        raise HTTPException(503, "Serveur non initialisé")
-
-    result = _orchestrator.get_last_result(Path(file_path))
-    if not result:
-        raise HTTPException(404, f"Aucun résultat pour : {file_path}")
-    return result
+async def get_results_legacy():
+    """
+    Legacy endpoint kept for plugin backward compatibility.
+    The new plugin should use GET /watch/events/latest instead.
+    Returns an empty dict so the plugin doesn't get a 404.
+    """
+    return {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -447,90 +696,89 @@ async def get_file_result(file_path: str):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    Point de connexion WebSocket pour le streaming temps réel.
+    WebSocket pour events temps réel (watch + CI + git alerts).
 
-    L'extension VS Code se connecte ici pour recevoir :
-      - analysis_result : résultats du watch mode en temps réel
-      - progress        : progression de l'initialisation
-      - error           : erreurs du pipeline
+    Client → serveur :
+      {"type": "ping"}
+      {"type": "analyze_file", "file_path": "..."}
 
-    Le client peut envoyer :
-      - {"type": "ping"}                           → pong
-      - {"type": "analyze", "file_path": "..."}    → lance une analyse
-      - {"type": "subscribe", "events": [...]}     → filtre les événements
+    Serveur → client :
+      {"type": "watch_event", "file": "...", "strategy": "..."}
+      {"type": "file_deleted", "file": "..."}
+      {"type": "ci_event", ...}
     """
     await _ws_manager.connect(websocket)
-
     try:
-        # Envoyer le statut initial
         await _ws_manager.send_to(websocket, {
-            "type": "connected",
-            "data": {
-                "server_version": "7.0.0",
-                "ws_clients": _ws_manager.active_count,
-            },
+            "type":    "connected",
+            "version": "8.0.0",
+            "clients": _ws_manager.active_count,
         })
 
         while True:
-            data = await websocket.receive_json()
+            data     = await websocket.receive_json()
             msg_type = data.get("type", "")
 
             if msg_type == "ping":
                 await _ws_manager.send_to(websocket, {"type": "pong"})
 
-            elif msg_type == "analyze":
-                # Analyse à la demande via WebSocket
-                file_path = data.get("file_path")
-                if file_path and _orchestrator:
-                    result = await asyncio.to_thread(
-                        _orchestrator.analyze_single, Path(file_path)
-                    )
-                    await _ws_manager.send_to(websocket, {
-                        "type": "analysis_result",
-                        "data": result,
-                    })
+            elif msg_type == "analyze_file":
+                fp = data.get("file_path", "")
+                if fp:
+                    try:
+                        from langchain_agents.graphs.watch_graph import invoke_watch
+                        result = await asyncio.to_thread(
+                            invoke_watch,
+                            file_path=fp,
+                            project_path=data.get("project_path", "."),
+                            project_indexer=_watch_services.get("project_indexer"),
+                            extractor=_watch_services.get("extractor"),
+                        )
+                        await _ws_manager.send_to(websocket, {
+                            "type":     "analysis_result",
+                            "file":     Path(fp).name,
+                            "strategy": result.get("strategy", "?"),
+                            "skipped":  bool(result.get("skip_reason")),
+                        })
+                    except Exception as e:
+                        await _ws_manager.send_to(websocket, {"type": "error", "detail": str(e)})
                 else:
-                    await _ws_manager.send_to(websocket, {
-                        "type": "error",
-                        "data": {"message": "file_path requis ou serveur non prêt"},
-                    })
+                    await _ws_manager.send_to(websocket, {"type": "error", "detail": "file_path requis"})
 
             else:
-                await _ws_manager.send_to(websocket, {
-                    "type": "error",
-                    "data": {"message": f"Type inconnu: {msg_type}"},
-                })
+                await _ws_manager.send_to(websocket, {"type": "error", "detail": f"Type inconnu: {msg_type}"})
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.debug("WebSocket erreur: %s", e)
+        logger.debug("WebSocket error: %s", e)
     finally:
         await _ws_manager.disconnect(websocket)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI entry point
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """Lance le serveur uvicorn avec les options CLI."""
     import argparse
+    import uvicorn
 
-    parser = argparse.ArgumentParser(description="Code Auditor API Server")
-    parser.add_argument("--host", default="127.0.0.1", help="Adresse d'écoute")
-    parser.add_argument("--port", type=int, default=8765, help="Port d'écoute")
-    parser.add_argument("--project", default=".", help="Projet par défaut")
-    parser.add_argument("--reload", action="store_true", help="Hot reload (dev)")
+    parser = argparse.ArgumentParser(description="Code Auditor API Server v8")
+    parser.add_argument("--host",    default="127.0.0.1")
+    parser.add_argument("--port",    type=int, default=8765)
+    parser.add_argument("--project", default=".")
+    parser.add_argument("--reload",  action="store_true")
     args = parser.parse_args()
 
     global _default_project
     _default_project = Path(args.project).resolve()
 
-    # Configurer le logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    import uvicorn
     uvicorn.run(
         "api.server:app",
         host=args.host,

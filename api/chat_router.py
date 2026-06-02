@@ -1,28 +1,34 @@
 """
-api/chat_router.py — FastAPI router for ChatAgent (Phase 1 + Phase 2).
+api/chat_router.py — FastAPI router for ChatAgent.
 
 Endpoints:
-  POST /chat              — Q&A / explain (Phase 1)
-  POST /chat/complete     — Complete a function body (Phase 2)
-  POST /chat/generate     — Generate a new class/file (Phase 2)
-  GET  /chat/history/{id} — Load session conversation history
-  DELETE /chat/history/{id} — Clear session history
+  POST /chat                 — Q&A / explain
+  POST /chat/stream          — Q&A / explain streaming via SSE
+  POST /chat/complete        — Complete a function body
+  POST /chat/generate        — Generate a new class/file
+  GET  /chat/history/{id}    — Load session conversation history
+  DELETE /chat/history/{id}  — Clear session history
 
-All endpoints delegate to invoke_chat() from chat_graph.py.
-The VS Code extension plugin calls these endpoints from the Chat Webview panel.
-
-Usage (standalone):
+Usage:
     from api.chat_router import chat_router
     app.include_router(chat_router, prefix="/api")
+
+Final URL examples:
+    POST /api/chat
+    POST /api/chat/stream
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -33,62 +39,52 @@ chat_router = APIRouter(prefix="/chat", tags=["ChatAgent"])
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    """Phase 1 — Q&A / explain request."""
-    message: str = Field(..., description="Developer question or request")
-    project_path: str = Field(".", description="Project root (absolute or relative)")
-    session_id: str = Field("", description="Session ID for conversation continuity")
-    target_file: str = Field("", description="Optional file to focus on (path or filename)")
+    """Q&A / explain request."""
+    message:         str = Field(..., description="Developer question or request")
+    project_path:    str = Field(".", description="Project root (absolute or relative)")
+    session_id:      str = Field("", description="Session ID for conversation continuity")
+    target_file:     str = Field("", description="Optional file to focus on (path or filename)")
+    # IDE cursor context (sent by VS Code extension)
+    cursor_line:     int = Field(0,  description="Line number under cursor (0 = unknown)")
+    active_function: str = Field("", description="Function/method name under cursor")
+    selected_text:   str = Field("", description="Currently selected code (empty if none)")
+    visible_range:   list[int] = Field(default_factory=lambda: [0, 0],
+                                       description="[start_line, end_line] of visible editor area")
 
 
 class CompletionRequest(BaseModel):
-    """Phase 2 — Function completion request."""
-    function_name: str = Field(
-        ..., description="Name of the function to complete, e.g. 'findByEmail'"
-    )
-    file_path: str = Field(
-        "", description="File containing the function, e.g. 'services/user_service.py'"
-    )
+    """Function completion request."""
+    function_name: str = Field(..., description="Name of the function to complete")
+    file_path: str = Field("", description="File containing the function")
     project_path: str = Field(".", description="Project root")
     session_id: str = Field("", description="Session ID")
-    language: str = Field("", description="Language override (java|python|javascript|typescript)")
+    language: str = Field("", description="Language override")
 
 
 class GenerateClassRequest(BaseModel):
-    """Phase 2 — New class/file generation request."""
-    class_name: str = Field(
-        ..., description="PascalCase class name to generate, e.g. 'NotificationService'"
-    )
+    """New class/file generation request."""
+    class_name: str = Field(..., description="PascalCase class name to generate")
     language: str = Field("python", description="Target language")
     project_path: str = Field(".", description="Project root")
     session_id: str = Field("", description="Session ID")
-    description: str = Field(
-        "", description="Optional natural language description of what the class should do"
-    )
-    write_to_disk: bool = Field(
-        False, description="If true, write the generated file to the suggested path"
-    )
+    description: str = Field("", description="Optional natural language description")
+    write_to_disk: bool = Field(False, description="Trusted local mode only")
 
 
 class ChatResponse(BaseModel):
-    """Unified response for all chat endpoints."""
-    response: str = Field("", description="Human-readable answer or generation result")
-    session_id: str = Field("", description="Session ID (use to continue conversation)")
-    intent: str = Field("question", description="Detected intent: question|explain|complete_fn|new_class")
-    target_file: str = Field("", description="File used as context (resolved path)")
-    generated_code: str = Field("", description="Raw generated code (Phase 2 only)")
-    code_blocks: List[Dict[str, str]] = Field(
-        default_factory=list,
-        description="Parsed code blocks [{lang, code}] for syntax highlighting in plugin"
-    )
-    suggested_files: List[str] = Field(
-        default_factory=list,
-        description="Suggested file paths for generated code"
-    )
-    generation_valid: bool = Field(True, description="True if generated code passed syntax check")
-    generation_errors: List[str] = Field(
-        default_factory=list, description="Syntax errors if generation_valid is False"
-    )
-    elapsed_seconds: float = Field(0.0, description="Total processing time in seconds")
+    """Unified response for all non-streaming chat endpoints."""
+    response: str = ""
+    session_id: str = ""
+    intent: str = "question"
+    context_level: str = "context"
+    selected_agents: List[str] = Field(default_factory=list)
+    target_file: str = ""
+    generated_code: str = ""
+    code_blocks: List[Dict[str, str]] = Field(default_factory=list)
+    suggested_files: List[str] = Field(default_factory=list)
+    generation_valid: bool = True
+    generation_errors: List[str] = Field(default_factory=list)
+    elapsed_seconds: float = 0.0
 
 
 class HistoryEntry(BaseModel):
@@ -103,28 +99,35 @@ class SessionHistoryResponse(BaseModel):
     turn_count: int = 0
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 async def _run_chat(
     message: str,
     project_path: str,
     session_id: str,
     target_file: str,
+    cursor_line: int = 0,
+    active_function: str = "",
+    selected_text: str = "",
+    visible_range: list | None = None,
 ) -> ChatResponse:
-    """Run invoke_chat() in a thread and map the result to ChatResponse."""
-    from langchain_agents.graphs.chat_graph import invoke_chat
+    """Run ainvoke_chat() and map the result to ChatResponse."""
+    from langchain_agents.graphs.chat_graph import ainvoke_chat
 
     start = time.time()
     try:
-        result: Dict[str, Any] = await asyncio.to_thread(
-            invoke_chat,
+        result: Dict[str, Any] = await ainvoke_chat(
             message=message,
             project_path=project_path,
             session_id=session_id,
             target_file=target_file,
+            cursor_line=cursor_line,
+            active_function=active_function,
+            selected_text=selected_text,
+            visible_range=visible_range or [0, 0],
         )
     except Exception as e:
-        logger.exception("invoke_chat failed: %s", e)
+        logger.exception("ainvoke_chat failed: %s", e)
         raise HTTPException(status_code=500, detail=f"ChatAgent error: {e}")
 
     elapsed = round(time.time() - start, 2)
@@ -133,6 +136,8 @@ async def _run_chat(
         response=result.get("formatted_response") or result.get("response", ""),
         session_id=result.get("session_id", session_id),
         intent=result.get("intent", "question"),
+        context_level=result.get("context_level", "context"),
+        selected_agents=result.get("selected_agents") or [],
         target_file=result.get("target_file", ""),
         generated_code=result.get("generated_code", ""),
         code_blocks=result.get("code_blocks") or [],
@@ -143,51 +148,84 @@ async def _run_chat(
     )
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+def _safe_write_generated_file(project_path: str, suggested_file: str, code: str) -> None:
+    """Write generated code only inside project root and never overwrite existing files."""
+    root = Path(project_path).resolve()
+    out_path = Path(suggested_file).resolve()
 
-@chat_router.post("", response_model=ChatResponse, summary="Q&A / Explain (Phase 1)")
+    if not str(out_path).startswith(str(root)):
+        raise ValueError(f"Refusing to write outside project root: {out_path}")
+
+    if out_path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing file: {out_path}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(code, encoding="utf-8")
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+
+@chat_router.post("", response_model=ChatResponse, summary="Q&A / Explain")
 async def chat(req: ChatRequest):
-    """
-    Project-aware Q&A and code explanation.
-
-    The agent automatically:
-    - Detects intent (question / explain)
-    - Loads file context if a filename or ClassName.method is mentioned
-    - Retrieves RAG documents from the project knowledge base
-    - Answers grounded in project code, cached analysis, and dependencies
-
-    **Examples:**
-    - `"What does CacheService.get_cached_analysis do?"`
-    - `"Explain the dependency graph in services/dep_graph.py"`
-    - `"What tests are missing in analysis_agent.py?"`
-    """
+    """Project-aware Q&A and code explanation with IDE cursor context."""
     return await _run_chat(
-        message=req.message,
-        project_path=req.project_path,
-        session_id=req.session_id,
-        target_file=req.target_file,
+        message         = req.message,
+        project_path    = req.project_path,
+        session_id      = req.session_id,
+        target_file     = req.target_file,
+        cursor_line     = req.cursor_line,
+        active_function = req.active_function,
+        selected_text   = req.selected_text,
+        visible_range   = req.visible_range,
     )
 
 
-@chat_router.post("/complete", response_model=ChatResponse, summary="Complete a function (Phase 2)")
+@chat_router.post("/stream", summary="Stream Q&A / Explain via SSE")
+async def chat_stream(req: ChatRequest):
+    """
+    Streaming version of Q&A endpoint.
+
+    Returns Server-Sent Events (SSE):
+      data: {"type":"status","content":"..."}
+      data: {"type":"plan","intent":"..."}
+      data: {"type":"token","content":"..."}
+      data: {"type":"done","session_id":"..."}
+    """
+    from langchain_agents.graphs.chat_graph import stream_chat
+
+    async def event_generator():
+        try:
+            async for chunk in stream_chat(
+                message=req.message,
+                project_path=req.project_path,
+                session_id=req.session_id,
+                target_file=req.target_file,
+            ):
+                yield chunk
+        except asyncio.CancelledError:
+            logger.info("Client disconnected from chat stream")
+            raise
+        except Exception as e:
+            logger.exception("Stream error: %s", e)
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@chat_router.post("/complete", response_model=ChatResponse, summary="Complete a function")
 async def complete_function(req: CompletionRequest):
-    """
-    Generate the body of an incomplete/stub function.
-
-    The agent:
-    - Finds the function in the project (by name + file)
-    - Detects project conventions (naming, imports, style)
-    - Retrieves relevant RAG documents
-    - Generates only the function body (never rewrites other code)
-    - Validates Python syntax (or brace balance for Java/JS/TS)
-
-    **Examples:**
-    - function_name: `"findByEmail"`, file_path: `"services/user_service.py"`
-    - function_name: `"processQueue"`, file_path: `"UserService.java"`
-    """
-    # Build a natural language message that the intent router understands
+    """Generate the body of an incomplete/stub function."""
     file_part = f" in {req.file_path}" if req.file_path else ""
-    message = f"complete {req.function_name}{file_part}"
+    lang_part = f" using {req.language}" if req.language else ""
+    message = f"complete {req.function_name}{file_part}{lang_part}"
 
     return await _run_chat(
         message=message,
@@ -197,22 +235,9 @@ async def complete_function(req: CompletionRequest):
     )
 
 
-@chat_router.post("/generate", response_model=ChatResponse, summary="Generate new class/file (Phase 2)")
+@chat_router.post("/generate", response_model=ChatResponse, summary="Generate new class/file")
 async def generate_class(req: GenerateClassRequest):
-    """
-    Generate a complete new class following project conventions.
-
-    The agent:
-    - Scans existing classes to infer naming/import/style conventions
-    - Generates a complete, compilable class with docstrings
-    - Includes a unit test skeleton
-    - Suggests the correct file path based on project structure
-    - Optionally writes the file to disk (`write_to_disk: true`)
-
-    **Examples:**
-    - class_name: `"NotificationService"`, language: `"python"`
-    - class_name: `"ProductRepository"`, language: `"java"`, description: `"CRUD for Product entity"`
-    """
+    """Generate a complete new class following project conventions."""
     lang_part = f" in {req.language}" if req.language else ""
     desc_part = f" — {req.description}" if req.description else ""
     message = f"create a {req.class_name} class{lang_part}{desc_part}"
@@ -224,16 +249,18 @@ async def generate_class(req: GenerateClassRequest):
         target_file="",
     )
 
-    # Optionally write generated file to disk
+    # Trusted local mode only. Plugin should keep write_to_disk=false.
     if req.write_to_disk and response.generated_code and response.suggested_files:
-        from pathlib import Path
-        out_path = Path(response.suggested_files[0])
         try:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(response.generated_code, encoding="utf-8")
-            logger.info("Generated file written: %s", out_path)
+            _safe_write_generated_file(
+                project_path=req.project_path,
+                suggested_file=response.suggested_files[0],
+                code=response.generated_code,
+            )
+            logger.info("Generated file written: %s", response.suggested_files[0])
         except Exception as e:
             logger.warning("write_to_disk failed: %s", e)
+            response.response += f"\n\n---\n⚠️ Write failed: {e}"
 
     return response
 
@@ -244,12 +271,7 @@ async def generate_class(req: GenerateClassRequest):
     summary="Get conversation history",
 )
 async def get_history(session_id: str):
-    """
-    Retrieve the conversation history for a session.
-
-    Used by the VS Code plugin to restore a previous chat session
-    when the developer reopens the panel.
-    """
+    """Retrieve the conversation history for a session."""
     try:
         from services.chat_memory_service import chat_memory_service
         history = await asyncio.to_thread(chat_memory_service.load_history, session_id)
@@ -278,9 +300,7 @@ async def get_history(session_id: str):
     summary="Clear conversation history",
 )
 async def clear_history(session_id: str):
-    """
-    Clear the conversation history for a session (Redis + local fallback).
-    """
+    """Clear the conversation history for a session."""
     try:
         from services.chat_memory_service import chat_memory_service
         await asyncio.to_thread(chat_memory_service.clear_session, session_id)
@@ -288,3 +308,466 @@ async def clear_history(session_id: str):
     except Exception as e:
         logger.warning("clear_session failed: %s", e)
         return {"status": "error", "detail": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase B — New endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+
+class InlineCompletionRequest(BaseModel):
+    prefix_code:  str  = Field(...,      description="Code before the cursor")
+    suffix_code:  str  = Field("",       description="Code after the cursor")
+    language:     str  = Field("python", description="Programming language")
+    file_path:    str  = Field("",       description="Current file path")
+    project_path: str  = Field(".",      description="Project root")
+    cursor_line:  int  = Field(0)
+    use_rag:      bool = Field(True)
+
+
+class InlineCompletionResponse(BaseModel):
+    completion:  str   = ""
+    confidence:  float = 0.0
+    source:      str   = "llm"
+    elapsed_ms:  int   = 0
+    error:       str   = ""
+
+
+@chat_router.post("/complete/inline", response_model=InlineCompletionResponse,
+                  summary="Inline completion (Copilot-style)")
+async def complete_inline(req: InlineCompletionRequest):
+    """Cursor-aware inline code completion. Cache-first (Redis TTL 5min)."""
+    try:
+        from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
+        result = await asyncio.to_thread(
+            lc_inline_completion_agent.complete,
+            prefix_code=req.prefix_code,
+            suffix_code=req.suffix_code,
+            language=req.language,
+            file_path=req.file_path,
+            project_path=req.project_path,
+            use_rag=req.use_rag,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"InlineCompletion error: {e}")
+    return InlineCompletionResponse(**result)
+
+
+@chat_router.post(
+    "/complete/inline/stream",
+    summary="Streaming inline completion via SSE (first token < 300ms)",
+)
+async def complete_inline_stream(req: InlineCompletionRequest):
+    """
+    Streaming inline code completion — returns tokens as SSE events.
+
+    Events emitted in order:
+      data: {"type":"cache_hit","completion":"..."}   → served from Redis (< 5ms)
+      data: {"type":"token","content":"..."}           → each streamed token
+      data: {"type":"done","completion":"...","confidence":0.9,"elapsed_ms":280}
+      data: {"type":"error","content":"..."}
+
+    The VS Code InlineCompletionProvider should:
+      1. Start listening to this stream
+      2. Accumulate tokens in a buffer
+      3. On "done", compare accumulated with buffer — use accumulated
+      4. On "cache_hit", skip streaming and show directly
+
+    Debounce: call this endpoint after 350ms of inactivity, cancel on new keypress.
+    """
+    import json as _json
+    import time as _time
+    import hashlib as _hashlib
+
+    async def _event_gen():
+        t0 = _time.time()
+        language = req.language or "python"
+
+        # 1. Cache check (< 5ms)
+        try:
+            from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
+            cache_key = lc_inline_completion_agent._cache_key(
+                req.prefix_code, req.suffix_code, language
+            )
+            cached = lc_inline_completion_agent._cache_get(cache_key)
+            if cached:
+                elapsed = round((_time.time() - t0) * 1000)
+                yield f"data: {_json.dumps({'type':'cache_hit','completion':cached,'confidence':0.85,'elapsed_ms':elapsed})}\n\n"
+                return
+        except Exception:
+            pass
+
+        # 2. RAG snippet (background, non-blocking)
+        rag_snippet = ""
+        if req.use_rag and req.project_path:
+            try:
+                from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
+                query = req.prefix_code.strip().split("\n")[-1][:100] or req.file_path
+                rag_snippet = await asyncio.to_thread(
+                    lc_inline_completion_agent._get_rag_snippet,
+                    req.project_path, query, language
+                )
+            except Exception:
+                rag_snippet = ""
+
+        # 3. Build FIM prompt
+        fim_prompt = (
+            f"You are an expert {language} inline code completion engine.\n"
+            f"Complete ONLY the missing code at the cursor. Output the completion text ONLY.\n"
+            f"Be concise (1-5 lines). Match the project style.\n\n"
+            f"File: {req.file_path or '(unknown)'}\n"
+            f"Language: {language}\n"
+            + (f"Project patterns:\n{rag_snippet}\n\n" if rag_snippet else "")
+            + f"<prefix>{req.prefix_code[-1200:]}</prefix>\n"
+            f"<cursor/>\n"
+            f"<suffix>{req.suffix_code[:300]}</suffix>\n\n"
+            f"Completion:"
+        )
+
+        # 4. Stream LLM tokens
+        completion_buf = []
+        try:
+            from langchain_agents.agents.lc_analysis_agent import _build_llm_with_fallback
+            llm = await asyncio.to_thread(_build_llm_with_fallback)
+            from langchain_core.messages import HumanMessage
+
+            async for chunk in llm.astream(
+                [HumanMessage(content=fim_prompt)],
+                config={"max_tokens": 128},
+            ):
+                token = getattr(chunk, "content", "")
+                if token:
+                    # Strip accidental fences
+                    import re as _re
+                    token = _re.sub(r"```[a-z]*", "", token)
+                    if token:
+                        completion_buf.append(token)
+                        yield f"data: {_json.dumps({'type':'token','content':token})}\n\n"
+
+        except Exception as e:
+            # Fallback: non-streaming synchronous call
+            try:
+                from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
+                result = await asyncio.to_thread(
+                    lc_inline_completion_agent.complete,
+                    prefix_code=req.prefix_code,
+                    suffix_code=req.suffix_code,
+                    language=language,
+                    file_path=req.file_path,
+                    project_path=req.project_path,
+                    use_rag=False,
+                )
+                completion = result.get("completion", "")
+                if completion:
+                    completion_buf = [completion]
+                    yield f"data: {_json.dumps({'type':'token','content':completion})}\n\n"
+            except Exception as e2:
+                yield f"data: {_json.dumps({'type':'error','content':str(e2)})}\n\n"
+                return
+
+        # 5. Done event
+        full = "".join(completion_buf).strip()
+        import re as _re2
+        full = _re2.sub(r"^```[a-z]*\n?", "", full)
+        full = _re2.sub(r"\n?```$", "", full)
+
+        elapsed = round((_time.time() - t0) * 1000)
+        confidence = 0.9 if len(full) > 5 else 0.5
+
+        # Cache the result
+        if full:
+            try:
+                from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
+                lc_inline_completion_agent._cache_set(cache_key, full)
+            except Exception:
+                pass
+
+        yield f"data: {_json.dumps({'type':'done','completion':full,'confidence':confidence,'elapsed_ms':elapsed})}\n\n"
+
+    return StreamingResponse(
+        _event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "Connection":       "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+class ApplyFunctionRequest(BaseModel):
+    project_path:  str = Field(...,        description="Project root")
+    file_path:     str = Field(...,        description="Target file")
+    function_name: str = Field(...,        description="Function to replace")
+    new_code:      str = Field(...,        description="New implementation")
+    language:      str = Field("python")
+    write_mode:    str = Field("dry_run",  description="dry_run | preview | apply")
+
+
+class ApplyNewFileRequest(BaseModel):
+    project_path:   str = Field(...)
+    suggested_file: str = Field(...)
+    code:           str = Field(...)
+    language:       str = Field("python")
+    write_mode:     str = Field("dry_run")
+
+
+class ApplyMultiFileRequest(BaseModel):
+    project_path: str                   = Field(...)
+    patches:      List[Dict[str, Any]]  = Field(...)
+    write_mode:   str                   = Field("dry_run")
+
+
+class ApplyResponse(BaseModel):
+    file_path:      str               = ""
+    function_name:  str               = ""
+    diff:           str               = ""
+    workspace_edit: Dict[str, Any]    = Field(default_factory=dict)
+    valid:          bool              = True
+    errors:         List[str]         = Field(default_factory=list)
+    written:        bool              = False
+    mode:           str               = "dry_run"
+    error:          str               = ""
+    patches:        List[Dict[str, Any]] = Field(default_factory=list)
+    all_valid:      bool              = True
+
+
+@chat_router.post("/apply", response_model=ApplyResponse,
+                  summary="Apply generated code to a function (diff + WorkspaceEdit)")
+async def apply_function(req: ApplyFunctionRequest):
+    """
+    Replace a function in a file with generated code.
+    Returns unified diff + VS Code WorkspaceEdit JSON.
+    write_mode: dry_run (default, safe) | preview | apply (writes to disk).
+    """
+    try:
+        from langchain_agents.agents.lc_apply_agent import lc_apply_agent
+        result = await asyncio.to_thread(
+            lc_apply_agent.apply_function_patch,
+            project_path=req.project_path, file_path=req.file_path,
+            function_name=req.function_name, new_code=req.new_code,
+            language=req.language, write_mode=req.write_mode,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"ApplyAgent error: {e}")
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    return ApplyResponse(**{k: v for k, v in result.items() if k in ApplyResponse.model_fields})
+
+
+@chat_router.post("/apply/new-file", response_model=ApplyResponse,
+                  summary="Apply generated code as a new file")
+async def apply_new_file(req: ApplyNewFileRequest):
+    """Create a new file with generated code. Never overwrites unless write_mode='overwrite'."""
+    try:
+        from langchain_agents.agents.lc_apply_agent import lc_apply_agent
+        result = await asyncio.to_thread(
+            lc_apply_agent.apply_new_file,
+            project_path=req.project_path, suggested_file=req.suggested_file,
+            code=req.code, language=req.language, write_mode=req.write_mode,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"ApplyAgent error: {e}")
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    return ApplyResponse(**{k: v for k, v in result.items() if k in ApplyResponse.model_fields})
+
+
+@chat_router.post("/apply/multi", response_model=ApplyResponse,
+                  summary="Multi-file patch (Phase B3)")
+async def apply_multi_file(req: ApplyMultiFileRequest):
+    """
+    Apply generated patches to multiple files in one operation.
+    Patch: {file_path, function_name, new_code, language} or {file_path, code, is_new_file, language}
+    """
+    try:
+        from langchain_agents.agents.lc_apply_agent import lc_apply_agent
+        result = await asyncio.to_thread(
+            lc_apply_agent.apply_multi_file_patch,
+            project_path=req.project_path, patches=req.patches, write_mode=req.write_mode,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"ApplyAgent multi error: {e}")
+    return ApplyResponse(all_valid=result.get("all_valid", False),
+                         written=result.get("written", False),
+                         mode=result.get("mode", "dry_run"),
+                         patches=result.get("patches", []))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase C — Proactive + Semantic Memory + Pair Programmer
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ProactiveRequest(BaseModel):
+    project_path:  str = Field(...,  description="Project root")
+    session_id:    str = Field("",   description="Current session ID")
+    target_file:   str = Field("",   description="Currently open file")
+    max_suggestions: int = Field(5,  description="Max suggestions to return")
+
+
+class ProactiveSuggestion(BaseModel):
+    type:     str = ""
+    severity: str = "info"
+    title:    str = ""
+    message:  str = ""
+    file:     str = ""
+    action:   Optional[str] = None
+
+
+class ProactiveResponse(BaseModel):
+    suggestions:  List[ProactiveSuggestion] = Field(default_factory=list)
+    total:        int   = 0
+    has_critical: bool  = False
+    elapsed_ms:   int   = 0
+
+
+@chat_router.post("/proactive", response_model=ProactiveResponse,
+                  summary="Proactive suggestions (Phase C2)")
+async def proactive_suggestions(req: ProactiveRequest):
+    """
+    Scan the project for proactive suggestions without the developer asking:
+      - Uncommitted critical bugs (from GitSessionTracker)
+      - Test gaps (modified files without tests)
+      - CI risk patterns (files historically correlated with CI failures)
+      - Coupling impact (high-fan-in files modified)
+
+    VS Code extension shows these in a side panel or as notifications.
+    """
+    try:
+        from langchain_agents.agents.lc_proactive_agent import proactive_agent
+        result = await asyncio.to_thread(
+            proactive_agent.scan,
+            project_path    = req.project_path,
+            session_id      = req.session_id,
+            target_file     = req.target_file,
+            max_suggestions = req.max_suggestions,
+        )
+    except Exception as e:
+        logger.exception("proactive error: %s", e)
+        raise HTTPException(500, f"ProactiveAgent error: {e}")
+
+    suggestions = [
+        ProactiveSuggestion(
+            type     = s.get("type", ""),
+            severity = s.get("severity", "info"),
+            title    = s.get("title", ""),
+            message  = s.get("message", ""),
+            file     = s.get("file", ""),
+            action   = s.get("action"),
+        )
+        for s in result.get("suggestions", [])
+    ]
+
+    return ProactiveResponse(
+        suggestions  = suggestions,
+        total        = result.get("total", 0),
+        has_critical = result.get("has_critical", False),
+        elapsed_ms   = result.get("elapsed_ms", 0),
+    )
+
+
+class SemanticMemoryRequest(BaseModel):
+    session_id:   str = Field(..., description="Session ID")
+    query:        str = Field("",  description="Query for semantic recall (empty = profile)")
+    action:       str = Field("recall", description="recall | profile | clear")
+
+
+@chat_router.post("/memory/semantic", summary="Semantic memory operations (Phase C1)")
+async def semantic_memory_op(req: SemanticMemoryRequest):
+    """
+    Manage per-session semantic memory:
+      - recall : find relevant past facts for a query (vector search)
+      - profile : build a developer profile from all stored facts
+      - clear   : delete all semantic memory for this session
+    """
+    try:
+        from langchain_agents.memory.lc_semantic_memory import semantic_memory
+
+        if req.action == "recall":
+            facts = await asyncio.to_thread(
+                semantic_memory.recall_memory,
+                session_id=req.session_id,
+                query=req.query or "project",
+            )
+            return {"action": "recall", "session_id": req.session_id, "facts": facts}
+
+        elif req.action == "profile":
+            profile = await asyncio.to_thread(
+                semantic_memory.get_profile,
+                session_id=req.session_id,
+            )
+            return {"action": "profile", "session_id": req.session_id, "profile": profile}
+
+        elif req.action == "clear":
+            ok = await asyncio.to_thread(semantic_memory.clear_session, req.session_id)
+            return {"action": "clear", "session_id": req.session_id, "cleared": ok}
+
+        else:
+            raise HTTPException(400, f"Unknown action: {req.action}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"SemanticMemory error: {e}")
+
+
+class PairProgrammerRequest(BaseModel):
+    """Direct tool-calling pair programmer — bypasses the full ChatGraph."""
+    message:         str = Field(...,  description="Developer question")
+    project_path:    str = Field(".",  description="Project root")
+    session_id:      str = Field("",   description="Session ID")
+    target_file:     str = Field("",   description="Currently focused file")
+    history:         List[Dict[str, Any]] = Field(default_factory=list,
+                                                   description="Last N conversation turns")
+
+
+class PairProgrammerResponse(BaseModel):
+    response:     str       = ""
+    tools_called: List[str] = Field(default_factory=list)
+    iterations:   int       = 0
+    elapsed_seconds: float  = 0.0
+
+
+@chat_router.post("/pair-programmer", response_model=PairProgrammerResponse,
+                  summary="Pair programmer with tool-calling (Phase C3)")
+async def pair_programmer(req: PairProgrammerRequest):
+    """
+    Direct pair programmer endpoint that bypasses the full ChatGraph.
+
+    The LLM autonomously decides which tools to use:
+      search_codebase | get_file | get_git_diff | analyze_file | get_dependencies | get_ci_status
+
+    Best for deep, multi-step questions about the project.
+    Max 4 tool-call iterations.
+    """
+    import time
+
+    t0 = time.time()
+    try:
+        from langchain_agents.agents.lc_tool_calling_agent import lc_tool_calling_agent
+        from langchain_agents.memory.lc_semantic_memory import semantic_memory
+
+        # Enrich with semantic context
+        semantic_ctx = await asyncio.to_thread(
+            semantic_memory.recall_memory,
+            session_id=req.session_id,
+            query=req.message,
+        ) if req.session_id else []
+
+        result = await lc_tool_calling_agent.arun(
+            message          = req.message,
+            project_path     = req.project_path,
+            session_id       = req.session_id,
+            history          = req.history,
+            semantic_context = semantic_ctx,
+            target_file      = req.target_file,
+        )
+    except Exception as e:
+        logger.exception("pair-programmer error: %s", e)
+        raise HTTPException(500, f"ToolCallingAgent error: {e}")
+
+    return PairProgrammerResponse(
+        response        = result.get("response", ""),
+        tools_called    = result.get("tools_called", []),
+        iterations      = result.get("iterations", 0),
+        elapsed_seconds = round(time.time() - t0, 2),
+    )

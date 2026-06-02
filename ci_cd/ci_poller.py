@@ -313,13 +313,18 @@ class CIPoller:
 
         return analyzed
 
-    def run(self, max_cycles: int = 0):
+    def run(self, max_cycles: int = 0, stop_event=None):
         """
         Boucle principale de polling (bloquante).
 
         Args:
-            max_cycles: 0 = infini, N = s'arrête après N cycles (tests)
+            max_cycles:  0 = infini, N = s'arrête après N cycles (tests)
+            stop_event:  threading.Event — si set(), arrête proprement la boucle
+                         (utilisé par l'API FastAPI pour stopper le poller en background)
         """
+        import threading as _threading
+        _stop = stop_event if stop_event is not None else _threading.Event()
+
         cycle = 0
         logger.info(
             "[Poller] Démarrage — repo=%s interval=%ds branch=%s",
@@ -330,7 +335,7 @@ class CIPoller:
         print(f"   T7: publish + deploy connectés au CIGraph\n")
 
         try:
-            while True:
+            while not _stop.is_set():
                 cycle += 1
                 try:
                     n = self.poll_once()
@@ -344,11 +349,17 @@ class CIPoller:
                 if max_cycles and cycle >= max_cycles:
                     break
 
-                time.sleep(self.interval)
+                # Sleep interruptible — vérifie le stop_event toutes les secondes
+                for _ in range(self.interval):
+                    if _stop.is_set():
+                        break
+                    time.sleep(1)
 
         except KeyboardInterrupt:
             print("\n\n⏹ Poller arrêté (Ctrl+C)")
             logger.info("[Poller] Arrêt manuel")
+
+        logger.info("[Poller] Arrêté après %d cycle(s)", cycle)
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

@@ -1,89 +1,95 @@
 """
-lc_git_session_agent.py — LangChain GitSessionAgent wrapper.
+lc_git_session_agent.py — Smart Git Session Agent.
 
-Wraps the GitSessionTracker snapshot for integration into the LangGraph WatchGraph.
+Role:
+  Wrap GitSessionTracker and expose a clean dict output for LangGraph,
+  ChatAgent, API, and plugin.
 
-Responsibilities:
-  1. Read the session snapshot from Redis (written by GitSessionTracker)
-  2. Format a context string for the LLM
-  3. Return serializable dict for the WatchState
+Uses existing:
+  smart_git.git_session_tracker.GitSessionTracker
 """
+
 from __future__ import annotations
 
-import json
-import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
-
-logger = logging.getLogger(__name__)
+from typing import Any, Dict
 
 
 class LCGitSessionAgent:
     """
-    LangChain-compatible GitSessionAgent.
-    Reads from Redis cache populated by the background GitSessionTracker.
+    SessionAgent answers:
+      - current Git session risk
+      - can I commit?
+      - files at risk
+      - unanalyzed modified files
     """
 
-    def __init__(self, project_path: Path):
-        self.project_path = project_path
-
-    def _gs_key(self) -> str:
-        """Redis key for git session snapshot."""
-        from services.mcp_redis_service import key_hash, KEY_PREFIX
-        return f"{KEY_PREFIX}gs:{key_hash(str(self.project_path))}"
-
-    def get_session_context(self) -> Optional[Dict[str, Any]]:
-        """
-        Read the session snapshot from Redis.
-        Returns a dict with session info, or None if not available.
-        """
+    def get_status(self, project_path: str) -> Dict[str, Any]:
         try:
-            from services.mcp_redis_service import get_mcp_redis
-            redis = get_mcp_redis()
-            gs_key = self._gs_key()
-            raw = redis.get(gs_key)
-            if not raw:
-                return None
-
-            # Parse JSON with fallback for single-quotes (defensive)
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                import ast
-                data = ast.literal_eval(raw)
-
-            # Extract key fields for LLM context
-            return {
-                "level": data.get("level", "CLEAN"),
-                "score": data.get("score", 0),
-                "minutes_since_commit": data.get("minutes_since_commit", 0),
-                "files_at_risk_count": len(data.get("files_at_risk", [])),
-                "files_unanalyzed_count": len(data.get("files_unanalyzed", [])),
-                "time_multiplier": data.get("time_multiplier", 1.0),
-                "has_data": True,
-            }
+            from smart_git.git_session_tracker import GitSessionTracker
         except Exception as e:
-            logger.debug("LCGitSessionAgent.get_session_context erreur : %s", e)
-            return None
+            return {
+                "success": False,
+                "error": f"Cannot import GitSessionTracker: {e}",
+            }
 
-    def format_alert(self, context: Dict[str, Any]) -> Optional[str]:
-        """Format a session alert for the LLM if level is WARN or CRITICAL."""
-        level = context.get("level", "CLEAN")
-        if level not in ("WARN", "CRITICAL"):
-            return None
+        project = Path(project_path).resolve()
 
-        score = context.get("score", 0)
-        minutes = context.get("minutes_since_commit", 0)
-        files_at_risk = context.get("files_at_risk_count", 0)
-        files_unanalyzed = context.get("files_unanalyzed_count", 0)
-
-        alert = (
-            f"⚠️ SESSION GIT {level} — "
-            f"score={score}, {minutes}min depuis dernier commit, "
-            f"{files_at_risk} fichiers à risque, {files_unanalyzed} fichiers non analysés"
+        cache_db = (
+            project.parent
+            / "code_auditor"
+            / "data"
+            / "cache"
+            / "analysis_cache.db"
         )
-        return alert
+
+        try:
+            tracker = GitSessionTracker(
+                project_path=project,
+                cache_db=cache_db,
+            )
+
+            snapshot = tracker.force_check()
+
+            if not snapshot:
+                return {
+                    "success": False,
+                    "error": "Unable to calculate git session status",
+                }
+
+            return {
+                "success": True,
+                "score": snapshot.score,
+                "level": snapshot.level,
+                "minutes_since_commit": snapshot.minutes_since_commit,
+                "time_multiplier": snapshot.time_multiplier,
+                "total_critical": snapshot.total_critical,
+                "total_high": snapshot.total_high,
+                "total_bugs": snapshot.total_bugs,
+                "files_at_risk": [
+                    {
+                        "path": file_risk.path,
+                        "status": file_risk.status,
+                        "staged": file_risk.staged,
+                        "critical": file_risk.bugs_critical,
+                        "high": file_risk.bugs_high,
+                        "medium": file_risk.bugs_medium,
+                        "low": file_risk.bugs_low,
+                        "score": file_risk.score,
+                        "has_analysis": file_risk.has_analysis,
+                        "max_severity": file_risk.max_severity,
+                    }
+                    for file_risk in snapshot.files_at_risk
+                ],
+                "files_unanalyzed": snapshot.files_unanalyzed,
+                "stats": snapshot.stats,
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Git session status failed: {e}",
+            }
 
 
-# Singleton (re-instantiated in watch_graph with real project_path)
-lc_git_session_agent = LCGitSessionAgent(Path("."))
+git_session_agent = LCGitSessionAgent()
