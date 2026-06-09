@@ -114,6 +114,13 @@ class GenerateTestsRequest(BaseModel):
     file_path: str = Field(..., description="Fichier source à tester")
     project_path: str = Field("", description="Racine du projet (optionnel)")
     write: bool = Field(False, description="Écrire le fichier de test sur disque")
+    incremental: bool = Field(
+        False,
+        description=(
+            "Si True et qu'un fichier de test existe déjà, génère uniquement les méthodes "
+            "manquantes et les insère à la fin du fichier existant plutôt que de l'écraser."
+        ),
+    )
 
 
 class GenerateTestsResponse(BaseModel):
@@ -122,6 +129,7 @@ class GenerateTestsResponse(BaseModel):
     framework: str = ""
     rag_docs_used: int = 0
     validated: bool = False
+    incremental: bool = False
     error: str = ""
 
 

@@ -40,6 +40,10 @@ httpx>=0.27.0
 # Redis MCP Server
 redis-mcp-server>=0.5.0
 
+# Auth (passwordless email-OTP + JWT) — dedicated redis-py client + stdlib smtplib
+PyJWT>=2.8.0
+redis>=5.0
+
 # Utilities
 pydantic>=2.0
 python-dotenv>=1.0.0

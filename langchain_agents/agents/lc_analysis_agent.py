@@ -152,7 +152,7 @@ def _safe_int(value) -> "int | None":
 
 def _build_llm_with_fallback():
     """
-    Build LLM with cascade fallback: OpenRouter → Gemini.
+    Build LLM with cascade fallback: OpenRouter → Groq → Gemini.
 
     Uses RunnableWithFallbacks from LangChain for automatic failover.
     """
@@ -161,7 +161,24 @@ def _build_llm_with_fallback():
 
     llms = []
 
-    # Primary: OpenRouter
+    # Primary: Groq (rapide + fiable — OpenRouter free est très souvent saturé en 429,
+    # ce qui faisait perdre un aller-retour à CHAQUE analyse avant ce changement)
+    groq_key = config.api.groq_api_key or os.getenv("GROQ_API_KEY", "")
+    if groq_key:
+        try:
+            from langchain_openai import ChatOpenAI
+            llms.append(ChatOpenAI(
+                model=config.api.groq_model,
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1",
+                temperature=config.api.temperature,
+                max_tokens=min(config.api.max_tokens, 8192),  # marge sous la TPM Groq (30k)
+                max_retries=1,
+            ))
+        except Exception as e:
+            logger.debug("Groq LLM build failed: %s", e)
+
+    # Fallback 1: OpenRouter (utilisé seulement si Groq est indisponible)
     api_key = config.api.openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "")
     if api_key:
         try:
@@ -172,6 +189,7 @@ def _build_llm_with_fallback():
                 base_url="https://openrouter.ai/api/v1",
                 temperature=config.api.temperature,
                 max_tokens=config.api.max_tokens,
+                max_retries=0,
                 default_headers={
                     "HTTP-Referer": "https://github.com/code-auditor",
                     "X-Title": "Code Auditor",
@@ -180,7 +198,7 @@ def _build_llm_with_fallback():
         except Exception as e:
             logger.debug("OpenRouter LLM build failed: %s", e)
 
-    # Fallback: Gemini
+    # Fallback 2: Gemini
     gemini_key = config.api.gemini_api_key or os.getenv("GOOGLE_API_KEY", "")
     if gemini_key:
         try:
@@ -191,6 +209,7 @@ def _build_llm_with_fallback():
                 temperature=config.api.temperature,
                 max_output_tokens=config.api.max_tokens,
                 convert_system_message_to_human=True,
+                max_retries=1,  # évite le spam de 8 retries quand le free tier Gemini est à 0
             ))
         except Exception as e:
             logger.debug("Gemini LLM build failed: %s", e)

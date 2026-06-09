@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.models import (
@@ -67,6 +67,15 @@ _watch_last_events: Dict[str, Any] = {}  # project_path → latest ws_events sna
 
 # Main asyncio event loop — captured at startup so background threads can broadcast
 _main_loop: asyncio.AbstractEventLoop | None = None
+
+# Extension → language mapping for fast pre-pipeline detection (no AST needed)
+_EXT_LANGUAGE: Dict[str, str] = {
+    ".py": "python", ".js": "javascript", ".jsx": "javascript",
+    ".ts": "typescript", ".tsx": "typescript", ".java": "java",
+}
+
+def _ext_to_language(fp: Path) -> str:
+    return _EXT_LANGUAGE.get(fp.suffix.lower(), "unknown")
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -141,14 +150,39 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("RetrieverAgent init failed: %s", e)
 
+        # TestKnowledgeLoader — collection ChromaDB dédiée aux patterns de test (RAG pour génération)
+        try:
+            from services.test_knowledge_loader import TestKnowledgeLoader
+            _rag_svc = services.get("rag_system")
+            _embeddings = (
+                getattr(_rag_svc, "_embeddings", None)
+                or getattr(_rag_svc, "embeddings", None)
+            ) if _rag_svc else None
+            test_kb = TestKnowledgeLoader(embeddings=_embeddings)
+            loaded = test_kb.load()
+            services["test_kb"] = test_kb
+            logger.info("TestKnowledgeLoader initialisé (%d chunks)", loaded)
+        except Exception as e:
+            logger.warning("TestKnowledgeLoader init failed: %s", e)
+
         # LearningAgent
         try:
             from agents.learning_agent import learning_agent as la
             rag = services.get("rag_system")
             from config import config
+            # CodeRAGSystemAPI exposes the LLM under different attribute names across
+            # versions — probe defensively instead of assuming `_llm` (the missing
+            # attribute that was disabling the LearningAgent entirely).
+            _rag_llm = None
+            if rag is not None:
+                _rag_llm = (
+                    getattr(rag, "_llm", None)
+                    or getattr(rag, "llm", None)
+                    or getattr(rag, "assistant_agent", None)
+                )
             la.initialize(
-                llm=rag._llm if rag else None,
-                vector_store=rag.vector_store if rag else None,
+                llm=_rag_llm,
+                vector_store=getattr(rag, "vector_store", None) if rag else None,
                 kb_dir=config.KNOWLEDGE_BASE_DIR,
             )
             la.start()
@@ -214,6 +248,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
+from auth import auth_router, authenticate_ws, get_current_user  # noqa: E402
 from api.chat_router        import chat_router          # noqa: E402
 from api.git_router         import git_router           # noqa: E402
 from api.ci_router          import ci_router            # noqa: E402
@@ -221,13 +256,18 @@ from api.diagnostics_router import diagnostics_router, feedback_router  # noqa: 
 from api.code_actions_router import code_actions_router  # noqa: E402
 from api.mcp_router         import mcp_router            # noqa: E402
 
-app.include_router(chat_router,        prefix="/api")
-app.include_router(git_router,         prefix="/api")
-app.include_router(ci_router,          prefix="/api")
-app.include_router(diagnostics_router, prefix="/api")
-app.include_router(feedback_router,    prefix="/api")
-app.include_router(code_actions_router, prefix="/api")
-app.include_router(mcp_router)
+# Authentication endpoints — always public (login lives here).
+app.include_router(auth_router, prefix="/api")
+
+# Everything else requires a valid access token (bypassed when AUTH_REQUIRED=false).
+_auth = [Depends(get_current_user)]
+app.include_router(chat_router,        prefix="/api", dependencies=_auth)
+app.include_router(git_router,         prefix="/api", dependencies=_auth)
+app.include_router(ci_router,          prefix="/api", dependencies=_auth)
+app.include_router(diagnostics_router, prefix="/api", dependencies=_auth)
+app.include_router(feedback_router,    prefix="/api", dependencies=_auth)
+app.include_router(code_actions_router, prefix="/api", dependencies=_auth)
+app.include_router(mcp_router,         dependencies=_auth)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -269,7 +309,7 @@ async def health():
 # Analyze File (WatchGraph one-shot)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/analyze/file", response_model=AnalysisResultResponse)
+@app.post("/analyze/file", response_model=AnalysisResultResponse, dependencies=[Depends(get_current_user)])
 async def analyze_file(req: AnalyzeFileRequest):
     """
     Analyse un fichier unique via le WatchGraph (pipeline complet).
@@ -347,7 +387,7 @@ async def analyze_file(req: AnalyzeFileRequest):
 # Analyze Project
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/analyze/project", response_model=ProjectAnalysisResponse)
+@app.post("/analyze/project", response_model=ProjectAnalysisResponse, dependencies=[Depends(get_current_user)])
 async def analyze_project(req: AnalyzeProjectRequest):
     """Analyse architecturale d'un projet complet."""
     project_path = Path(req.project_path)
@@ -381,7 +421,7 @@ async def analyze_project(req: AnalyzeProjectRequest):
 # Watch Mode — WatchGraph
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/watch/start")
+@app.post("/watch/start", dependencies=[Depends(get_current_user)])
 async def watch_start(req: WatchStartRequest):
     """
     Démarre la surveillance en temps réel via WatchGraph.
@@ -409,6 +449,21 @@ async def watch_start(req: WatchStartRequest):
         with pending_lock:
             pending_timers.pop(str(fp), None)
 
+        # ── Phase A : signal immédiat avant le pipeline LLM (< 1ms) ──────────
+        _loop = _main_loop
+        if _loop and _loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                _ws_manager.broadcast({
+                    "type":      "analysis_started",
+                    "file_path": str(fp),
+                    "file_name": fp.name,
+                    "language":  _ext_to_language(fp),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }),
+                _loop,
+            )
+
+        # ── Phase B : pipeline complet (hash → AST → RAG → LLM → learn) ─────
         result = invoke_watch(
             file_path=str(fp),
             project_path=proj_key,
@@ -525,7 +580,7 @@ async def watch_start(req: WatchStartRequest):
         raise HTTPException(500, f"watch_start failed: {type(e).__name__}: {e}")
 
 
-@app.post("/watch/stop")
+@app.post("/watch/stop", dependencies=[Depends(get_current_user)])
 async def watch_stop(req: WatchStartRequest):
     """Arrête la surveillance d'un projet."""
     proj_key = str(Path(req.project_path).resolve())
@@ -546,7 +601,7 @@ async def watch_stop(req: WatchStartRequest):
     return {"status": "stopped", "files_analyzed": ctx["counter"].get("analyzed", 0)}
 
 
-@app.get("/watch/status", response_model=WatchStatusResponse)
+@app.get("/watch/status", response_model=WatchStatusResponse, dependencies=[Depends(get_current_user)])
 async def watch_status():
     """État de tous les watchers actifs."""
     if not _watch_active:
@@ -566,7 +621,7 @@ async def watch_status():
     )
 
 
-@app.get("/watch/events/latest")
+@app.get("/watch/events/latest", dependencies=[Depends(get_current_user)])
 async def watch_events_latest(project_path: str = ""):
     """
     Retourne le dernier snapshot d'événements WS pour un projet.
@@ -592,7 +647,7 @@ async def watch_events_latest(project_path: str = ""):
 # ══════════════════════════════════════════════════════════════════════════════
 # Generate Tests
 # ══════════════════════════════════════════════════════════════════════════════
-@app.post("/generate-tests", response_model=GenerateTestsResponse)
+@app.post("/generate-tests", response_model=GenerateTestsResponse, dependencies=[Depends(get_current_user)])
 async def generate_tests(req: GenerateTestsRequest):
     """Génère des tests unitaires via TestGeneratorAgent (RAG)."""
     file_path = Path(req.file_path)
@@ -602,14 +657,23 @@ async def generate_tests(req: GenerateTestsRequest):
 
     try:
         from agents.test_generator_agent import TestGeneratorAgent
+        from services.knowledge_graph import knowledge_graph as _kg
 
         project_path = Path(req.project_path).resolve() if req.project_path else file_path.parent
-        agent = TestGeneratorAgent(project_path=project_path)
+
+        # Injecter les composants RAG initialisés au démarrage du serveur
+        agent = TestGeneratorAgent(
+            project_path=project_path,
+            test_kb=_watch_services.get("test_kb"),
+            project_code_indexer=_watch_services.get("project_indexer"),
+            knowledge_graph=_kg if getattr(_kg, "_built", False) else None,
+        )
 
         result = await asyncio.to_thread(
             agent.generate_for_file,
             file_path,
             req.write,
+            req.incremental,
         )
 
         if not isinstance(result, dict):
@@ -636,6 +700,7 @@ async def generate_tests(req: GenerateTestsRequest):
             framework=str(framework or ""),
             rag_docs_used=int(rag_docs_used or 0),
             validated=bool(validated or False),
+            incremental=bool(result.get("incremental") or False),
             error=str(error or ""),
         )
 
@@ -654,7 +719,7 @@ async def generate_tests(req: GenerateTestsRequest):
 # Stats
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(get_current_user)])
 async def get_stats():
     total_analyzed = sum(c["counter"].get("analyzed", 0) for c in _watch_active.values())
     total_skipped  = sum(c["counter"].get("skipped",  0) for c in _watch_active.values())
@@ -679,7 +744,7 @@ async def get_stats():
 # Legacy Compat — /results stub
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/results")
+@app.get("/results", dependencies=[Depends(get_current_user)])
 async def get_results_legacy():
     """
     Legacy endpoint kept for plugin backward compatibility.
@@ -694,7 +759,7 @@ async def get_results_legacy():
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(default="")):
     """
     WebSocket pour events temps réel (watch + CI + git alerts).
 
@@ -707,6 +772,11 @@ async def websocket_endpoint(websocket: WebSocket):
       {"type": "file_deleted", "file": "..."}
       {"type": "ci_event", ...}
     """
+    # Authenticate the WebSocket handshake (?token=<access JWT>).
+    if authenticate_ws(token) is None:
+        await websocket.close(code=1008)
+        return
+
     await _ws_manager.connect(websocket)
     try:
         await _ws_manager.send_to(websocket, {
@@ -725,6 +795,14 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "analyze_file":
                 fp = data.get("file_path", "")
                 if fp:
+                    # ── Phase A : feedback immédiat avant le pipeline LLM ─────
+                    await _ws_manager.send_to(websocket, {
+                        "type":      "analysis_started",
+                        "file_path": fp,
+                        "file_name": Path(fp).name,
+                        "language":  _ext_to_language(Path(fp)),
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    })
                     try:
                         from langchain_agents.graphs.watch_graph import invoke_watch
                         result = await asyncio.to_thread(
@@ -733,13 +811,21 @@ async def websocket_endpoint(websocket: WebSocket):
                             project_path=data.get("project_path", "."),
                             project_indexer=_watch_services.get("project_indexer"),
                             extractor=_watch_services.get("extractor"),
+                            rag_system=_watch_services.get("rag_system"),
+                            dep_graph=_watch_services.get("dep_graph"),
                         )
-                        await _ws_manager.send_to(websocket, {
-                            "type":     "analysis_result",
-                            "file":     Path(fp).name,
-                            "strategy": result.get("strategy", "?"),
-                            "skipped":  bool(result.get("skip_reason")),
-                        })
+                        # ── Phase B : ws_events complets schema v2.0 ─────────
+                        ws_events = result.get("ws_events") or []
+                        if ws_events:
+                            for event in ws_events:
+                                await _ws_manager.send_to(websocket, event)
+                        else:
+                            await _ws_manager.send_to(websocket, {
+                                "type":     "analysis_result",
+                                "file":     Path(fp).name,
+                                "strategy": result.get("strategy", "?"),
+                                "skipped":  bool(result.get("skip_reason")),
+                            })
                     except Exception as e:
                         await _ws_manager.send_to(websocket, {"type": "error", "detail": str(e)})
                 else:

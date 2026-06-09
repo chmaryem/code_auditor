@@ -14,6 +14,42 @@ from typing import Any, Dict, List, Tuple
 from langchain_core.tools import tool
 
 _fallback_rag_instance = None
+_fallback_indexer_instance = None
+
+
+def _get_project_code_indexer():
+    """Return a live ProjectCodeIndexer instance for tool_index_file_chromadb.
+
+    Priority:
+      1. Orchestrator's initialized instance (retriever_agent._project_code_indexer)
+         — preferred: shares the already-loaded Jina embeddings and the same
+         `project_code_index` collection used by the rest of the pipeline.
+      2. Lazy fallback: build one reusing assistant_agent's embeddings.
+         Writes to the same store/collection (COLLECTION_NAME is a class constant),
+         so retrieval stays consistent regardless of which path created it.
+
+    Returns None only if no embeddings/indexer can be obtained at all.
+    """
+    # 1. Live instance wired by the orchestrator
+    try:
+        from agents.retriever_agent import retriever_agent
+        if retriever_agent._project_code_indexer is not None:
+            return retriever_agent._project_code_indexer
+    except Exception:
+        pass
+
+    # 2. Lazy fallback — reuse the Jina embeddings already loaded by assistant_agent
+    global _fallback_indexer_instance
+    if _fallback_indexer_instance is None:
+        try:
+            from services.knowledge_loader import ProjectCodeIndexer
+            from services.llm_service import assistant_agent
+            _fallback_indexer_instance = ProjectCodeIndexer(
+                embeddings=assistant_agent.embeddings
+            )
+        except Exception:
+            return None
+    return _fallback_indexer_instance
 
 
 @tool
@@ -95,17 +131,31 @@ def tool_kg_detect_patterns(code: str, language: str) -> List[str]:
 def tool_index_file_chromadb(file_path: str, content: str, entities: list) -> int:
     """Index a single file into ChromaDB via ProjectCodeIndexer.
 
+    Reindexes the file's code (method-by-method when entities are provided,
+    otherwise generic chunks) into the `project_code_index` collection, so later
+    System-Aware RAG can surface similar real project code. The old version of
+    the file is replaced first, keeping the collection in sync.
+
     Args:
         file_path: Absolute file path.
         content: File content.
-        entities: Parsed AST entities list.
+        entities: Parsed AST entities list (dicts or CodeEntity objects).
 
     Returns:
-        Number of chunks indexed.
+        Number of chunks indexed (0 if no indexer is available or ChromaDB is
+        momentarily locked — the call is always non-blocking).
     """
-    # This is called by the graph node; the indexer must be passed via state
-    # We return 0 here as a fallback — the real indexing happens in the graph node
-    return 0
+    indexer = _get_project_code_indexer()
+    if indexer is None:
+        return 0
+    try:
+        return indexer.index_file(
+            file_path=Path(file_path),
+            content=content,
+            entities=entities or [],
+        )
+    except Exception:
+        return 0
 
 
 @tool

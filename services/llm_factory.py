@@ -65,6 +65,47 @@ def _call_openrouter_http(prompt: str, api_key: str, model: str, max_tokens: int
     return choices[0]["message"]["content"]
 
 
+def _call_groq_http(prompt: str, api_key: str, model: str, max_tokens: int = 2048) -> str:
+    """Groq — API compatible OpenAI, free et très rapide.
+    Sert de fallback entre OpenRouter et Gemini.
+    """
+    import requests
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=(15, 180),
+    )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Groq HTTP {response.status_code}: {response.text[:1000]}"
+        )
+
+    data = response.json()
+    choices = data.get("choices", [])
+
+    if not choices:
+        raise ValueError(f"Groq: réponse vide — {data}")
+
+    return choices[0]["message"]["content"]
+
+
 def _call_gemini_http(prompt: str, api_key: str, model: str = "gemini-2.5-flash", max_tokens: int = 2048) -> str:
     import requests
 
@@ -138,6 +179,30 @@ def _build_openrouter_llm(
     ), resolved_model 
 
 
+def _build_groq_llm(
+    model: str | None = None,
+    temperature: float = 0.0,
+    max_tokens: int = 8192,
+):
+    """Construit un LLM via Groq (API compatible OpenAI). Fallback free et rapide."""
+    from langchain_openai import ChatOpenAI
+    from config import config
+
+    api_key = config.api.groq_api_key or os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY non défini")
+
+    resolved_model = model or config.api.groq_model
+
+    return ChatOpenAI(
+        model       = resolved_model,
+        api_key     = api_key,
+        base_url    = "https://api.groq.com/openai/v1",
+        temperature = temperature,
+        max_tokens  = max_tokens,
+    )
+
+
 def _build_gemini_llm(
     model: str | None = None,
     temperature: float = 0.0,
@@ -196,27 +261,47 @@ def invoke_with_fallback(
     if api_key:
         model      = config.api.openrouter_model or "mistralai/mistral-7b-instruct:free"
         short_name = model.split("/")[-1].replace(":free", "")
+        # 1 seule tentative : les modèles :free sont throttlés en amont (pool partagé) ;
+        # inutile d'attendre 100s en backoff — on bascule tout de suite sur Groq.
+        try:
+            print(f"    [{short_name}] {label} — appel HTTP...")
+            text = _call_openrouter_http(prompt_text, api_key, model, max_tokens)
+            logger.info("[%s] réponse via OpenRouter/%s (HTTP)", label, short_name)
+            return text
+        except Exception as e:
+            err = str(e)
+            if _is_quota_error(err):
+                logger.info("[%s] OpenRouter rate-limited → bascule Groq", label)
+            elif _is_auth_error(err):
+                logger.error("[%s] OpenRouter clé invalide", label)
+            else:
+                logger.warning("[%s] OpenRouter HTTP erreur: %s", label, err[:150])
+
+    # ── 2. Groq via HTTP (fallback free, très rapide) ────────────────────────
+    api_key = config.api.groq_api_key or os.getenv("GROQ_API_KEY", "")
+    if api_key:
+        model = config.api.groq_model or "llama-3.3-70b-versatile"
         for attempt in range(4):
             try:
-                print(f"    [{short_name}] {label} — appel HTTP (tentative {attempt + 1}/4)...")
-                text = _call_openrouter_http(prompt_text, api_key, model, max_tokens)
-                logger.info("[%s] réponse via OpenRouter/%s (HTTP)", label, short_name)
+                print(f"    [Groq/{model}] {label} — appel HTTP (tentative {attempt + 1}/4)...")
+                text = _call_groq_http(prompt_text, api_key, model, min(max_tokens, 8192))
+                logger.info("[%s] réponse via Groq/%s (HTTP)", label, model)
                 return text
             except Exception as e:
                 err = str(e)
                 if _is_quota_error(err):
                     if attempt < 3:
                         wait = _BACKOFF[attempt]
-                        print(f"   ⚠️  [{short_name}] quota — attente {wait}s...")
+                        print(f"   ⚠️  [Groq] quota — attente {wait}s...")
                         time.sleep(wait)
                     else:
-                        logger.error("[%s] OpenRouter épuisé après 4 tentatives", label); break
+                        logger.error("[%s] Groq épuisé après 4 tentatives", label); break
                 elif _is_auth_error(err):
-                    logger.error("[%s] OpenRouter clé invalide", label); break
+                    logger.error("[%s] Groq clé invalide", label); break
                 else:
-                    logger.warning("[%s] OpenRouter HTTP erreur: %s", label, err[:150]); break
+                    logger.warning("[%s] Groq HTTP erreur: %s", label, err[:150]); break
 
-    # ── 2. Gemini via HTTP (zéro PyTorch) ────────────────────────────────────
+    # ── 3. Gemini via HTTP (zéro PyTorch) ────────────────────────────────────
     api_key = config.api.gemini_api_key or os.getenv("GOOGLE_API_KEY", "")
     if api_key:
         model = config.api.gemini_model or "gemini-2.0-flash"
@@ -249,12 +334,20 @@ def build_llm_cascade_for_agent(
     max_tokens: int = 8192,
 ) -> list:
     """Retourne la cascade [(name, llm)] pour les agents."""
+    from config import config
+
     cascade = []
     # OpenRouter (premier modèle de la rotation)
     try:
         llm, model_name = _build_openrouter_llm(temperature=temperature, max_tokens=max_tokens)
         short = model_name.split("/")[-1].replace(":free", "")
         cascade.append((f"OpenRouter/{short}", llm))
+    except ValueError:
+        pass
+    # Groq fallback (free, rapide)
+    try:
+        llm = _build_groq_llm(temperature=temperature, max_tokens=max_tokens)
+        cascade.append((f"Groq/{config.api.groq_model}", llm))
     except ValueError:
         pass
     # Gemini fallback
@@ -264,3 +357,58 @@ def build_llm_cascade_for_agent(
     except ValueError:
         pass
     return cascade
+
+
+# ── P2 · Routage par complexité ─────────────────────────────────────────────
+
+# Budget de tokens en SORTIE par niveau : une question "fast" n'a pas besoin
+# d'une réponse de 8k tokens → on économise sans dégrader la qualité.
+_MAX_TOKENS_BY_LEVEL = {"fast": 1024, "context": 4096, "deep": 8192}
+
+
+def build_llm_for_level(
+    level: str = "context",
+    temperature: float = 0.0,
+    max_tokens: int | None = None,
+):
+    """Construit un LLM dont le modèle PRIMAIRE dépend du niveau de complexité
+    (fast | context | deep) décidé par le Decision Agent.
+
+    Les deux autres providers restent ajoutés en fallback → la fiabilité est
+    identique à l'ancien comportement, seul le modèle qui répond en premier change.
+
+    Le mapping niveau → (provider, model) est centralisé dans
+    config.api.model_for_level() : c'est le seul endroit à éditer pour changer
+    de modèles (ou via .env : FAST_PROVIDER/FAST_MODEL/CONTEXT_*/DEEP_*).
+    """
+    from config import config
+
+    level = level if level in ("fast", "context", "deep") else "context"
+    provider, model = config.api.model_for_level(level)
+    if max_tokens is None:
+        max_tokens = _MAX_TOKENS_BY_LEVEL.get(level, 4096)
+
+    def _build(p: str, m: str):
+        if p == "groq":
+            return _build_groq_llm(model=m or None, temperature=temperature, max_tokens=max_tokens)
+        if p == "gemini":
+            return _build_gemini_llm(model=m or None, temperature=temperature, max_tokens=max_tokens)
+        # défaut : openrouter (renvoie un tuple (llm, model_name))
+        return _build_openrouter_llm(model=m or None, temperature=temperature, max_tokens=max_tokens)[0]
+
+    # Primaire = provider du niveau ; les autres deviennent fallback (sans forcer
+    # de modèle particulier → ils utilisent leur modèle par défaut).
+    order = [provider] + [p for p in ("groq", "openrouter", "gemini") if p != provider]
+    llms = []
+    for p in order:
+        try:
+            llms.append(_build(p, model if p == provider else ""))
+        except Exception as e:
+            logger.debug("build_llm_for_level(%s): provider %s indisponible: %s", level, p, e)
+
+    if not llms:
+        logger.warning("build_llm_for_level(%s): aucun provider LLM disponible", level)
+        return None
+
+    primary = llms[0]
+    return primary.with_fallbacks(llms[1:]) if len(llms) > 1 else primary

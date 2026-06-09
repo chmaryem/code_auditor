@@ -25,6 +25,7 @@ from langchain_agents.tools.rag_tools import (
     tool_kg_detect_patterns,
     tool_rag_retrieve,
 )
+from langchain_agents.tools.code_tools import tool_detect_language
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,12 @@ class LCRetrieverAgent(BaseRetriever):
     This retriever is composable with any LangChain chain via the | operator.
     """
 
+    # Optional context. When set, _get_relevant_documents (the interface used by
+    # the `|` operator) becomes system-aware instead of forcing the basic path.
+    # Both default to the previous behavior → fully backward compatible.
+    language: str = "unknown"
+    file_path: str = ""
+
     class Config:
         arbitrary_types_allowed = True
 
@@ -54,7 +61,12 @@ class LCRetrieverAgent(BaseRetriever):
         """
         Retrieve documents using the 2-pass system-aware pipeline.
 
-        This is the LangChain BaseRetriever interface method.
+        LangChain BaseRetriever interface (used by the `|` operator). When a
+        `file_path`/`language` context is configured (e.g. via `for_file()`),
+        it resolves the language from the extension and pulls the dependency-
+        graph neighborhood, so composing the retriever in a chain no longer
+        forces the basic fallback. With no context set, it degrades gracefully
+        to basic retrieval (previous behavior).
 
         Args:
             query: The code content to find relevant knowledge for.
@@ -62,12 +74,32 @@ class LCRetrieverAgent(BaseRetriever):
         Returns:
             List of relevant Document objects.
         """
-        # For basic retrieval, use the tool directly
+        language = self.language or "unknown"
+        file_name = "unknown"
+        neighborhood: Dict[str, Any] = {}
+
+        if self.file_path:
+            file_name = Path(self.file_path).name
+            if language == "unknown":
+                try:
+                    language = tool_detect_language.invoke(
+                        {"file_path": self.file_path}
+                    ) or "unknown"
+                except Exception:
+                    language = "unknown"
+            # System-aware: dependency-graph neighborhood for this file
+            try:
+                neighborhood = tool_get_neighborhood.invoke(
+                    {"file_path": self.file_path}
+                )
+            except Exception:
+                neighborhood = {}
+
         result = tool_rag_retrieve.invoke({
             "code": query,
-            "neighborhood": {},
-            "file_name": "unknown",
-            "language": "unknown",
+            "neighborhood": neighborhood,
+            "file_name": file_name,
+            "language": language,
         })
 
         docs = []
@@ -78,6 +110,21 @@ class LCRetrieverAgent(BaseRetriever):
                     metadata=d.get("metadata", {}),
                 ))
         return docs
+
+    def for_file(
+        self,
+        file_path: str,
+        language: str = "unknown",
+    ) -> "LCRetrieverAgent":
+        """
+        Return a NEW retriever bound to a file's context.
+
+        Keeps the retriever system-aware when composed via `|` without mutating
+        the shared singleton (thread-safe for concurrent multi-agent graphs):
+
+            chain = lc_retriever_agent.for_file(path) | prompt | llm
+        """
+        return self.__class__(file_path=str(file_path), language=language)
 
     def retrieve_with_context(
         self,

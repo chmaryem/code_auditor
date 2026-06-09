@@ -65,12 +65,40 @@ class LCChatAgent:
             tool_chat_rag_retrieve,
         ]
         self._llm = None
+        self._llm_by_level: Dict[str, Any] = {}   # P2 · LLM par context_level
 
     @property
     def llm(self):
-        if self._llm is None:
-            self._llm = _build_chat_llm()
-        return self._llm
+        # Rétro-compat : modèle de niveau "context" (cas normal).
+        return self._llm_for_level("context")
+
+    def _llm_for_level(self, level: str = "context"):
+        """P2 · Retourne le LLM correspondant au context_level décidé par le
+        Decision Agent (fast | context | deep).
+
+        - Si ROUTE_BY_COMPLEXITY=false → renvoie l'unique LLM historique.
+        - Sinon → construit (paresseusement, puis cache) un LLM dont le modèle
+          primaire dépend du niveau, le mapping étant centralisé dans
+          config.api.model_for_level().
+        Tombe sur le LLM historique si la construction par niveau échoue.
+        """
+        from config import config
+
+        if not getattr(config.api, "route_by_complexity", False):
+            if self._llm is None:
+                self._llm = _build_chat_llm()
+            return self._llm
+
+        level = level if level in ("fast", "context", "deep") else "context"
+        if level not in self._llm_by_level:
+            llm = None
+            try:
+                from services.llm_factory import build_llm_for_level
+                llm = build_llm_for_level(level)
+            except Exception as e:
+                logger.warning("ChatAgent: build_llm_for_level(%s) failed: %s", level, e)
+            self._llm_by_level[level] = llm if llm is not None else _build_chat_llm()
+        return self._llm_by_level[level]
 
 
 
@@ -297,7 +325,7 @@ Developer question:
             )
 
         prompt_text = self._build_fast_prompt(state)
-        return self._call_llm_raw(prompt_text, label="chat_fast_answer")
+        return self._call_llm_raw(prompt_text, label="chat_fast_answer", level="fast")
 
     async def afast_answer(self, state: Dict[str, Any], config: Any = None) -> str:
         """Async fast answer path for SSE token streaming."""
@@ -310,15 +338,16 @@ Developer question:
             )
 
         prompt_text = self._build_fast_prompt(state)
-        return await self._acall_llm_raw(prompt_text, label="chat_fast_answer", config=config)
+        return await self._acall_llm_raw(prompt_text, label="chat_fast_answer", config=config, level="fast")
 
     def answer(self, state: Dict[str, Any]) -> str:
         """Contextual/deep synchronous answer path."""
         prompt, inputs = self._build_context_prompt(state)
+        llm = self._llm_for_level(state.get("context_level", "context"))
 
         try:
-            if self.llm is not None:
-                chain = prompt | self.llm | StrOutputParser()
+            if llm is not None:
+                chain = prompt | llm | StrOutputParser()
                 return chain.invoke(inputs)
         except Exception as e:
             logger.error("ChatAgent LLM answer failed: %s", e)
@@ -340,10 +369,11 @@ Developer question:
     async def aanswer(self, state: Dict[str, Any], config: Any = None) -> str:
         """Async contextual/deep answer path for LangGraph streaming."""
         prompt, inputs = self._build_context_prompt(state)
+        llm = self._llm_for_level(state.get("context_level", "context"))
 
         try:
-            if self.llm is not None:
-                chain = prompt | self.llm | StrOutputParser()
+            if llm is not None:
+                chain = prompt | llm | StrOutputParser()
                 if config:
                     return await chain.ainvoke(inputs, config=config)
                 return await chain.ainvoke(inputs)
@@ -563,13 +593,14 @@ Developer question:
 
         return ""
 
-    def _call_llm_raw(self, prompt_text: str, label: str = "chat") -> str:
+    def _call_llm_raw(self, prompt_text: str, label: str = "chat", level: str = "context") -> str:
         """Call LLM with raw text prompt — used by sync fast mode and generation methods."""
+        llm = self._llm_for_level(level)
         try:
-            if self.llm is not None:
+            if llm is not None:
                 from langchain_core.messages import HumanMessage
 
-                result = self.llm.invoke([HumanMessage(content=prompt_text)])
+                result = llm.invoke([HumanMessage(content=prompt_text)])
                 return getattr(result, "content", str(result))
         except Exception as e:
             logger.error("%s LLM call failed: %s", label, e)
@@ -583,16 +614,17 @@ Developer question:
 
         return f"[{label}] LLM unavailable — check API keys."
 
-    async def _acall_llm_raw(self, prompt_text: str, label: str = "chat", config: Any = None) -> str:
+    async def _acall_llm_raw(self, prompt_text: str, label: str = "chat", config: Any = None, level: str = "context") -> str:
         """Async raw LLM call — used by streaming fast mode."""
+        llm = self._llm_for_level(level)
         try:
-            if self.llm is not None:
+            if llm is not None:
                 from langchain_core.messages import HumanMessage
 
                 if config:
-                    result = await self.llm.ainvoke([HumanMessage(content=prompt_text)], config=config)
+                    result = await llm.ainvoke([HumanMessage(content=prompt_text)], config=config)
                 else:
-                    result = await self.llm.ainvoke([HumanMessage(content=prompt_text)])
+                    result = await llm.ainvoke([HumanMessage(content=prompt_text)])
                 return getattr(result, "content", str(result))
         except Exception as e:
             logger.error("%s async LLM call failed: %s", label, e)

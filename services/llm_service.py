@@ -589,27 +589,26 @@ REASON: [one sentence explaining why this strategy is the most effective]
 
 Use this decision tree — in ORDER of priority:
 
-  → full_class       if ANY of these is true:
-                       • An undeclared variable is used in 3+ methods (systemic)
-                       • The class uses a wrong pattern throughout (e.g. every method
-                         needs dataSource.getConnection() but uses `connection` instead)
-                       • 5+ methods need structural rewriting (not just small patches)
-                       • Fixing method A correctly requires changing method B and C
-                       → When in doubt between full_class and targeted_methods,
-                         CHOOSE full_class. A complete rewrite is always safer.
+  → block_fix        DEFAULT — prefer this for real-time / per-save review.
+                       Use whenever each problem maps to a few specific lines that can
+                       be patched independently (the common case). Produce ONE targeted
+                       fix PER issue, where current_code = ONLY the exact broken lines
+                       (2-6 lines), NEVER the whole file. Different issues → different
+                       fixes at different locations.
 
-  → targeted_methods if ALL of these are true:
-                       • Only 2-4 specific methods have problems
-                       • The other methods are clean and correct
-                       • Each affected method can be fixed independently
-                       • No systemic undeclared variable or wrong class design
-                       IMPORTANT: If you choose targeted_methods, you MUST produce
-                       a ---METHOD START: name--- block for EVERY method you listed
-                       in SCOPE. Zero method blocks = wrong choice, use full_class.
+  → targeted_methods if 2-4 specific methods each need a full rewrite AND the other
+                       methods are clean. You MUST produce a ---METHOD START: name---
+                       block for EVERY method listed in SCOPE.
 
-  → block_fix        if: problems are genuinely small (1-2 issues, localized patches)
-                         Never use for undeclared variables or resource leaks across
-                         multiple methods.
+  → full_class       ONLY when the problem is genuinely systemic and CANNOT be
+                       expressed as per-line patches:
+                       • An undeclared variable / wrong pattern repeated across 5+ methods
+                       • Fixing one method structurally forces rewriting most others
+                       Do NOT choose full_class just to be "safe". Rewriting code that
+                       is not broken introduces regressions and hallucinated references
+                       to fields/files that do not exist in THIS file.
+                       → When in doubt, CHOOSE block_fix with one targeted snippet per
+                         issue. Never touch lines that are not part of a reported issue.
 
 ═══════════════════════════════════════════════════════════════
 STEP 2 — GENERATE THE FIX MATCHING YOUR DECISION
@@ -642,11 +641,15 @@ IF STRATEGY = full_class:
      • No java.util.Optional unless the original already imports it.
      • No Order, no DTO classes, no new framework annotations.
 
-  E. Fix ALL of these without inventing new architecture:
-     → Replace 'connection' (undeclared) with 'dataSource.getConnection()' in try-with-resources
-     → Wrap every Statement/PreparedStatement/ResultSet/Connection in try-with-resources
-     → Replace string-concatenated SQL with PreparedStatement + setXxx()
-     → Add rollback in batchInsert: catch(SQLException e){{ conn.rollback(); throw e; }}
+  E. Fix every reported issue using THIS file's language idioms ONLY.
+     • Follow the LANGUAGE-SPECIFIC RULES section above for {language}.
+     • NEVER import patterns from another language. In Python NEVER write
+       dataSource.getConnection(), PreparedStatement, try-with-resources, or
+       SQLAlchemy create_engine unless they already exist in the original file.
+       In JS/TS use JS/TS idioms; in Java use Java idioms. Stay within {language}.
+     • Resource safety per language: Python → 'with' context managers;
+       Java → try-with-resources; JS/TS → try/finally or using/await using.
+     • Parameterized queries per language's real DB-API — never invent a new one.
 
   F. Write CLEAN code — minimal inline comments.
      • DO NOT add // PROBLEM 4: ..., // CRITICAL:, // Fixed by try-with-resources, // MEDIUM: etc.
@@ -729,8 +732,17 @@ summary. Use EXACTLY the markers below — the API parser depends on them.
 Rules for STRUCTURED_OUTPUT:
 - strategy must match exactly what you chose in ---DECISION---
 - issues must include EVERY problem you reported, one entry per issue
-- fixes must parallel the ---FIX START--- blocks you produced (one-to-one)
-- For full_class strategy: fixes[0].apply_mode = "full_file", current_code = first 3 lines of original class, fixed_code = first 3 lines of your solution
+- fixes must parallel the issues ONE-TO-ONE: issue[i] is fixed by fixes[i]
+- For block_fix (the DEFAULT): produce ONE fix per issue.
+    • apply_mode = "replace_snippet"
+    • current_code = ONLY the exact broken lines copied verbatim from the original
+      source (2-6 lines max) — NEVER the whole file, NEVER lines from another issue
+    • fixed_code = the corrected version of those SAME lines only
+    • each fix.line points to the specific issue location; fixes target DIFFERENT lines
+- For full_class only (rare, systemic): a SINGLE fix with apply_mode = "full_file",
+  current_code = first 3 lines of original, fixed_code = first 3 lines of your solution
+- current_code MUST be an exact substring of the original source — if you cannot copy
+  it verbatim, the fix is wrong; re-read the source and copy the real lines
 - All strings must be valid JSON (escape quotes, no raw newlines inside strings — use \\n)
 - If there are no issues, output: "issues": [], "fixes": []
 
@@ -781,6 +793,19 @@ ANALYZE NOW — START WITH ---DECISION---:"""
             relevant_docs, rag_scores = self._retrieve_relevant_knowledge(
                 query    = code,
                 language = language,
+            )
+
+        # 1b. P4 · Compression contextuelle (anti-doublons + filtre pertinence).
+        #     Sans appel LLM ; réduit les tokens du knowledge_context à qualité égale.
+        if config.rag.compression_enabled and relevant_docs:
+            from services.context_compression import compress_documents
+            relevant_docs, rag_scores = compress_documents(
+                relevant_docs,
+                query                = code,
+                embeddings           = self.embeddings,
+                scores               = rag_scores,
+                similarity_threshold = config.rag.compression_threshold,
+                min_keep             = config.rag.compression_min_keep,
             )
 
         # 2. Formatage du contexte de connaissance

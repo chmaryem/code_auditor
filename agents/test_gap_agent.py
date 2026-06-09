@@ -180,5 +180,21 @@ class TestGapAgent:
         return " — ".join(parts)
 
 
-# Singleton (ré-initialisé dans Orchestrator.initialize())
+def get_test_gap_agent(project_path: Path | None = None) -> "TestGapAgent":
+    """
+    Retourne un TestGapAgent pour le projet donné.
+    Utilise un cache par project_path pour éviter de recréer TestDiscoveryService à chaque appel.
+    Si project_path est None, utilise Path(".") comme fallback (compatibilité CLI).
+    """
+    path = project_path or Path(".")
+    key = str(path.resolve())
+    if key not in _agent_cache:
+        _agent_cache[key] = TestGapAgent(path)
+    return _agent_cache[key]
+
+
+_agent_cache: dict = {}
+
+# Compatibilité rétrograde — les imports existants continuent de fonctionner
+# mais le singleton est maintenant créé lazily pour éviter Path(".") hardcodé
 test_gap_agent = TestGapAgent(Path("."))

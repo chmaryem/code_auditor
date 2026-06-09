@@ -55,18 +55,31 @@ class TestGeneratorAgent:
 
     # ── API publique ─────────────────────────────────────────────────────────
 
-    def generate_for_file(self, source_path: Path, write: bool = False) -> Dict[str, Any]:
+    def generate_for_file(
+        self,
+        source_path: Path,
+        write: bool = False,
+        incremental: bool = False,
+    ) -> Dict[str, Any]:
         """
         Génère un fichier de test pour `source_path`.
 
+        Args:
+            source_path: Fichier source à tester.
+            write: Écrire le résultat sur disque.
+            incremental: Si True et qu'un fichier de test existe déjà,
+                génère uniquement les méthodes manquantes et les insère
+                à la fin du fichier existant plutôt que de l'écraser.
+
         Returns:
             {
-                "test_file":  Path or None,
-                "test_code":  str,
-                "framework":  str,
-                "error":      str or None,
+                "test_file":   Path or None,
+                "test_code":   str,
+                "framework":   str,
+                "error":       str or None,
                 "rag_docs_used": int,
-                "validated": bool,
+                "validated":   bool,
+                "incremental": bool,
             }
         """
         if not source_path.exists():
@@ -83,60 +96,82 @@ class TestGeneratorAgent:
         except Exception as e:
             return {"error": f"Lecture impossible : {e}", "test_file": None}
 
-        # 3. Parsing — signatures publiques
-        public_signatures = self._extract_signatures(source_code, source_path)
+        # 3. Parsing — toutes les signatures (public + private pour la validation)
+        all_signatures = self._extract_signatures(source_code, source_path)
 
         # 4. Extraction des imports du fichier source
         source_imports = self._extract_imports(source_code, source_path)
 
-        # 5. RAG — patterns de test + exemples du projet
-        rag_context = self._retrieve_rag_context(source_path, source_code, public_signatures)
+        # 5. Déterminer le chemin cible tôt pour le mode incrémentiel
+        target_path = self._build_target_path(source_path, convention)
+        language = self._detect_language(source_path)
 
-        # 6. Contexte Knowledge Graph (dépendances, classes liées)
+        # ── Mode incrémentiel : détecter les entités déjà testées ────────────
+        is_incremental = False
+        existing_test_code = ""
+        untested_signatures = all_signatures
+
+        if incremental and target_path.exists():
+            try:
+                existing_test_code = target_path.read_text(encoding="utf-8", errors="replace")
+                untested_signatures = self._filter_untested_signatures(
+                    all_signatures, existing_test_code
+                )
+                if not untested_signatures:
+                    logger.info("Mode incrémentiel : toutes les entités sont déjà testées dans %s", target_path.name)
+                    return {
+                        "test_file": target_path,
+                        "test_code": existing_test_code,
+                        "framework": framework,
+                        "error": None,
+                        "rag_docs_used": 0,
+                        "validated": True,
+                        "incremental": True,
+                    }
+                is_incremental = True
+                logger.info(
+                    "Mode incrémentiel : %d entité(s) sans test dans %s",
+                    len(untested_signatures), source_path.name,
+                )
+            except Exception as e:
+                logger.warning("Mode incrémentiel : lecture du fichier de test existant échouée (%s), génération complète.", e)
+                is_incremental = False
+                untested_signatures = all_signatures
+
+        # 6. RAG — patterns de test + exemples du projet
+        rag_context = self._retrieve_rag_context(source_path, source_code, untested_signatures)
+
+        # 7. Contexte Knowledge Graph (dépendances, classes liées)
         kg_context = self._get_kg_context(source_path)
 
-        # 7. Prompt LLM enrichi
-        language = self._detect_language(source_path)
+        # 8. Prompt LLM enrichi
         prompt = self._build_prompt(
             source_path=source_path,
             source_code=source_code,
-            signatures=public_signatures,
+            signatures=untested_signatures,
             imports=source_imports,
             framework=framework,
             rag_context=rag_context,
             kg_context=kg_context,
             language=language,
+            incremental=is_incremental,
+            existing_test_code=existing_test_code,
         )
 
-        # 8. Génération LLM directe
+        # 9. Génération LLM directe
         test_code = self._call_llm(prompt, source_path.name)
         if not test_code:
             return {"error": "Le LLM n'a pas généré de code de test.", "test_file": None}
 
-        # 9. Validation post-génération (Python + Java)
-        validated = False
-        if language in ("python", "java"):
-            validated = self._validate_generated_test(
-                test_code, source_path, signatures=public_signatures,
-            )
-            if not validated:
-                # Retry avec le message d'erreur
-                logger.info("Test non valide, retry avec feedback d'erreur...")
-                test_code_v2 = self._retry_with_error(test_code, source_path, prompt)
-                if test_code_v2:
-                    validated = self._validate_generated_test(
-                        test_code_v2, source_path, signatures=public_signatures,
-                    )
-                    if validated:
-                        test_code = test_code_v2
-                        logger.info("Retry reussi: test valide apres correction")
-        else:
-            validated = True  # Pas de validation pour les autres langages
+        # 10. En mode incrémentiel : fusionner avec le fichier existant
+        if is_incremental:
+            test_code = self._merge_incremental(existing_test_code, test_code, language)
 
-        # 10. Déterminer le chemin cible
-        target_path = self._build_target_path(source_path, convention)
+        # 11. Validation post-génération (Python + Java + JS/TS)
+        # _run_validation retourne (code_final, is_valid) — le code peut avoir été corrigé par le retry
+        test_code, validated = self._run_validation(test_code, source_path, all_signatures, language, prompt)
 
-        # 11. Écriture si demandé
+        # 12. Écriture si demandé
         if write:
             try:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,7 +186,101 @@ class TestGeneratorAgent:
             "error": None,
             "rag_docs_used": rag_context.get("total_docs", 0),
             "validated": validated,
+            "incremental": is_incremental,
         }
+
+    # ── Helpers pour le mode incrémentiel ────────────────────────────────────
+
+    @staticmethod
+    def _filter_untested_signatures(
+        signatures: List[Dict[str, Any]], existing_test_code: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Retourne uniquement les signatures non encore couvertes dans le fichier de test existant.
+        Utilise la même logique que TestDiscoveryService.check_coverage pour la cohérence :
+          1. Extraire les noms des fonctions de test déclarées
+          2. Vérifier si le nom de l'entité est référencé dans ces noms
+          3. Fallback : appel direct name( dans le corps du test
+        """
+        # Extraire les noms de fonctions de test (Python, Java, JS/TS)
+        test_func_names: set = set(re.findall(
+            r"(?:def\s+|function\s+|it\s*\(|test\s*\()([A-Za-z_]\w*)",
+            existing_test_code,
+        ))
+        test_func_lower = {n.lower() for n in test_func_names}
+
+        untested = []
+        for sig in signatures:
+            name = sig.get("name", "")
+            if not name:
+                continue
+            name_lower = name.lower()
+
+            # Entité couverte si un nom de méthode de test la référence
+            is_covered = any(
+                name_lower in fn_lower
+                or fn_lower.startswith(("test_" + name_lower, name_lower + "test"))
+                for fn_lower in test_func_lower
+            )
+            # Fallback : appel direct dans le corps du test (hors commentaires)
+            if not is_covered:
+                is_covered = bool(re.search(
+                    rf"(?<!#)(?<!//)(?<!\*)\b{re.escape(name)}\s*[\(\.]",
+                    existing_test_code,
+                ))
+            if not is_covered:
+                untested.append(sig)
+        return untested
+
+    @staticmethod
+    def _merge_incremental(existing: str, new_methods: str, language: str) -> str:
+        """
+        Insère les nouvelles méthodes de test dans le fichier existant.
+        Stratégie : insérer avant la dernière accolade fermante (Java/JS/TS)
+        ou à la fin du fichier (Python).
+        """
+        new_clean = new_methods.strip()
+
+        if language == "python":
+            return existing.rstrip() + "\n\n\n" + new_clean + "\n"
+
+        # Java / JS / TS : insérer avant la dernière `}`
+        last_brace = existing.rfind("}")
+        if last_brace == -1:
+            return existing + "\n\n" + new_clean
+        return (
+            existing[:last_brace].rstrip()
+            + "\n\n"
+            + new_clean
+            + "\n"
+            + existing[last_brace:]
+        )
+
+    def _run_validation(
+        self,
+        test_code: str,
+        source_path: Path,
+        signatures: List[Dict[str, Any]],
+        language: str,
+        original_prompt: str = "",
+    ) -> tuple:
+        """
+        Valide le code généré et retente une fois en cas d'échec.
+        Retourne (code_final, is_valid) — code_final est la version corrigée si le retry réussit,
+        l'original sinon. Le code retourné DOIT remplacer test_code chez l'appelant.
+        """
+        validated = self._validate_generated_test(test_code, source_path, signatures=signatures)
+        if not validated:
+            logger.info("Test non valide, retry avec feedback d'erreur...")
+            test_code_v2 = self._retry_with_error(test_code, source_path, original_prompt)
+            if test_code_v2:
+                validated = self._validate_generated_test(
+                    test_code_v2, source_path, signatures=signatures
+                )
+                if validated:
+                    logger.info("Retry réussi : test valide après correction")
+                    return test_code_v2, True
+        return test_code, validated
 
     # ── Extraction de signatures ─────────────────────────────────────────────
 
@@ -166,13 +295,44 @@ class TestGeneratorAgent:
         lang = file_path.suffix.lower()
 
         if lang == ".py":
-            # functions
-            for m in re.finditer(r"^def\s+([A-Za-z_]\w*)\s*\([^)]*\)", code, re.M):
-                name = m.group(1)
+            # Fonctions et méthodes — capture async def, def, signatures multilignes
+            # Stratégie : on détecte le début (def/async def) puis on lit jusqu'à ":"
+            py_func_pat = re.compile(
+                r"^(?P<indent>[ \t]*)(?P<async>async\s+)?def\s+(?P<name>[A-Za-z_]\w*)"
+                r"\s*\((?P<args>[^)]*)\)",
+                re.M,
+            )
+            seen_names: set = set()
+            for m in py_func_pat.finditer(code):
+                name = m.group("name")
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                is_async = bool(m.group("async"))
                 visibility = "private" if name.startswith("_") else "public"
+
+                # Détecter le décorateur juste avant pour identifier @property / @classmethod / @staticmethod
+                start = m.start()
+                preceding = code[max(0, start - 120): start]
+                decorator_lines = [
+                    ln.strip() for ln in preceding.splitlines()
+                    if ln.strip().startswith("@")
+                ]
+                method_type = "function"
+                if decorator_lines:
+                    last_dec = decorator_lines[-1]
+                    if "@property" in last_dec:
+                        method_type = "property"
+                    elif "@classmethod" in last_dec or "@staticmethod" in last_dec:
+                        method_type = "classmethod"
+
+                sig = f"{'async ' if is_async else ''}def {name}({m.group('args')})"
                 sigs.append({
-                    "type": "function", "name": name,
-                    "signature": m.group(0), "visibility": visibility,
+                    "type": method_type,
+                    "name": name,
+                    "signature": sig,
+                    "visibility": visibility,
+                    "async": is_async,
                 })
             # classes
             for m in re.finditer(r"^class\s+([A-Za-z_]\w*)", code, re.M):
@@ -203,12 +363,37 @@ class TestGeneratorAgent:
                 })
 
         elif lang in (".js", ".ts", ".jsx", ".tsx"):
+            seen_js: set = set()
+            _JS_KEYWORDS = {"if", "while", "for", "switch", "catch", "return", "typeof", "instanceof"}
+
+            # Fonctions nommées classiques : function foo() / export async function foo()
             for m in re.finditer(
-                r"(?:export\s+)?(?:async\s+)?(?:function\s+)?([A-Za-z_]\w*)\s*\([^)]*\)",
+                r"(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(",
                 code, re.M,
             ):
                 name = m.group(1)
-                if name not in ("if", "while", "for", "switch", "catch"):
+                if name not in _JS_KEYWORDS and name not in seen_js:
+                    seen_js.add(name)
+                    sigs.append({"type": "function", "name": name, "visibility": "public"})
+
+            # Arrow functions : const foo = (args) => / const foo = async (args) =>
+            for m in re.finditer(
+                r"(?:export\s+)?(?:const|let)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_]\w*)\s*=>",
+                code, re.M,
+            ):
+                name = m.group(1)
+                if name not in _JS_KEYWORDS and name not in seen_js:
+                    seen_js.add(name)
+                    sigs.append({"type": "arrow_function", "name": name, "visibility": "public"})
+
+            # Méthodes de classe : methodName() / async methodName()
+            for m in re.finditer(
+                r"^\s+(?:async\s+)?([A-Za-z_]\w*)\s*\([^)]*\)\s*\{",
+                code, re.M,
+            ):
+                name = m.group(1)
+                if name not in _JS_KEYWORDS and name not in seen_js and not name[0].isupper():
+                    seen_js.add(name)
                     sigs.append({"type": "method", "name": name, "visibility": "public"})
 
         return sigs
@@ -380,6 +565,8 @@ class TestGeneratorAgent:
         rag_context: Dict[str, Any],
         kg_context: str,
         language: str,
+        incremental: bool = False,
+        existing_test_code: str = "",
     ) -> str:
         """Construit un prompt LLM structuré et enrichi pour la génération de tests."""
 
@@ -458,7 +645,28 @@ Exemple : si hashPassword() est private et appelé dans save(), teste hashPasswo
 Note: Préfère JUnit 5 (org.junit.jupiter.api) avec @ExtendWith(MockitoExtension.class)
 plutôt que JUnit 4 (@RunWith). Utilise les assertions de org.junit.jupiter.api.Assertions."""
 
-        prompt = f"""Tu es un expert en tests unitaires. Génère un fichier de tests COMPLET et EXÉCUTABLE pour le code source ci-dessous.
+        # Contexte du fichier de test existant pour le mode incrémentiel
+        incremental_block = ""
+        if incremental and existing_test_code:
+            preview = existing_test_code[:3000]
+            if len(existing_test_code) > 3000:
+                preview += f"\n// ... [{len(existing_test_code) - 3000} chars tronqués]"
+            incremental_block = f"""
+## Fichier de test EXISTANT (NE PAS réécrire ce qui est déjà testé) :
+```{language}
+{preview}
+```
+"""
+
+        mode_instruction = (
+            "Génère UNIQUEMENT les NOUVELLES méthodes de test manquantes listées dans les signatures "
+            "ci-dessus. Ne répète PAS les méthodes de test déjà présentes dans le fichier existant. "
+            "Génère uniquement les corps de méthodes, sans redéclarer la classe ni les imports déjà présents."
+            if incremental
+            else "Génère un fichier de tests COMPLET et EXÉCUTABLE."
+        )
+
+        prompt = f"""Tu es un expert en tests unitaires. {mode_instruction}
 
 Fichier source : {source_path.name}
 Langage : {language}
@@ -478,10 +686,10 @@ Framework de test détecté : {framework}
 ```{language}
 {code_block}
 ```
-{patterns_text}{examples_text}
+{incremental_block}{patterns_text}{examples_text}
 
 ## Instructions STRICTES :
-1. Génère UNIQUEMENT le code du fichier de test (pas d'explications, pas de markdown fences).
+1. Génère UNIQUEMENT le code {"des nouvelles méthodes de test" if incremental else "du fichier de test"} (pas d'explications, pas de markdown fences).
 2. Utilise le framework {framework} avec les conventions du projet.
 3. Teste TOUTES les méthodes PUBLIC listées ci-dessus.
 4. INTERDIT : appeler directement une méthode private ou protected depuis les tests. Teste-les UNIQUEMENT via les méthodes publiques qui les appellent.
@@ -494,7 +702,7 @@ Framework de test détecté : {framework}
 11. N'invente PAS de méthodes ou classes qui n'existent pas dans le code source.
 12. Inclus tous les imports nécessaires (framework + mocks + classes du source).
 
-GÉNÈRE LE CODE DU FICHIER DE TEST MAINTENANT :"""
+GÉNÈRE LE CODE {"DES NOUVELLES MÉTHODES DE TEST" if incremental else "DU FICHIER DE TEST"} MAINTENANT :"""
 
         return prompt
 
@@ -629,24 +837,29 @@ GÉNÈRE LE CODE DU FICHIER DE TEST MAINTENANT :"""
         elif language == "java":
             return self._validate_java_structural(test_code, signatures=signatures)
 
-        # Autres langages : pas de validation pour l'instant
+        elif language in ("javascript", "typescript"):
+            return self._validate_js_structural(test_code)
+
+        # Autres langages : pas de validation
         return True
 
     def _validate_java_structural(
         self, test_code: str, signatures: List[Dict] = None,
     ) -> bool:
         """
-        Validation structurelle Java (sans javac) :
+        Validation structurelle Java (sans javac).
+        Checks :
           1. Accolades équilibrées
           2. Parenthèses équilibrées
           3. Strings non fermées
-          4. Variables non déclarées
-          5. Appels directs aux méthodes private
-          6. Utilisation de la réflexion Java
+          4. Appels directs aux méthodes private
+          5. Utilisation de la réflexion Java
+        Note : la vérification de variables non déclarées est supprimée car son
+        regex supposait une indentation fixe à 4 espaces → faux rejets systématiques.
         """
         errors = []
 
-        # 1. Accolades équilibrées
+        # 1. Accolades équilibrées (hors chaînes et commentaires)
         opens = test_code.count("{")
         closes = test_code.count("}")
         if opens != closes:
@@ -658,53 +871,36 @@ GÉNÈRE LE CODE DU FICHIER DE TEST MAINTENANT :"""
         if opens_p != closes_p:
             errors.append(f"Parentheses desequilibrees : {opens_p} ouvertes, {closes_p} fermees")
 
-        # 3. Strings non fermées (détection basique)
+        # 3. Strings non fermées — parcours caractère par caractère
         in_string = False
-        for i, ch in enumerate(test_code):
-            if ch == '"' and (i == 0 or test_code[i-1] != '\\'):
+        escaped = False
+        for ch in test_code:
+            if escaped:
+                escaped = False
+                continue
+            if ch == '\\' and in_string:
+                escaped = True
+                continue
+            if ch == '"':
                 in_string = not in_string
         if in_string:
             errors.append("String non fermee detectee")
 
-        # 4. Variables potentiellement non déclarées
-        test_methods = re.findall(
-            r"(?:void|@Test[^{]*)\s+\w+\s*\([^)]*\)[^{]*\{(.*?)\n    \}",
-            test_code,
-            re.S,
-        )
-        for method_body in test_methods:
-            used_vars = set(re.findall(r"\b([a-z]\w*)\.", method_body))
-            declared = set(re.findall(r"(?:\w+(?:<[^>]+>)?)\s+(\w+)\s*=", method_body))
-            declared.update(re.findall(r"(\w+)\s*=\s*\w+", method_body))
-            declared.update({"this", "super", "System", "Assert", "mock", "when",
-                           "verify", "any", "anyString", "anyInt", "anyLong",
-                           "assertEquals", "assertNotNull", "assertTrue",
-                           "assertFalse", "assertThrows", "assertDoesNotThrow"})
-            undeclared = used_vars - declared
-            if undeclared:
-                mock_fields = set(re.findall(r"@Mock\s+.*?\s+(\w+)\s*;", test_code, re.S))
-                mock_fields.update(re.findall(r"private\s+\w+\s+(\w+)\s*;", test_code))
-                undeclared -= mock_fields
-                if undeclared:
-                    errors.append(f"Variables potentiellement non declarees : {undeclared}")
-
-        # 5. Appels directs aux méthodes private
+        # 4. Appels directs aux méthodes private
         if signatures:
             private_methods = [
                 s["name"] for s in signatures
                 if s.get("visibility") == "private"
             ]
             for pm in private_methods:
-                # Chercher objectInstance.privateMethod( dans le test
                 pattern = re.compile(rf"\w+\.{re.escape(pm)}\s*\(")
-                matches = pattern.findall(test_code)
-                if matches:
+                if pattern.search(test_code):
                     errors.append(
                         f"Appel direct a la methode PRIVATE '{pm}()' — "
                         f"doit etre testee via les methodes publiques"
                     )
 
-        # 6. Utilisation de la réflexion Java (contournement de visibilité)
+        # 5. Utilisation de la réflexion Java
         reflection_patterns = [
             ("setAccessible", "setAccessible() utilise pour contourner la visibilite"),
             ("getDeclaredMethod", "getDeclaredMethod() — reflexion interdite"),
@@ -715,11 +911,53 @@ GÉNÈRE LE CODE DU FICHIER DE TEST MAINTENANT :"""
                 errors.append(msg)
 
         if errors:
-            for e in errors:
-                logger.warning("Validation Java: %s", e)
+            for err in errors:
+                logger.warning("Validation Java: %s", err)
             return False
 
         logger.info("Test Java genere: validation structurelle OK")
+        return True
+
+    @staticmethod
+    def _validate_js_structural(test_code: str) -> bool:
+        """
+        Validation structurelle JS/TS (sans node/tsc) :
+          1. Accolades équilibrées
+          2. Parenthèses équilibrées
+          3. Crochets équilibrés
+          4. Strings non fermées (simple et double quotes)
+          5. Au moins une fonction de test déclarée (it/test/describe)
+        """
+        errors = []
+
+        # 1-3. Équilibrage des délimiteurs
+        for open_c, close_c, label in [("{", "}", "Accolades"), ("(", ")", "Parenthèses"), ("[", "]", "Crochets")]:
+            if test_code.count(open_c) != test_code.count(close_c):
+                errors.append(
+                    f"{label} desequilibre(e)s : "
+                    f"{test_code.count(open_c)} ouvrant(s), {test_code.count(close_c)} fermant(s)"
+                )
+
+        # 4. Strings non fermées (simple et double quotes, hors template literals)
+        for quote in ('"', "'"):
+            count = sum(
+                1 for i, ch in enumerate(test_code)
+                if ch == quote and (i == 0 or test_code[i - 1] != '\\')
+            )
+            if count % 2 != 0:
+                errors.append(f"String non fermee detectee (quote: {quote})")
+
+        # 5. Au moins une fonction de test
+        has_test = bool(re.search(r"\b(?:it|test|describe)\s*\(", test_code))
+        if not has_test:
+            errors.append("Aucune fonction de test detectee (it/test/describe)")
+
+        if errors:
+            for err in errors:
+                logger.warning("Validation JS/TS: %s", err)
+            return False
+
+        logger.info("Test JS/TS genere: validation structurelle OK")
         return True
 
     def _retry_with_error(
@@ -759,7 +997,26 @@ GÉNÈRE LE CODE DU FICHIER DE TEST MAINTENANT :"""
                 undeclared = used_vars - declared
                 if undeclared:
                     error_parts.append(f"Variable(s) non declaree(s) : {undeclared}")
-            error_msg = " | ".join(error_parts) if error_parts else "Erreur structurelle"
+            error_msg = " | ".join(error_parts) if error_parts else "Erreur structurelle Java"
+
+        elif language in ("javascript", "typescript"):
+            error_parts = []
+            for open_c, close_c, label in [("{", "}", "Accolades"), ("(", ")", "Parenthèses"), ("[", "]", "Crochets")]:
+                if failed_code.count(open_c) != failed_code.count(close_c):
+                    error_parts.append(
+                        f"{label} desequilibres ({failed_code.count(open_c)} vs {failed_code.count(close_c)})"
+                    )
+            for quote in ('"', "'"):
+                count = sum(
+                    1 for i, ch in enumerate(failed_code)
+                    if ch == quote and (i == 0 or failed_code[i - 1] != '\\')
+                )
+                if count % 2 != 0:
+                    error_parts.append(f"String non fermee (quote: {quote})")
+            if not re.search(r"\b(?:it|test|describe)\s*\(", failed_code):
+                error_parts.append("Aucune fonction de test (it/test/describe) detectee")
+            error_msg = " | ".join(error_parts) if error_parts else "Erreur structurelle JS/TS"
+
         else:
             return None
 

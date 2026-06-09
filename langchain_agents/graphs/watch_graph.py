@@ -1213,7 +1213,17 @@ def node_emit_ws_events(state: WatchState) -> Dict[str, Any]:
         diff_hunks = []
         if _diff_available and current and fixed and current != fixed:
             try:
-                diff_hunks = compute_diff_hunks(current, fixed)
+                # FILE-ABSOLUTE hunks: locate the snippet in the FULL source and
+                # diff the whole file before/after. Diffing the snippet alone
+                # produced snippet-relative line numbers (start at 1) that the
+                # plugin applied as file-absolute → it patched unrelated lines
+                # and corrupted the file. Patching the full source fixes this.
+                if source_code and current in source_code:
+                    patched = source_code.replace(current, fixed, 1)
+                    diff_hunks = compute_diff_hunks(source_code, patched)
+                # else: snippet not found verbatim → leave hunks empty so the
+                # plugin falls back to exact/normalized current_code matching,
+                # which locates the real position instead of guessing a line.
             except Exception as exc:
                 logger.debug("diff_hunks failed: %s", exc)
 
@@ -1287,6 +1297,36 @@ def node_emit_ws_events(state: WatchState) -> Dict[str, Any]:
         state.get("dependents_to_analyze")
         or state.get("neighborhood", {}).get("predecessors", [])
     )
+
+    # Keep only files that REALLY exist inside the analyzed project. The shared
+    # dependency graph can contain entries from other indexed projects (or stale
+    # paths); without this filter a 4-file project wrongly reported "5 dependent
+    # files". This grounds the impact in the actual project on disk.
+    import os as _os
+    _proj = state.get("project_path", "") or ""
+    if impacted:
+        _proj_abs = _os.path.normcase(_os.path.abspath(_proj)) if _proj else ""
+
+        def _in_project(f: str) -> bool:
+            try:
+                if not f or not _os.path.exists(f):
+                    return False
+                if _proj_abs:
+                    return _os.path.normcase(_os.path.abspath(f)).startswith(_proj_abs)
+                return True
+            except Exception:
+                return False
+
+        # de-dup + filter to real project files, excluding the analyzed file itself
+        _self_abs = _os.path.normcase(_os.path.abspath(file_path)) if file_path else ""
+        seen = set()
+        filtered = []
+        for f in impacted:
+            fa = _os.path.normcase(_os.path.abspath(f)) if f else ""
+            if fa and fa != _self_abs and fa not in seen and _in_project(f):
+                seen.add(fa)
+                filtered.append(f)
+        impacted = filtered
 
     if impacted:
         n    = len(impacted)

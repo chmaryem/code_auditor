@@ -345,6 +345,7 @@ async def complete_inline(req: InlineCompletionRequest):
             language=req.language,
             file_path=req.file_path,
             project_path=req.project_path,
+            cursor_line=req.cursor_line,
             use_rag=req.use_rag,
         )
     except Exception as e:
@@ -354,99 +355,86 @@ async def complete_inline(req: InlineCompletionRequest):
 
 @chat_router.post(
     "/complete/inline/stream",
-    summary="Streaming inline completion via SSE (first token < 300ms)",
+    summary="Streaming inline completion via SSE — 3-tier pipeline",
 )
 async def complete_inline_stream(req: InlineCompletionRequest):
     """
-    Streaming inline code completion — returns tokens as SSE events.
+    Streaming inline code completion — 3-tier pipeline identical to the JSON endpoint.
 
-    Events emitted in order:
-      data: {"type":"cache_hit","completion":"..."}   → served from Redis (< 5ms)
-      data: {"type":"token","content":"..."}           → each streamed token
+    Events:
+      data: {"type":"cache_hit","completion":"...","source":"cache"|"graph",...}
+      data: {"type":"token","content":"..."}
       data: {"type":"done","completion":"...","confidence":0.9,"elapsed_ms":280}
       data: {"type":"error","content":"..."}
-
-    The VS Code InlineCompletionProvider should:
-      1. Start listening to this stream
-      2. Accumulate tokens in a buffer
-      3. On "done", compare accumulated with buffer — use accumulated
-      4. On "cache_hit", skip streaming and show directly
-
-    Debounce: call this endpoint after 350ms of inactivity, cancel on new keypress.
     """
     import json as _json
     import time as _time
-    import hashlib as _hashlib
 
     async def _event_gen():
-        t0 = _time.time()
+        t0       = _time.time()
         language = req.language or "python"
 
-        # 1. Cache check (< 5ms)
-        try:
-            from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
-            cache_key = lc_inline_completion_agent._cache_key(
-                req.prefix_code, req.suffix_code, language
-            )
-            cached = lc_inline_completion_agent._cache_get(cache_key)
-            if cached:
-                elapsed = round((_time.time() - t0) * 1000)
-                yield f"data: {_json.dumps({'type':'cache_hit','completion':cached,'confidence':0.85,'elapsed_ms':elapsed})}\n\n"
-                return
-        except Exception:
-            pass
+        from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
 
-        # 2. RAG snippet (background, non-blocking)
-        rag_snippet = ""
-        if req.use_rag and req.project_path:
-            try:
-                from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
-                query = req.prefix_code.strip().split("\n")[-1][:100] or req.file_path
-                rag_snippet = await asyncio.to_thread(
-                    lc_inline_completion_agent._get_rag_snippet,
-                    req.project_path, query, language
-                )
-            except Exception:
-                rag_snippet = ""
+        # ── Tier 1: in-memory cache ───────────────────────────────────────────
+        cache_key = lc_inline_completion_agent._cache_key(
+            req.prefix_code, req.suffix_code, language
+        )
+        cached = lc_inline_completion_agent._cache_get(cache_key)
+        if cached:
+            elapsed = round((_time.time() - t0) * 1000)
+            yield f"data: {_json.dumps({'type':'cache_hit','completion':cached,'confidence':0.85,'source':'cache','elapsed_ms':elapsed})}\n\n"
+            return
 
-        # 3. Build FIM prompt
+        # ── Tier 2: graph fast path (unambiguous symbol, no LLM) ─────────────
+        fast = await asyncio.to_thread(
+            lc_inline_completion_agent._try_graph_completion,
+            req.file_path, req.prefix_code, req.cursor_line,
+        )
+        if fast is not None:
+            lc_inline_completion_agent._cache_set(cache_key, fast)
+            elapsed = round((_time.time() - t0) * 1000)
+            yield f"data: {_json.dumps({'type':'cache_hit','completion':fast,'confidence':0.95,'source':'graph','elapsed_ms':elapsed})}\n\n"
+            return
+
+        # ── Tier 3: LLM stream with project context ───────────────────────────
+        ctx = await asyncio.to_thread(
+            lc_inline_completion_agent._build_project_context,
+            req.file_path, req.prefix_code, req.cursor_line,
+        )
+        context_section = (
+            f"\nProject context (match style and types):\n{ctx}\n" if ctx else ""
+        )
+
+        import re as _re
         fim_prompt = (
-            f"You are an expert {language} inline code completion engine.\n"
-            f"Complete ONLY the missing code at the cursor. Output the completion text ONLY.\n"
-            f"Be concise (1-5 lines). Match the project style.\n\n"
-            f"File: {req.file_path or '(unknown)'}\n"
-            f"Language: {language}\n"
-            + (f"Project patterns:\n{rag_snippet}\n\n" if rag_snippet else "")
-            + f"<prefix>{req.prefix_code[-1200:]}</prefix>\n"
-            f"<cursor/>\n"
+            f"Complete the {language} code at <CURSOR>. Output ONLY the inserted text — "
+            f"no explanation, no markdown fences.\n"
+            f"Keep it concise (1–5 lines). Must be syntactically valid {language}."
+            f"{context_section}\n"
+            f"<prefix>{req.prefix_code[-1200:]}</prefix><CURSOR>"
             f"<suffix>{req.suffix_code[:300]}</suffix>\n\n"
             f"Completion:"
         )
 
-        # 4. Stream LLM tokens
         completion_buf = []
         try:
-            from langchain_agents.agents.lc_analysis_agent import _build_llm_with_fallback
-            llm = await asyncio.to_thread(_build_llm_with_fallback)
+            llm = lc_inline_completion_agent.fast_llm
+            if llm is None:
+                raise RuntimeError("fast LLM unavailable")
             from langchain_core.messages import HumanMessage
 
-            async for chunk in llm.astream(
-                [HumanMessage(content=fim_prompt)],
-                config={"max_tokens": 128},
-            ):
+            async for chunk in llm.astream([HumanMessage(content=fim_prompt)]):
                 token = getattr(chunk, "content", "")
                 if token:
-                    # Strip accidental fences
-                    import re as _re
-                    token = _re.sub(r"```[a-z]*", "", token)
+                    token = _re.sub(r"```[a-zA-Z0-9_-]*", "", token)
                     if token:
                         completion_buf.append(token)
                         yield f"data: {_json.dumps({'type':'token','content':token})}\n\n"
 
-        except Exception as e:
-            # Fallback: non-streaming synchronous call
+        except Exception:
+            # Fallback: sync complete() call
             try:
-                from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
                 result = await asyncio.to_thread(
                     lc_inline_completion_agent.complete,
                     prefix_code=req.prefix_code,
@@ -454,34 +442,27 @@ async def complete_inline_stream(req: InlineCompletionRequest):
                     language=language,
                     file_path=req.file_path,
                     project_path=req.project_path,
+                    cursor_line=req.cursor_line,
                     use_rag=False,
                 )
-                completion = result.get("completion", "")
-                if completion:
-                    completion_buf = [completion]
-                    yield f"data: {_json.dumps({'type':'token','content':completion})}\n\n"
+                text = result.get("completion", "")
+                if text:
+                    completion_buf = [text]
+                    yield f"data: {_json.dumps({'type':'token','content':text})}\n\n"
             except Exception as e2:
                 yield f"data: {_json.dumps({'type':'error','content':str(e2)})}\n\n"
                 return
 
-        # 5. Done event
         full = "".join(completion_buf).strip()
-        import re as _re2
-        full = _re2.sub(r"^```[a-z]*\n?", "", full)
-        full = _re2.sub(r"\n?```$", "", full)
+        full = _re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", full)
+        full = _re.sub(r"\n?```$", "", full)
 
-        elapsed = round((_time.time() - t0) * 1000)
-        confidence = 0.9 if len(full) > 5 else 0.5
-
-        # Cache the result
         if full:
-            try:
-                from langchain_agents.agents.lc_inline_completion_agent import lc_inline_completion_agent
-                lc_inline_completion_agent._cache_set(cache_key, full)
-            except Exception:
-                pass
+            lc_inline_completion_agent._cache_set(cache_key, full)
 
-        yield f"data: {_json.dumps({'type':'done','completion':full,'confidence':confidence,'elapsed_ms':elapsed})}\n\n"
+        elapsed    = round((_time.time() - t0) * 1000)
+        confidence = 0.9 if len(full) > 5 else 0.5
+        yield f"data: {_json.dumps({'type':'done','completion':full,'confidence':confidence,'source':'llm','elapsed_ms':elapsed})}\n\n"
 
     return StreamingResponse(
         _event_gen(),

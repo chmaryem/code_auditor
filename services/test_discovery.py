@@ -14,6 +14,7 @@ Conventions supportées :
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -142,13 +143,42 @@ class TestDiscoveryService:
             ]
             return result
 
+        # Extraire les noms des méthodes/fonctions de test déclarées dans le fichier de test
+        # Patterns : test_xxx, xxxTest, should_xxx, it_xxx, describe_xxx
+        test_func_names: set = set(
+            re.findall(
+                r"(?:def\s+|function\s+|it\s*\(|test\s*\()([A-Za-z_]\w*)",
+                test_code,
+            )
+        )
+        # Noms normalisés en minuscules pour la comparaison insensible à la casse
+        test_func_lower = {n.lower() for n in test_func_names}
+
         tested = []
         untested = []
         for ent in source_entities:
             if not self._is_public_entity(ent):
                 continue
             name = ent.get("name", "") if isinstance(ent, dict) else getattr(ent, "name", "")
-            if name and name in test_code:
+            if not name:
+                continue
+
+            name_lower = name.lower()
+            # Une entité est considérée testée si un nom de méthode de test la référence
+            # Patterns reconnus : test_send_email, sendEmailTest, testSendEmail, should_send_email
+            is_tested = any(
+                name_lower in fn_lower or fn_lower.startswith(("test_" + name_lower, name_lower + "test"))
+                for fn_lower in test_func_lower
+            )
+            # Fallback : l'entité est appelée directement dans le corps du test (appel réel, pas commentaire)
+            if not is_tested:
+                # Cherche "name(" ou "name =" hors commentaires et hors chaînes simples
+                body_pattern = re.compile(
+                    rf"(?<!#)(?<!//)(?<!\*)\b{re.escape(name)}\s*[\(\.]",
+                )
+                is_tested = bool(body_pattern.search(test_code))
+
+            if is_tested:
                 tested.append(name)
             else:
                 untested.append(name)
@@ -271,15 +301,30 @@ class TestDiscoveryService:
 
         root = self.project_path
 
-        # Python
-        if (root / "pytest.ini").exists() or (root / "pyproject.toml").exists():
+        # Python — vérifier le contenu des fichiers, pas uniquement leur présence
+        if (root / "pytest.ini").exists():
             self._framework_cache = "pytest"
             return self._framework_cache
+
+        pyproject = root / "pyproject.toml"
+        if pyproject.exists():
+            content = pyproject.read_text(errors="ignore")
+            if "[tool.pytest" in content or "pytest" in content:
+                self._framework_cache = "pytest"
+                return self._framework_cache
+            if "unittest" in content:
+                self._framework_cache = "unittest"
+                return self._framework_cache
+
         if (root / "setup.cfg").exists():
             cfg = (root / "setup.cfg").read_text(errors="ignore")
             if "pytest" in cfg:
                 self._framework_cache = "pytest"
                 return self._framework_cache
+            if "unittest" in cfg:
+                self._framework_cache = "unittest"
+                return self._framework_cache
+
         if (root / "requirements.txt").exists():
             req = (root / "requirements.txt").read_text(errors="ignore")
             if "pytest" in req:
@@ -394,7 +439,6 @@ class TestDiscoveryService:
             if field_part:
                 # Trivial = un seul mot CamelCase simple (Name, Id, Email)
                 # Non-trivial = mots composés (UsersWithOrders, DataSource)
-                import re
                 words = re.findall(r"[A-Z][a-z]*", field_part)
                 is_simple_accessor = len(words) <= 1
                 is_short_body = body_lines <= 3
