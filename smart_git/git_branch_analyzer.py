@@ -161,7 +161,7 @@ class GitBranchAnalyzer:
             file_analyses.append(fa)
 
         # Étape 4 : conflits potentiels
-        conflicts = self._detect_conflict_risks(diff_files, base)
+        conflicts = self._detect_conflict_risks(diff_files, base, branch)
 
         # Étape 5 : score et verdict
         total_score = sum(f.score for f in file_analyses)
@@ -284,7 +284,7 @@ class GitBranchAnalyzer:
 
     # ── Détection de conflits ─────────────────────────────────────────────────
 
-    def _detect_conflict_risks(self, branch_files: List[Dict], base: str) -> List[str]:
+    def _detect_conflict_risks(self, branch_files: List[Dict], base: str, branch: str = "HEAD") -> List[str]:
         """
         Détecte les fichiers modifiés des deux côtés depuis le merge-base.
         Un fichier modifié dans la branche ET dans main depuis le merge-base
@@ -294,7 +294,7 @@ class GitBranchAnalyzer:
         """
         from smart_git.git_diff_parser import get_merge_base, _run_git
 
-        merge_base = get_merge_base("HEAD", base, self.project_path)
+        merge_base = get_merge_base(branch, base, self.project_path)
         if not merge_base:
             return []
 

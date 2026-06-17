@@ -38,6 +38,21 @@ class LCGitSynthesisAgent:
         if intent == "conflict_resolution_dry_run":
             return self._conflicts(state)
 
+        if intent == "secret_scan":
+            return self._secret_scan(state)
+
+        if intent == "commit_lint":
+            return self._commit_lint(state)
+
+        if intent == "test_impact":
+            return self._test_impact(state)
+
+        if intent == "cross_pr_conflicts":
+            return self._cross_pr(state)
+
+        if intent == "pr_description":
+            return self._pr_description(state)
+
         return self._status(state)
 
     # ── Generic status ──────────────────────────────────────────────────────
@@ -257,20 +272,21 @@ class LCGitSynthesisAgent:
                 f"Erreur : `{report.get('error', 'unknown error')}`"
             )
 
-        ready = report.get("ready")
-        verdict = (
-            "✅ PR prête à merger."
-            if ready
-            else "⚠️ PR pas encore prête à merger."
-        )
+        # Use the pre-built markdown body if available (includes CI details, review counts)
+        if report.get("body"):
+            return report["body"]
+
+        ready   = report.get("ready")
+        verdict = "✅ PR prête à merger." if ready else "⚠️ PR pas encore prête à merger."
 
         return (
             "## PR Readiness\n\n"
             f"{verdict}\n\n"
-            f"- Ready : **{report.get('ready')}**\n"
-            f"- Mergeable : **{report.get('mergeable')}**\n"
-            f"- CI pass : **{report.get('ci_pass')}**\n"
-            f"- Reviews approved : **{report.get('reviews_approved')}**\n"
+            f"| Check | Statut |\n"
+            f"|---|---|\n"
+            f"| Mergeable | {'✅' if report.get('mergeable') else '❌'} |\n"
+            f"| CI/CD | {'✅' if report.get('ci_pass') else '❌'} |\n"
+            f"| Reviews | {'✅' if report.get('reviews_approved') else 'ℹ️ En attente'} |\n"
         )
 
     # ── PR review ───────────────────────────────────────────────────────────
@@ -284,16 +300,32 @@ class LCGitSynthesisAgent:
                 f"Erreur : `{report.get('error', 'unknown error')}`"
             )
 
-        score = report.get("score", report.get("total_score", "N/A"))
+        # If the review agent returned the full body, use it directly
+        if report.get("body"):
+            return report["body"]
+
+        score    = report.get("score", report.get("total_score", "N/A"))
         critical = report.get("critical", report.get("total_critical", 0))
-        high = report.get("high", report.get("total_high", 0))
+        high     = report.get("high", report.get("total_high", 0))
+        medium   = report.get("medium", report.get("total_medium", 0))
+        verdict  = report.get("verdict", "COMMENT")
+
+        verdict_line = {
+            "APPROVE":         "✅ **MERGE AUTORISÉ** — aucun problème critique détecté.",
+            "COMMENT":         "⚠️ **MERGE AVEC PRÉCAUTION** — des points méritent attention.",
+            "REQUEST_CHANGES": "❌ **MERGE BLOQUÉ** — corrections requises avant fusion.",
+        }.get(verdict, f"Verdict : {verdict}")
 
         return (
             "## PR Review\n\n"
-            f"- Score : **{score}**\n"
-            f"- Critical : **{critical}**\n"
-            f"- High : **{high}**\n"
-            f"- Résultat posté sur GitHub si la configuration MCP est active.\n"
+            f"{verdict_line}\n\n"
+            f"| Métrique | Valeur |\n"
+            f"|---|---|\n"
+            f"| Score global | **{score:.1f}** |\n"
+            f"| Critical | **{critical}** |\n"
+            f"| High | **{high}** |\n"
+            f"| Medium | **{medium}** |\n"
+            f"| Fichiers analysés | **{report.get('files_analyzed', 0)}** |\n"
         )
 
     # ── Conflicts ───────────────────────────────────────────────────────────
@@ -333,6 +365,217 @@ class LCGitSynthesisAgent:
         ]
 
         return "\n".join(lines)
+
+
+    # ── F1: Secret scan ─────────────────────────────────────────────────────
+
+    def _secret_scan(self, state: Dict[str, Any]) -> str:
+        report = state.get("secret_scan_report") or {}
+
+        if report.get("error"):
+            return f"## Secret Scan\n\nErreur : `{report['error']}`"
+
+        count  = len(report.get("findings", []))
+        scanned = report.get("scanned_files", 0)
+
+        if not report.get("has_secrets"):
+            return (
+                f"## Secret Scan\n\n"
+                f"✅ Aucun secret détecté dans {scanned} fichier(s) stagé(s)."
+            )
+
+        lines = [
+            "## Secret Scan — SECRETS DÉTECTÉS",
+            "",
+            f"🔐 **{count} secret(s)** détecté(s) dans {scanned} fichier(s) stagé(s).",
+            f"**⛔ Commit bloqué.** Supprimez les secrets avant de committer.",
+            "",
+            "### Détails",
+        ]
+
+        by_file: dict = {}
+        for f in report.get("findings", []):
+            by_file.setdefault(f["file_path"], []).append(f)
+
+        for file_path, findings in by_file.items():
+            lines.append(f"\n**`{file_path}`**")
+            for f in findings:
+                lines.append(
+                    f"- Ligne {f['line_number']} : `{f['secret_type']}` — `{f['masked_text']}`"
+                )
+
+        lines += [
+            "",
+            "### Actions",
+            "1. Supprimez le secret du code",
+            "2. Utilisez `os.environ['KEY']` ou un fichier `.env` (ajouté dans `.gitignore`)",
+            "3. Si déjà pushé : **révoquez la clé immédiatement**",
+        ]
+        return "\n".join(lines)
+
+    # ── F3: Commit lint ──────────────────────────────────────────────────────
+
+    def _commit_lint(self, state: Dict[str, Any]) -> str:
+        report = state.get("commit_lint_report") or {}
+
+        if report.get("error"):
+            return f"## Commit Lint\n\nErreur : `{report['error']}`"
+
+        msg     = report.get("original_message", "")
+        score   = report.get("score", 100)
+        is_valid = report.get("is_valid", True)
+        violations = report.get("violations", [])
+
+        if is_valid and not report.get("has_warnings"):
+            return (
+                f"## Commit Lint\n\n"
+                f"✅ Message valide (score {score}/100).\n\n"
+                f"```text\n{msg}\n```"
+            )
+
+        icon = "✅" if is_valid else "❌"
+        lines = [
+            f"## Commit Lint — {icon} {'Valide' if is_valid else 'Invalide'} (score {score}/100)",
+            "",
+            f"```text\n{msg}\n```",
+            "",
+        ]
+
+        errors   = [v for v in violations if v["severity"] == "ERROR"]
+        warnings = [v for v in violations if v["severity"] == "WARN"]
+
+        if errors:
+            lines.append("### Erreurs")
+            for v in errors:
+                lines.append(f"- ❌ **{v['rule']}** : {v['message']}")
+                if v.get("suggestion"):
+                    lines.append(f"  → Suggestion : `{v['suggestion']}`")
+
+        if warnings:
+            lines.append("\n### Avertissements")
+            for v in warnings:
+                lines.append(f"- ⚠️ **{v['rule']}** : {v['message']}")
+                if v.get("suggestion"):
+                    lines.append(f"  → Suggestion : `{v['suggestion']}`")
+
+        if report.get("suggested_message"):
+            lines += [
+                "",
+                "### Message corrigé suggéré",
+                f"```text\n{report['suggested_message']}\n```",
+            ]
+
+        return "\n".join(lines)
+
+    # ── F4: Test impact ──────────────────────────────────────────────────────
+
+    def _test_impact(self, state: Dict[str, Any]) -> str:
+        report = state.get("test_impact_report") or {}
+
+        if report.get("error"):
+            return f"## Test Impact\n\nErreur : `{report['error']}`"
+
+        total   = report.get("total_files", 0)
+        covered = report.get("covered_files", 0)
+        gaps    = report.get("uncovered_files", 0)
+        ratio   = round(report.get("coverage_ratio", 1.0) * 100)
+
+        if total == 0:
+            return "## Test Impact\n\nAucun fichier source stagé détecté."
+
+        lines = [
+            "## Test Impact Analysis",
+            "",
+            f"- Fichiers source modifiés : **{total}**",
+            f"- Couverts par des tests   : **{covered}** ({ratio}%)",
+            f"- Sans tests (gaps)        : **{gaps}**",
+        ]
+
+        all_tests = report.get("all_test_files", [])
+        if all_tests:
+            lines += ["", "### Tests à exécuter"]
+            for t in all_tests[:20]:
+                lines.append(f"- `{t}`")
+
+        impacts = report.get("impacts", [])
+        gap_files = [i for i in impacts if i.get("missing_tests")]
+        if gap_files:
+            lines += ["", "### Fichiers sans tests (coverage gaps)"]
+            for i in gap_files:
+                lines.append(f"- `{i['source_file']}` — aucun test trouvé")
+
+        return "\n".join(lines)
+
+    # ── F6: Cross-PR conflicts ───────────────────────────────────────────────
+
+    def _cross_pr(self, state: Dict[str, Any]) -> str:
+        report = state.get("cross_pr_report") or {}
+
+        if report.get("error"):
+            return f"## Cross-PR Conflicts\n\nErreur : `{report['error']}`"
+
+        total_prs = report.get("total_open_prs", 0)
+        conflicts = report.get("conflicts", [])
+
+        if not report.get("has_conflicts"):
+            return (
+                f"## Cross-PR Conflicts\n\n"
+                f"✅ Aucun conflit cross-PR détecté parmi {total_prs} PR(s) ouvertes."
+            )
+
+        high   = report.get("high_risk_count", 0)
+        medium = report.get("medium_risk_count", 0)
+
+        lines = [
+            "## Cross-PR Conflicts",
+            "",
+            f"⚠️ **{len(conflicts)} fichier(s)** partagés entre plusieurs PRs ouvertes.",
+            f"- PRs analysées : **{total_prs}**",
+            f"- Risque HIGH : **{high}** | Risque MEDIUM : **{medium}**",
+            "",
+            "### Conflits détectés",
+        ]
+
+        for c in conflicts[:15]:
+            risk_icon = "🔴" if c["risk_level"] == "HIGH" else "🟡"
+            pr_refs = ", ".join(f"#{n}" for n in c["pr_numbers"])
+            lines.append(f"\n{risk_icon} **`{c['file_path']}`** — PRs : {pr_refs}")
+            lines.append(f"  {c['note']}")
+
+        lines += [
+            "",
+            "### Recommandation",
+            "Merges ces PRs dans un ordre séquentiel et résolvez les conflits au fur et à mesure.",
+        ]
+
+        return "\n".join(lines)
+
+    # ── F7: PR description ───────────────────────────────────────────────────
+
+    def _pr_description(self, state: Dict[str, Any]) -> str:
+        report = state.get("pr_description") or {}
+
+        if report.get("error"):
+            return f"## PR Description\n\nErreur : `{report['error']}`"
+
+        description = report.get("description", "")
+        if not description:
+            return "## PR Description\n\nImpossible de générer la description."
+
+        from_cache = report.get("from_cache", False)
+        commits    = report.get("commits_used", 0)
+        files      = report.get("files_changed", 0)
+        adds       = report.get("additions", 0)
+        dels       = report.get("deletions", 0)
+
+        header = (
+            f"## PR Description Générée {'(cache)' if from_cache else '(LLM)'}\n\n"
+            f"_Basée sur {commits} commit(s), {files} fichier(s) — "
+            f"+{adds}/-{dels} lignes_\n\n"
+            "---\n\n"
+        )
+
+        return header + description
 
 
 git_synthesis_agent = LCGitSynthesisAgent()

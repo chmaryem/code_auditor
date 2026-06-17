@@ -552,6 +552,102 @@ def _test_results_path(profile: ProjectProfile) -> str:
 
 # -- Validation --------------------------------------------------------------
 
+def generate_dockerfile(profile: ProjectProfile) -> str:
+    """Public wrapper — Dockerfile adapté au langage/build system détecté."""
+    return _dockerfile_template(profile)
+
+
+def generate_docker_compose(profile: ProjectProfile) -> str:
+    """
+    Génère un docker-compose.yml production-ready adapté au projet.
+    Services additionnels inférés depuis le build system :
+      Java/Maven|Gradle → app + postgres
+      Python            → app + redis
+      JS/TS             → app seul
+    """
+    port_map = {"java": "8080", "python": "8000", "javascript": "3000", "typescript": "3000"}
+    app_port = port_map.get(profile.language.lower(), "8080")
+    lang     = profile.language.lower()
+
+    extra_services = ""
+    extra_volumes  = ""
+
+    if lang == "java":
+        extra_services = """
+  db:
+    image: postgres:15-alpine
+    container_name: db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-appdb}
+      POSTGRES_USER: ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+"""
+        extra_volumes = "  db-data:\n"
+
+    elif lang == "python":
+        extra_services = """
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+"""
+        extra_volumes = "  redis-data:\n"
+
+    volumes_block = f"\nvolumes:\n{extra_volumes}" if extra_volumes else ""
+
+    return f"""# docker-compose.yml — généré par Code Auditor
+# Projet  : {profile.language} / {profile.build_system}
+# Usage   : docker compose up -d
+
+version: "3.9"
+
+services:
+
+  app:
+    build: .
+    image: ${{DOCKERHUB_USERNAME:-myorg}}/${{IMAGE_NAME:-app}}:${{IMAGE_TAG:-latest}}
+    container_name: app
+    restart: unless-stopped
+    ports:
+      - "{app_port}:{app_port}"
+    env_file:
+      - .env
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{app_port}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+{('    depends_on:\n      db:\n        condition: service_healthy' if lang == 'java' else '    depends_on:\n      redis:\n        condition: service_healthy') if extra_services else ''}
+{extra_services}
+networks:
+  app-network:
+    driver: bridge
+{volumes_block}"""
+
+
 def validate_workflow(yaml_content: str) -> list[str]:
     """Valide le YAML genere. Retourne la liste des erreurs (vide = valide)."""
     _, errors = validate_workflow_strict(yaml_content)

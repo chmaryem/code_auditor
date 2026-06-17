@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from api.models import (
     AnalyzeFileRequest,
@@ -65,6 +66,13 @@ _watch_services: Dict[str, Any] = {}   # project_indexer, extractor, rag_system,
 _watch_active: Dict[str, Any]   = {}   # project_path → {thread, counter, timers, lock}
 _watch_last_events: Dict[str, Any] = {}  # project_path → latest ws_events snapshot
 
+# Per-project service cache. The startup graph/indexer are built on the backend's
+# OWN repo (_default_project = "."), so reusing them for a watched project made
+# the dependency analysis report bogus files (e.g. config.py/main.py from the
+# backend) as "dependents". These are (re)built and scoped to the watched project.
+_project_services_cache: Dict[str, Dict[str, Any]] = {}
+_project_services_lock = threading.Lock()
+
 # Main asyncio event loop — captured at startup so background threads can broadcast
 _main_loop: asyncio.AbstractEventLoop | None = None
 
@@ -93,6 +101,13 @@ async def lifespan(app: FastAPI):
 
     _server_start_time = time.time()
     logger.info("Code Auditor API v8 — démarrage (multi-agent mode)")
+
+    # ── PostgreSQL init ────────────────────────────────────────────────────────
+    try:
+        from database.connection import init_db
+        await init_db()
+    except Exception as _db_err:
+        logger.warning("Database init failed (running without persistent DB): %s", _db_err)
 
     def _init_services():
         """Background init — heavy services (embeddings, ChromaDB, dep graph)."""
@@ -220,6 +235,79 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # Close PostgreSQL connection pool
+    try:
+        from database.connection import close_db
+        await close_db()
+    except Exception:
+        pass
+
+
+def _get_project_services(project_path: Path) -> Dict[str, Any]:
+    """Build (and cache) a dependency graph + ProjectIndexer SCOPED to the
+    watched project.
+
+    Why: the services created at startup (``_watch_services``) are built on the
+    backend's own repository (``_default_project``). Reusing them for a watched
+    project made ``neighborhood.predecessors`` return backend files, so the watch
+    reported non-existent "dependent files". Here we build a graph for the real
+    project and re-wire the shared ``retriever_agent`` so neighborhood lookups are
+    grounded in THIS project. Cached per project_path.
+
+    Note: the ``retriever_agent`` singleton is shared, so the last watched project
+    wins. In practice only one project is watched at a time.
+    """
+    key = str(project_path)
+    with _project_services_lock:
+        cached = _project_services_cache.get(key)
+    if cached:
+        return cached
+
+    svc: Dict[str, Any] = {}
+
+    try:
+        from services.graph_service import dependency_builder, DependencyExtractor
+        dep_graph = dependency_builder.build_from_project(project_path)
+        svc["dep_graph"] = dep_graph
+        svc["extractor"] = DependencyExtractor(dep_graph)
+    except Exception as e:
+        logger.warning("Project dep graph build failed for %s: %s", key, e)
+
+    try:
+        from services.project_indexer import ProjectIndexer
+        pidx = ProjectIndexer(project_path)
+        pidx.build_index(svc.get("dep_graph"))
+        svc["project_indexer"] = pidx
+    except Exception as e:
+        logger.warning("Project indexer build failed for %s: %s", key, e)
+
+    # Re-wire the shared retriever so get_neighborhood() resolves predecessors
+    # from this project's graph instead of the backend repo graph.
+    try:
+        from agents.retriever_agent import retriever_agent
+        from services.knowledge_graph import knowledge_graph as kg
+        rag = _watch_services.get("rag_system")
+        retriever_agent.initialize(
+            graph=svc.get("dep_graph"),
+            project_indexer=svc.get("project_indexer"),
+            vector_store=getattr(rag, "vector_store", None) if rag else None,
+            project_code_indexer=svc.get("project_indexer"),
+            knowledge_graph=kg if getattr(kg, "_built", False) else None,
+        )
+    except Exception as e:
+        logger.warning("retriever_agent re-init for project %s failed: %s", key, e)
+
+    # Carry over the shared (project-agnostic) services.
+    svc["rag_system"] = _watch_services.get("rag_system")
+    svc["test_kb"]    = _watch_services.get("test_kb")
+
+    with _project_services_lock:
+        _project_services_cache[key] = svc
+
+    _nodes = svc["dep_graph"].number_of_nodes() if svc.get("dep_graph") else 0
+    logger.info("Project-scoped services built for %s (%d graph nodes)", key, _nodes)
+    return svc
+
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -255,6 +343,7 @@ from api.ci_router          import ci_router            # noqa: E402
 from api.diagnostics_router import diagnostics_router, feedback_router  # noqa: E402
 from api.code_actions_router import code_actions_router  # noqa: E402
 from api.mcp_router         import mcp_router            # noqa: E402
+from api.hardening_router   import hardening_router      # noqa: E402
 
 # Authentication endpoints — always public (login lives here).
 app.include_router(auth_router, prefix="/api")
@@ -267,6 +356,7 @@ app.include_router(ci_router,          prefix="/api", dependencies=_auth)
 app.include_router(diagnostics_router, prefix="/api", dependencies=_auth)
 app.include_router(feedback_router,    prefix="/api", dependencies=_auth)
 app.include_router(code_actions_router, prefix="/api", dependencies=_auth)
+app.include_router(hardening_router,   prefix="/api", dependencies=_auth)
 app.include_router(mcp_router,         dependencies=_auth)
 
 
@@ -323,14 +413,15 @@ async def analyze_file(req: AnalyzeFileRequest):
 
     try:
         from langchain_agents.graphs.watch_graph import invoke_watch
+        _svc = _get_project_services(project_path)
         result = await asyncio.to_thread(
             invoke_watch,
             file_path=str(file_path),
             project_path=str(project_path),
-            project_indexer=_watch_services.get("project_indexer"),
-            extractor=_watch_services.get("extractor"),
-            rag_system=_watch_services.get("rag_system"),
-            dep_graph=_watch_services.get("dep_graph"),
+            project_indexer=_svc.get("project_indexer"),
+            extractor=_svc.get("extractor"),
+            rag_system=_svc.get("rag_system"),
+            dep_graph=_svc.get("dep_graph"),
         )
     except Exception as e:
         logger.exception("analyze_file error: %s", e)
@@ -439,6 +530,10 @@ async def watch_start(req: WatchStartRequest):
     from langchain_agents.graphs.watch_graph import invoke_watch
     from watchers.file_watcher import FileWatcher
 
+    # Build/scope the dependency graph + indexer to THIS project so the watch
+    # never reports backend files as dependents (see _get_project_services).
+    proj_services = _get_project_services(project_path)
+
     print_lock   = threading.Lock()
     file_counter = {"analyzed": 0, "skipped": 0, "skipped_hash": 0, "skipped_minor": 0}
     pending_timers: Dict[str, Any] = {}
@@ -463,16 +558,29 @@ async def watch_start(req: WatchStartRequest):
                 _loop,
             )
 
+        # ── Real-time push callback ──────────────────────────────────────────
+        # Passed into the graph so the PRIMARY result is broadcast the instant it
+        # is ready (before the dependent cascade), and each dependent streams in
+        # as it finishes — instead of batching everything after the whole 297s
+        # pipeline. Thread-safe: schedules onto the captured main loop.
+        def _ws_push(event: Dict[str, Any]):
+            _loop2 = _main_loop
+            if _loop2 is not None and _loop2.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    _ws_manager.broadcast(event), _loop2
+                )
+
         # ── Phase B : pipeline complet (hash → AST → RAG → LLM → learn) ─────
         result = invoke_watch(
             file_path=str(fp),
             project_path=proj_key,
-            project_indexer=_watch_services.get("project_indexer"),
-            extractor=_watch_services.get("extractor"),
-            rag_system=_watch_services.get("rag_system"),
-            dep_graph=_watch_services.get("dep_graph"),
+            project_indexer=proj_services.get("project_indexer"),
+            extractor=proj_services.get("extractor"),
+            rag_system=proj_services.get("rag_system"),
+            dep_graph=proj_services.get("dep_graph"),
             print_lock=print_lock,
             file_counter=file_counter,
+            ws_broadcast=_ws_push,
         )
 
         # ── Broadcast all WebSocket events built by node_emit_ws_events ────────
@@ -482,6 +590,19 @@ async def watch_start(req: WatchStartRequest):
         loop = _main_loop
         if loop is None or not loop.is_running():
             logger.warning("_debounced: main event loop unavailable, WS broadcast skipped")
+            return
+
+        # When the graph already streamed events in real time via _ws_push, only
+        # persist the snapshot for TreeView init — do NOT re-broadcast (duplicates).
+        if result.get("ws_broadcasted"):
+            if ws_events:
+                _watch_last_events[proj_key] = {
+                    "file_path": str(fp),
+                    "timestamp": time.time(),
+                    "events":    ws_events,
+                }
+            if result.get("skip_reason"):
+                file_counter["skipped"] += 1
             return
 
         if ws_events:
@@ -716,6 +837,33 @@ async def generate_tests(req: GenerateTestsRequest):
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Knowledge Base — human approval of learned rules
+# ══════════════════════════════════════════════════════════════════════════════
+
+class KBRuleAction(BaseModel):
+    language: str
+    pattern: str
+
+
+@app.post("/api/kb/approve", dependencies=[Depends(get_current_user)])
+async def kb_approve(req: KBRuleAction):
+    """Promote a pending learned rule into the active Knowledge Base."""
+    from langchain_agents.agents.lc_learning_agent import lc_learning_agent
+    ok = lc_learning_agent.approve_pending(req.language, req.pattern)
+    if not ok:
+        raise HTTPException(404, f"Règle en attente introuvable : {req.language}/{req.pattern}")
+    return {"status": "approved", "language": req.language, "pattern": req.pattern}
+
+
+@app.post("/api/kb/reject", dependencies=[Depends(get_current_user)])
+async def kb_reject(req: KBRuleAction):
+    """Discard a pending learned rule (developer rejected it)."""
+    from langchain_agents.agents.lc_learning_agent import lc_learning_agent
+    lc_learning_agent.reject_pending(req.language, req.pattern)
+    return {"status": "rejected", "language": req.language, "pattern": req.pattern}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Stats
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -773,7 +921,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
       {"type": "ci_event", ...}
     """
     # Authenticate the WebSocket handshake (?token=<access JWT>).
-    if authenticate_ws(token) is None:
+    # Loopback bypass: the extension owns LOCAL and the backend binds to 127.0.0.1,
+    # so a WS from the same machine is the developer's own — allow it WITHOUT a token
+    # so real-time watch events always reach the local plugin even when the user has
+    # not signed into the extension. Remote clients (cloud dashboard) still need a JWT.
+    client_host = websocket.client.host if websocket.client else ""
+    is_loopback = client_host in ("127.0.0.1", "::1", "localhost")
+    if not is_loopback and authenticate_ws(token) is None:
         await websocket.close(code=1008)
         return
 

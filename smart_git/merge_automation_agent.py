@@ -152,14 +152,23 @@ async def check_merge_readiness(owner: str, repo: str, pr_number: int) -> Dict[s
               f"Approuvée: {'Oui' if reviews_approved else 'Non'}{_R}")
         print()
 
+        # Numeric score (0-100) for the frontend score ring
+        readiness_score = (
+            (40 if mergeable else 0) +
+            (35 if ci_pass else 0) +
+            (25 if reviews_approved else 0)
+        )
+
         return {
-            "success": True,
-            "ready": ready,
-            "mergeable": mergeable,
-            "ci_pass": ci_pass,
+            "success":          True,
+            "ready":            ready,
+            "mergeable":        mergeable,
+            "ci_pass":          ci_pass,
             "reviews_approved": reviews_approved,
-            "details": details,
-            "iterations": 0,   # 0 = pas d'appel LLM
+            "details":          details,
+            "score":            readiness_score,
+            "body":             report,   # full markdown for frontend display
+            "iterations":       0,
         }
 
     except Exception as e:

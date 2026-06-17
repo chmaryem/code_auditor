@@ -50,6 +50,13 @@ class WatchState(TypedDict, total=False):
     _print_lock: Any
     _learning_agent: Any
     _file_counter: Any
+    # Thread-safe callback(event: dict) -> None used to push WS events to the
+    # plugin *incrementally* (primary result first, dependents as they finish)
+    # instead of batching everything at the end of the pipeline.
+    _ws_broadcast: Any
+    # Set True by node_emit_ws_events when it has already pushed events through
+    # _ws_broadcast, so the caller does not re-broadcast (avoids duplicates).
+    ws_broadcasted: bool
 
 
 class CIState(TypedDict, total=False):
@@ -139,6 +146,7 @@ class ChatState(TypedDict, total=False):
 
     # ── Input ────────────────────────────────────────────────────────────────
     session_id: str
+    user_id: str          # authenticated user id (empty = anonymous / dev mode)
     user_message: str
     project_path: str
     target_file: Optional[str]
@@ -153,6 +161,7 @@ class ChatState(TypedDict, total=False):
     # ── Git context snapshot (injected if available) ─────────────────────────
     git_context: Dict[str, Any]  # session_snapshot from GitSessionTracker
     ci_context: Dict[str, Any]   # last CI run summary (injected if available)
+    project_state_context: Dict[str, Any]  # git_risk/secrets/test_gaps/security_quality/ci_readiness snapshot
 
     # ── Intent routing ──────────────────────────────────────────────────────
     intent: str
@@ -194,6 +203,7 @@ class ChatState(TypedDict, total=False):
     # ── Output ──────────────────────────────────────────────────────────────
     response: str
     formatted_response: str
+    context_sources: List[str]  # which project_state_context sections were available
     code_blocks: List[Dict[str, Any]]
     suggested_files: List[str]
     stats: Dict[str, Any]

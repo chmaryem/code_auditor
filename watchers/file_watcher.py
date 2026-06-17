@@ -58,25 +58,61 @@ class CodeChangeHandler(FileSystemEventHandler):
     def _should_process_file(self, file_path: Path) -> bool:
         """
         Détermine si un fichier doit être traité
-        
+
         Args:
             file_path: Chemin du fichier
-            
+
         Returns:
             True si le fichier doit être analysé
         """
         # Vérifier l'extension
         if file_path.suffix not in self.watched_extensions:
             return False
-        
+
         # Vérifier les dossiers exclus
         for excluded in self.excluded_dirs:
             # Convertir le pattern en vérification simple
             excluded_clean = excluded.replace('**/', '').replace('/**', '')
             if excluded_clean in file_path.parts:
                 return False
-        
+
+        # Exclure les fichiers de test : ils sont générés POUR vérifier le code, pas
+        # du code applicatif à auditer. Sans ce filtre, générer des tests déclenchait
+        # le watch sur le test lui-même (faux positifs + cascade inutile).
+        if self._is_test_file(file_path):
+            return False
+
         return True
+
+    @staticmethod
+    def _is_test_file(file_path: Path) -> bool:
+        """Détecte un fichier de test pour Python / JS-TS / Java."""
+        name = file_path.name.lower()
+        parts = {p.lower() for p in file_path.parts}
+
+        # Dossiers de test conventionnels (toutes langues)
+        if parts & {"tests", "test", "__tests__", "__mocks__"}:
+            return True
+        # Java : src/test/java/...
+        if "test" in parts and "src" in parts:
+            return True
+
+        # Python : test_*.py, *_test.py, conftest.py
+        if name.endswith(".py"):
+            if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+                return True
+        # JS/TS : *.test.* / *.spec.*
+        if any(name.endswith(ext) for ext in (".js", ".jsx", ".ts", ".tsx")):
+            stem = name.rsplit(".", 1)[0]
+            if stem.endswith(".test") or stem.endswith(".spec"):
+                return True
+        # Java : *Test.java / *Tests.java / *IT.java
+        if name.endswith(".java"):
+            base = name[:-5]
+            if base.endswith("test") or base.endswith("tests") or base.endswith("it"):
+                return True
+
+        return False
     
     def _schedule_analysis(self, file_path: str):
         """

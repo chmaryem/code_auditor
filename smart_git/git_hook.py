@@ -363,6 +363,44 @@ def run_pre_commit_hook(project_path: Path) -> int:
         print(f"  {_DM}Pas un dépôt Git — analyse ignorée.{_R}\n")
         return 0
 
+    # ── F1 : Secret Scan (HARD BLOCK) ─────────────────────────────────────────
+    try:
+        from smart_git.git_secret_scanner import scan_staged_secrets, render_secret_scan_report
+        print(f"  {_DM}[F1] Scan secrets...{_R}")
+        secret_report = scan_staged_secrets(project_path)
+        if secret_report.error:
+            print(f"  {_YL}⚠  Secret scan erreur (ignoré) : {secret_report.error}{_R}")
+        elif secret_report.has_secrets:
+            render_secret_scan_report(secret_report)
+            return 1  # HARD BLOCK — aucun secret ne doit être commité
+        else:
+            print(f"  {_GR}✓  [F1] Aucun secret détecté.{_R}")
+    except ImportError:
+        pass  # Module optionnel
+
+    # ── F3 : Commit Message Lint (WARNING) ────────────────────────────────────
+    try:
+        from smart_git.git_commit_linter import lint_staged_commit
+        print(f"  {_DM}[F3] Lint message de commit...{_R}")
+        lint_report = lint_staged_commit(project_path)
+        if lint_report.error:
+            print(f"  {_YL}⚠  Commit lint erreur (ignoré) : {lint_report.error}{_R}")
+        elif not lint_report.is_valid:
+            print(f"  {_YL}⚠  [F3] Message de commit non conforme (score {lint_report.score}/100) :{_R}")
+            for v in lint_report.errors[:3]:
+                print(f"     {_RD}✗ {v.rule} : {v.message}{_R}")
+            if lint_report.suggested_message:
+                print(f"     {_CY}Suggestion : {lint_report.suggested_message}{_R}")
+            print()
+        elif lint_report.has_warnings:
+            print(f"  {_YL}⚠  [F3] Message valide avec avertissements (score {lint_report.score}/100).{_R}")
+        else:
+            print(f"  {_GR}✓  [F3] Message de commit valide (score {lint_report.score}/100).{_R}")
+    except ImportError:
+        pass  # Module optionnel
+
+    print()
+
     staged = get_staged_files(project_path)
     code_files = [
         f for f in staged

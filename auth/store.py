@@ -16,7 +16,8 @@ from typing import Any, Optional
 
 import redis
 
-from auth.config import settings
+from config import config as _cfg
+settings = _cfg.auth
 
 # ── Key namespace ─────────────────────────────────────────────────────────────
 _NS = "ca:auth:"
@@ -145,6 +146,12 @@ def clear_otp(email: str) -> None:
 
 def in_cooldown(email: str) -> bool:
     return _r().exists(_cooldown_key(email)) == 1
+
+
+def clear_cooldown(email: str) -> None:
+    """Lift the resend cooldown — used when the OTP email failed to send,
+    so a transient SMTP outage doesn't lock the user out of retrying."""
+    _r().delete(_cooldown_key(email))
 
 
 def hit_rate_limit(email: str) -> bool:

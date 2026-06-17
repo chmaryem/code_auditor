@@ -90,6 +90,21 @@ def tool_llm_analyze(
     from services.llm_service import assistant_agent
     from langchain_core.documents import Document
 
+    # ── Security gate (Phase A) ───────────────────────────────────────────────
+    # Redact hardcoded secrets BEFORE the code leaves the machine for an external
+    # LLM. The real source is anchored separately in the watch graph, so redacting
+    # this copy never affects fix application — it only protects what we transmit.
+    import logging
+    from services.secret_redactor import redact_secrets
+
+    safe_code, n_secrets = redact_secrets(code)
+    if n_secrets:
+        logging.getLogger(__name__).warning(
+            "[SECURITY] redacted %d secret(s) from %s before sending to the LLM",
+            n_secrets,
+            (context or {}).get("file_path", "code") if isinstance(context, dict) else "code",
+        )
+
     # Reconstruct Document objects from serialized dicts
     doc_objects = []
     for d in (docs or []):
@@ -102,7 +117,7 @@ def tool_llm_analyze(
             doc_objects.append(d)
 
     result = assistant_agent.analyze_code_with_rag(
-        code=code,
+        code=safe_code,
         context=context,
         precomputed_docs=doc_objects if doc_objects else None,
         precomputed_scores=scores if scores else None,

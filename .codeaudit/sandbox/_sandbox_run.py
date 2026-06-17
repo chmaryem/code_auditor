@@ -19,96 +19,76 @@ from services.code_mode_client import github, rag, kg, cache, resolver
 try:
     code = '''package tn.esprit.sampleprojet;
 
+    import org.springframework.beans.factory.annotation.Autowired;
+    import org.springframework.stereotype.Service;
     import tn.esprit.sampleprojet.User;
-
     import javax.sql.DataSource;
     import java.sql.*;
     import java.sql.Connection;
     import java.sql.PreparedStatement;
     import java.sql.ResultSet;
     import java.sql.SQLException;
-    import java.sql.Statement;
+    import java.sql.Timestamp; // Added for handling Date/Timestamp conversion
+    import java.util.*;
     import java.util.ArrayList;
+    import java.util.Date;
+    import java.util.Date; // Explicitly imported for Date objects
     import java.util.List;
-    import java.util.Optional;
 
-    public class UserRepository {
+    @Service
+    public class UserService {
 
-        private DataSource dataSource;
+        DataSource dataSource;
 
-        public UserRepository(DataSource dataSource) {
-            this.dataSource = dataSource;
-        }
-        private String hashPassword(String plainPassword) {
-            return "hashed_" + plainPassword; // Example placeholder
-        }
 
-        public User findById(int id) throws SQLException {
-            String sql = "SELECT id, username, email FROM users WHERE id = ?";
+    @Autowired
+    public UserService(DataSource dataSource) {
+        this.dataSource = dataSource;
+        // Consider using environment variables or a secure secret management system
+        // For demonstration purposes only, do not hardcode sensitive data in production
+        private static final String ADMIN_PASSWORD = System.getenv("ADMIN_PASSWORD") != null ? System.getenv("ADMIN_PASSWORD") : "admin123!";
+    }
+
+        public User findByUsername(String username) throws SQLException {
+    // All fields required for a complete User object (as per User constructor) should be retrieved.
+    String query = "SELECT id, username, password_hash, email, role, created_at, last_login, is_active FROM users WHERE username = ?";
+    // Prepare statement to avoid SQL injection
+    PreparedStatement statement = connection.prepareStatement(query);
+    statement.setString(1, username);
             try (Connection conn = dataSource.getConnection();
-                 PreparedStatement pstmt = conn.prepareStatement(sql)) {
-                pstmt.setInt(1, id);
-                try (ResultSet rs = pstmt.executeQuery()) {
+                 PreparedStatement stmt = conn.prepareStatement(query)) {
+                try (ResultSet rs = stmt.executeQuery()) {
                     if (rs.next()) {
-                        User user = new User();
-                        user.id = rs.getInt("id");
-                        user.username = rs.getString("username");
-                        user.email = rs.getString("email");
-                        return user;
+    int id = rs.getInt("id");
+    String retrievedUsername = rs.getString("username");
+    String passwordHash = rs.getString("password_hash");
+    String email = rs.getString("email");
+    String role = rs.getString("role");
+    Timestamp createdAtTimestamp = rs.getTimestamp("created_at");
+    Timestamp lastLoginTimestamp = rs.getTimestamp("last_login");
+    boolean isActive = rs.getBoolean("is_active");
+
+    Date createdAt = (createdAtTimestamp != null) ? new Date(createdAtTimestamp.getTime()) : null;
+    Date lastLogin = (lastLoginTimestamp != null) ? new Date(lastLoginTimestamp.getTime()) : null;
+
+    return mapUser(new User(id, retrievedUsername, passwordHash, email, role, createdAt, lastLogin, isActive));
                     }
                 }
             }
             return null;
         }
 
-    public List<User> findAll() throws SQLException {
-            List<User> users = new ArrayList<>();
-            String sql = "SELECT id, username, email FROM users";
+        public boolean authenticate(String username, String password) throws SQLException {
+    ```
+            String query = "SELECT password_hash FROM users WHERE username = ?";
             try (Connection conn = dataSource.getConnection();
-                 Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery(sql)) {
-
-                while (rs.next()) {
-                    User user = new User();
-                    user.id = rs.getInt("id");
-                    user.username = rs.getString("username");
-                    user.email = rs.getString("email");
-                    users.add(user);
-                }
-            }
-
-            return users;
-        }
-        public void save(User user) throws SQLException {
-            String sql = "INSERT INTO users (username, email, password) VALUES (?, ?, ?)";
-            try (Connection conn = dataSource.getConnection();
-                 PreparedStatement pstmt = conn.prepareStatement(sql)) {
-
-                pstmt.setString(1, user.username);
-                pstmt.setString(2, user.email);
-                pstmt.setString(3, hashPassword(user.getPasswordHash())); // Hash password before saving
-
-                pstmt.executeUpdate();
-            }
-        }
-
-
-
-        public int countUsers() throws SQLException {
-            // Changement de la requête de COUNT(*) à COUNT(1)
-            String sql = "SELECT COUNT(1) AS total_count FROM users";
-            try (Connection conn = dataSource.getConnection();
-                 Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery(sql)) {
-
-                if (rs.next()) {
-                    return rs.getInt("total");
-                }
-            }
-            return 0;
-        }
-
-    public void batchInsert(List<User> users) throws SQLExce'''
+                 PreparedStatement stmt = conn.prepareStatement(query)) {
+                stmt.setString(1, username);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+    String storedPasswordHash = rs.getString("password_hash");
+    return hashPassword(password).equals(storedPasswordHash);
+            '''
     # Quick syntax check
     braces = code.count('{') == code.count('}')
     no_markers = '<<<<<<' not in code

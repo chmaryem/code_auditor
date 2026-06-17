@@ -26,6 +26,7 @@ import platform
 import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -149,7 +150,16 @@ class MCPRedisService:
 
     Toutes les méthodes publiques sont synchrones (thread-safe).
     L'async est géré en interne via _RedisLoopManager.
+
+    Résilience : Redis n'est qu'un cache best-effort. S'il tombe, on ne doit
+    JAMAIS transformer la panne en latence d'analyse. Un circuit-breaker
+    fail-fast (voir _run) coupe les appels au lieu de bloquer 30 s chacun.
     """
+
+    # ── Circuit-breaker tuning ───────────────────────────────────────────────
+    _OP_TIMEOUT_S = 5.0       # plafond d'attente sur un seul appel Redis
+    _FAIL_THRESHOLD = 2       # échecs consécutifs avant d'ouvrir le circuit
+    _COOLDOWN_S = 60.0        # durée pendant laquelle le circuit reste ouvert
 
     def __init__(self, redis_url: Optional[str] = None):
         self._redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -160,6 +170,9 @@ class MCPRedisService:
         self._available_tools: Set[str] = set()
         self._lock = threading.Lock()
         self._connected = False
+        # Circuit-breaker state
+        self._fail_until = 0.0    # monotonic deadline; >now ⇒ circuit ouvert
+        self._fail_streak = 0     # échecs consécutifs
 
     # ── Connexion MCP ────────────────────────────────────────────────────────
 
@@ -192,11 +205,15 @@ class MCPRedisService:
         self._connected = True
 
     def _ensure_connected(self) -> None:
-        """Connexion lazy — appelée automatiquement avant chaque opération."""
+        """Connexion lazy — appelée automatiquement avant chaque opération.
+
+        La connexion est bornée dans le temps : si le serveur MCP / Redis ne
+        répond pas, on ne reste pas bloqué (le circuit-breaker de _run gère
+        ensuite la mise en pause des appels)."""
         if not self._connected:
             with self._lock:
                 if not self._connected:
-                    _redis_loop.run(self._connect())
+                    _redis_loop.run(self._connect(), timeout=int(self._OP_TIMEOUT_S) + 5)
 
     async def _disconnect(self) -> None:
         """Ferme la connexion MCP proprement."""
@@ -258,9 +275,44 @@ class MCPRedisService:
         return None
 
     def _run(self, coro) -> Any:
-        """Wrapper synchrone pour les appels async."""
-        self._ensure_connected()
-        return _redis_loop.run(coro)
+        """Wrapper synchrone pour les appels async — résilient aux pannes Redis.
+
+        Circuit-breaker : si Redis est indisponible, on échoue VITE (retourne
+        None) au lieu de bloquer _OP_TIMEOUT_S, et on coupe complètement les
+        appels pendant _COOLDOWN_S après _FAIL_THRESHOLD échecs consécutifs.
+        Tous les appelants traitent déjà None comme « cache miss » → aucune
+        régression fonctionnelle, juste plus de latence quand Redis est mort.
+        """
+        # Circuit ouvert → on n'émet même pas l'appel (évite le hang réseau).
+        if time.monotonic() < self._fail_until:
+            try:
+                coro.close()  # évite "coroutine was never awaited"
+            except Exception:
+                pass
+            return None
+
+        try:
+            self._ensure_connected()
+            result = _redis_loop.run(coro, timeout=self._OP_TIMEOUT_S)
+            self._fail_streak = 0  # succès → on referme le circuit
+            return result
+        except Exception as exc:
+            try:
+                coro.close()
+            except Exception:
+                pass
+            self._fail_streak += 1
+            if self._fail_streak >= self._FAIL_THRESHOLD:
+                self._fail_until = time.monotonic() + self._COOLDOWN_S
+                # NB: on NE touche PAS à _connected ici — le transport MCP reste
+                # valide (c'est Redis derrière qui est down). La reconnexion d'une
+                # session réellement morte est gérée dans _call_tool.
+                logger.warning(
+                    "MCP-Redis indisponible (%s) — circuit ouvert %.0fs, "
+                    "fail-fast actif (cache désactivé temporairement)",
+                    exc.__class__.__name__, self._COOLDOWN_S,
+                )
+            return None
 
     # ── String operations ────────────────────────────────────────────────────
 
@@ -271,10 +323,33 @@ class MCPRedisService:
             args["expiration"] = expire_seconds
         return self._run(self._call_tool("set", args))
 
+    @staticmethod
+    def _is_mcp_error(val: Any) -> bool:
+        """
+        Le serveur redis-mcp-server renvoie une CHAÎNE D'ERREUR (au lieu de nil)
+        quand une clé/un champ n'existe pas — ex. :
+          "Key ca:fch:abc does not exist"
+          "Field 'analysis_text' not found in hash 'ca:fc:...'"
+        Ces chaînes sont *truthy* et étaient prises pour de vraies valeurs.
+        On les détecte ici pour les convertir en cache-miss (None).
+        """
+        if not isinstance(val, str):
+            return False
+        v = val.strip()
+        return (
+            (v.startswith("Key ") and v.endswith("does not exist"))
+            or (v.startswith("Field ") and "not found in hash" in v)
+            or v.startswith("ERR ")
+            or v.startswith("(error)")
+            or v.startswith("Error:")
+        )
+
     def get(self, key: str) -> Optional[str]:
-        """GET key → valeur ou None"""
+        """GET key → valeur ou None (None aussi sur erreur MCP 'does not exist')"""
         result = self._run(self._call_tool("get", {"key": key}))
         if result is None or result == "nil" or result == "(nil)":
+            return None
+        if self._is_mcp_error(result):
             return None
         return str(result) if result is not None else None
 
@@ -319,9 +394,11 @@ class MCPRedisService:
             self._run(self._call_tool("hset", args))
 
     def hget(self, name: str, key: str) -> Optional[str]:
-        """HGET name field → valeur ou None"""
+        """HGET name field → valeur ou None (None aussi sur erreur MCP 'not found')"""
         result = self._run(self._call_tool("hget", {"name": name, "key": key}))
         if result is None or result == "nil" or result == "(nil)":
+            return None
+        if self._is_mcp_error(result):
             return None
         val = str(result) if result is not None else None
         return self._unescape_hval(val) if val else val
@@ -329,6 +406,8 @@ class MCPRedisService:
     def hgetall(self, name: str) -> Dict[str, str]:
         """HGETALL name → {field: value, ...}"""
         result = self._run(self._call_tool("hgetall", {"name": name}))
+        if self._is_mcp_error(result):
+            return {}
         if isinstance(result, dict):
             out = {}
             for k, v in result.items():
@@ -521,14 +600,12 @@ class MCPRedisService:
     # ── Server info ──────────────────────────────────────────────────────────
 
     def ping(self) -> bool:
-        """Vérifie la connectivité Redis via info()."""
-        try:
-            self._ensure_connected()
-            result = self._run(self._call_tool("dbsize", {}))
-            return result is not None
-        except Exception as e:
-            logger.error("MCP-Redis ping failed : %s", e)
-            return False
+        """Vérifie la connectivité Redis (via dbsize), sans bloquer.
+
+        Passe par _run → respecte le circuit-breaker : renvoie False
+        instantanément quand le circuit est ouvert, au lieu de retenter et
+        de spammer les logs toutes les 30 s."""
+        return self._run(self._call_tool("dbsize", {})) is not None
 
     def dbsize(self) -> int:
         """Retourne le nombre de clés dans la base."""

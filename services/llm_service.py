@@ -455,13 +455,19 @@ LANGUAGE-SPECIFIC RULES (General):
             
             # Include dependent files content for cross-file analysis
             if dependents:
-                dependency_info += "\nDEPENDENT FILES CONTENT (files that call this one):\n"
+                primary_name = Path(file_path).name
+                dependency_info += (
+                    f"\nDEPENDENT FILES CONTENT (files that call this one) — FOR REFERENCE ONLY:\n"
+                    f"⚠️  CRITICAL: The code below is from OTHER files. "
+                    f"When writing fixes for {primary_name}, 'current_code' MUST come "
+                    f"from the primary CODE TO ANALYZE block above, NOT from here.\n"
+                )
                 for dep_path in dependents[:3]:  # Limit to first 3 dependents
                     try:
                         dep_file = Path(dep_path)
                         if dep_file.exists():
                             dep_content = dep_file.read_text(encoding="utf-8", errors="replace")[:2000]
-                            dependency_info += f"\n--- {dep_file.name} ---\n{dep_content}\n"
+                            dependency_info += f"\n--- {dep_file.name} (reference only) ---\n{dep_content}\n"
                     except Exception:
                         pass
                 if len(dependents) > 3:
@@ -517,11 +523,58 @@ DO NOT rewrite the entire class. Use block_fix only for real incompatibilities f
             if criticality > 3
             else "Breaking changes acceptable with justification."
         )
-        
-        
+
+        # ── Hardening mode override ───────────────────────────────────────────
+        # When called from node_fix, the context carries hardening_mode=True and
+        # a specific target_issue to fix. Override the general analysis prompt to
+        # force block_fix on ONE issue only and preserve all existing imports.
+        hardening_hint = ""
+        if context.get("hardening_mode"):
+            target_msg  = context.get("target_message", "")
+            target_line = context.get("target_line", "?")
+            target_sev  = context.get("target_severity", "")
+            prior_str   = context.get("prior_failures", "")
+            hardening_hint = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║  HARDENING MODE — TARGETED FIX ONLY                              ║
+╚══════════════════════════════════════════════════════════════════╝
+You are NOT doing a full audit. You must fix ONE specific issue:
+
+  [{target_sev}] {target_msg}  (around line {target_line})
+
+MANDATORY CONSTRAINTS:
+• STRATEGY MUST BE block_fix — NEVER full_class or targeted_methods.
+• Output ONLY the minimal lines that fix this issue (2-10 lines max).
+• current_code = the EXACT lines from the file that need changing (copy verbatim).
+• fixed_code   = the corrected version of those same lines.
+• DO NOT touch any other method, class, or import statement.
+• NEVER remove, rename, or move any existing import statement.
+• NEVER introduce a new import that doesn't already exist in the file.
+• The fixed_code must be syntactically valid on its own (no ellipsis, no placeholders).
+{("FORBIDDEN approaches (tried and failed):\\n" + prior_str) if prior_str else ""}
+Respond ONLY with the ---DECISION--- block (strategy=block_fix) and ONE ---FIX START--- block.
+"""
 
         # ── Prompt final ──────────────────────────────────────────────────────
-        prompt = f"""You are a SENIOR code reviewer performing an EXHAUSTIVE audit.
+        if context.get("hardening_mode"):
+            # Stripped-down prompt for targeted hardening fix
+            prompt = f"""{hardening_hint}
+CODE:
+File: {file_path}
+Language: {language}
+
+```{language}
+{code_to_send}
+```
+
+BEST PRACTICES FROM KNOWLEDGE BASE:
+{knowledge_context if knowledge_context else "(none)"}
+
+{post_solution_hint}
+Now produce the ---DECISION--- block then ONE ---FIX START--- / ---FIX END--- block.
+"""
+        else:
+            prompt = f"""You are a SENIOR code reviewer performing an EXHAUSTIVE audit.
 Your mission: find and report EVERY issue in the code below — do not skip, do not group, do not stop early.
 {post_solution_hint}{upstream_hint}{project_ctx_compressed}
 {context.get("system_impact_section", "")}
@@ -574,6 +627,12 @@ RULES:
 12. Treat each method as INDEPENDENT. Even if method A has a fatal error,
     analyze method B, C, D... as if each stands alone.
     Report every distinct issue in every method.
+13. CRITICAL — current_code source rule:
+    For every fix that targets the PRIMARY file ({Path(file_path).name}):
+      • current_code MUST be copied verbatim from the ```{language}``` CODE TO ANALYZE block above.
+      • NEVER copy current_code from DEPENDENT FILES CONTENT — that is a different file.
+    For fixes targeting a dependent file, copy current_code from that file's section and
+    set LOCATION to that file's name. Cross-file current_code = instant fix rejection.
 
 ═══════════════════════════════════════════════════════════════
 STEP 1 — DECIDE YOUR REPAIR STRATEGY

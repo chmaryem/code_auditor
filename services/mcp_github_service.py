@@ -220,6 +220,30 @@ class MCPGitHubService:
     async def _call_alias(self, alias: str, arguments: Dict[str, Any]) -> Any:
         return await self._call_tool(self._resolve_tool(alias), arguments)
 
+    # ── REST helper (writes) ──────────────────────────────────────────────────
+    # Le serveur MCP npm échoue silencieusement sur les écritures (create_branch,
+    # push_file, create_pr) — mêmes limitations que les lectures. On passe donc en
+    # REST-first pour les écritures aussi. MCP reste en fallback.
+    def _rest_api(self, method: str, url: str, payload: Optional[dict] = None) -> Any:
+        """Appel REST GitHub synchrone. Lève une exception claire en cas d'échec
+        (contrairement à MCP qui renvoie {} en silence). HTTPError propagée pour
+        que l'appelant gère les cas 422 (déjà existant)."""
+        import urllib.request as _ur
+        token = os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+        if not token:
+            raise RuntimeError("GITHUB token manquant pour l'appel REST")
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "code-auditor/1.0",
+            "Content-Type": "application/json",
+        }
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = _ur.Request(url, data=data, headers=headers, method=method)
+        with _ur.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode()
+            return json.loads(body) if body else {}
+
     # ── Pull Requests ─────────────────────────────────────────────────────────
 
     async def get_pull_request(self, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
@@ -229,10 +253,31 @@ class MCPGitHubService:
                 result = await self._call_alias("get_pr", {
                     "owner": owner, "repo": repo, key: pr_number,
                 })
-                if result and isinstance(result, dict):
+                if result and isinstance(result, dict) and result.get("number"):
                     return result
             except Exception:
                 continue
+
+        # REST fallback — MCP retourne {} quand le tool échoue
+        token = os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+        if token:
+            try:
+                import urllib.request as _ur
+                api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+                req = _ur.Request(api_url, headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github.v3+json",
+                    "User-Agent": "code-auditor/1.0",
+                })
+                with _ur.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                if isinstance(data, dict) and data.get("number"):
+                    sys.stderr.write(f"[REST] get_pull_request fallback OK: PR #{pr_number}\n")
+                    sys.stderr.flush()
+                    return data
+            except Exception as e:
+                logger.debug("get_pull_request REST fallback: %s", e)
+
         return {}
 
     async def get_pr_mergeable_status(
@@ -280,40 +325,66 @@ class MCPGitHubService:
                 "Authorization": f"token {token}",
                 "Accept": "application/vnd.github.v3+json",
             }
-            for attempt in range(3):
+
+            def _result_from(rest_pr: dict, has_conflicts: bool, mergeable) -> dict:
+                return {
+                    "has_conflicts": has_conflicts,
+                    "mergeable": mergeable,
+                    "conflict_files": [],
+                    "base_ref": rest_pr.get("base", {}).get("ref", "main"),
+                    "head_ref": rest_pr.get("head", {}).get("ref", ""),
+                    "head_sha": rest_pr.get("head", {}).get("sha", ""),
+                    "pr_data": rest_pr,
+                }
+
+            # mergeable_state plus stable que mergeable :
+            #   "dirty"  = conflits confirmés
+            #   ces états = pas de conflit (mergeable même si CI/review bloquent)
+            _CLEAN_STATES = {"clean", "blocked", "behind", "unstable", "has_hooks"}
+
+            # GitHub calcule mergeable en asynchrone → backoff progressif (5 essais).
+            delays = [0, 1, 2, 3, 3]
+            last_pr: dict = {}
+            for attempt, delay in enumerate(delays):
+                if delay:
+                    await asyncio.sleep(delay)
                 try:
                     req = urllib.request.Request(api_url, headers=headers_rest)
                     with urllib.request.urlopen(req, timeout=10) as resp:
                         rest_pr = json.loads(resp.read().decode())
+                    last_pr = rest_pr
 
                     rest_mergeable = rest_pr.get("mergeable")
                     rest_state = rest_pr.get("mergeable_state", "")
                     sys.stderr.write(
                         f"[REST] Stratégie 0 : mergeable={rest_mergeable!r} "
-                        f"state={rest_state!r} (attempt {attempt+1})\n"
+                        f"state={rest_state!r} (attempt {attempt+1}/{len(delays)})\n"
                     )
                     sys.stderr.flush()
 
+                    # 1) Signal le plus fiable : mergeable_state == "dirty" = conflit
+                    if rest_state == "dirty":
+                        return _result_from(rest_pr, True, False)
+                    # 2) mergeable explicite (true/false)
                     if rest_mergeable is not None:
-                        pr_data = rest_pr
-                        base_ref = rest_pr.get("base", {}).get("ref", "main")
-                        head_ref = rest_pr.get("head", {}).get("ref", "")
-                        head_sha = rest_pr.get("head", {}).get("sha", "")
-                        return {
-                            "has_conflicts": not rest_mergeable,
-                            "mergeable": rest_mergeable,
-                            "conflict_files": [],
-                            "base_ref": base_ref,
-                            "head_ref": head_ref,
-                            "head_sha": head_sha,
-                            "pr_data": rest_pr,
-                        }
-                    # mergeable=None → GitHub calcule encore — attendre 1s (réduit de 3s)
-                    await asyncio.sleep(1)
+                        return _result_from(rest_pr, not rest_mergeable, rest_mergeable)
+                    # 3) mergeable null mais state concluant → pas de conflit
+                    if rest_state in _CLEAN_STATES:
+                        return _result_from(rest_pr, False, True)
+                    # 4) null + state "unknown"/"" → GitHub calcule encore, on retente
                 except Exception as e:
                     sys.stderr.write(f"[REST] Stratégie 0 erreur: {e}\n")
                     sys.stderr.flush()
                     break  # REST inaccessible, passer aux stratégies MCP
+
+            # Tous les essais épuisés : si on a un mergeable_state, le respecter
+            # plutôt que de tomber sur le défaut peu fiable des stratégies MCP.
+            if last_pr:
+                final_state = last_pr.get("mergeable_state", "")
+                if final_state == "dirty":
+                    return _result_from(last_pr, True, False)
+                if final_state in _CLEAN_STATES:
+                    return _result_from(last_pr, False, True)
 
         # ── Stratégie 1 : get_pull_request_status ────────────────────────────
         # NOTE : Ce tool MCP retourne le statut CI/CD (checks), pas mergeableState.
@@ -542,9 +613,14 @@ class MCPGitHubService:
         }
 
     async def get_pr_files(self, owner: str, repo: str, pr_number: int) -> List[Dict[str, Any]]:
-        """Multi-strategy fallback pour lister les fichiers d'une PR."""
+        """Liste les fichiers d'une PR via MCP (outil `get_pull_request_files`,
+        paramètre `pull_number` en snake_case). REST direct en fallback
+        uniquement si MCP échoue vraiment (serveur down, outil absent)."""
+        # ── Stratégie MCP (prioritaire) ──────────────────────────────────────
         if "get_pull_request_files" in self._available_tools:
-            for key in ["pullNumber", "pull_number"]:
+            # pull_number (snake_case) est le nom attendu par le serveur MCP
+            # officiel ; pullNumber est tenté en second pour compat anciens forks.
+            for key in ["pull_number", "pullNumber"]:
                 try:
                     result = await self._call_tool("get_pull_request_files", {
                         "owner": owner, "repo": repo, key: pr_number,
@@ -554,7 +630,7 @@ class MCPGitHubService:
                 except Exception:
                     continue
         if self.has_tool("list_pr_files"):
-            for key in ["pullNumber", "pull_number"]:
+            for key in ["pull_number", "pullNumber"]:
                 try:
                     result = await self._call_alias("list_pr_files", {
                         "owner": owner, "repo": repo, key: pr_number,
@@ -563,6 +639,39 @@ class MCPGitHubService:
                         return result
                 except Exception:
                     continue
+
+        # ── Fallback REST : seulement si MCP n'a rien renvoyé ────────────────
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+        token = os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+        if token:
+            import urllib.request
+            api_url = (
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
+                f"?per_page=100"
+            )
+            headers_rest = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "code-auditor/1.0",
+            }
+            try:
+                req = urllib.request.Request(api_url, headers=headers_rest)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    rest_files = json.loads(resp.read().decode())
+                if isinstance(rest_files, list) and rest_files:
+                    sys.stderr.write(
+                        f"[REST] get_pr_files fallback : {len(rest_files)} fichier(s)\n"
+                    )
+                    sys.stderr.flush()
+                    return rest_files
+            except Exception as e:
+                sys.stderr.write(f"[REST] get_pr_files erreur: {e}\n")
+                sys.stderr.flush()
+
         try:
             pr = await self.get_pull_request(owner, repo, pr_number)
             if isinstance(pr, dict):
@@ -578,17 +687,22 @@ class MCPGitHubService:
         max_chars: int = 8000
     ) -> str:
         """
-        Lit le contenu d'un fichier GitHub.
-        max_chars=8000 par défaut pour limiter la consommation de tokens LLM.
+        Lit le contenu d'un fichier GitHub via MCP (outil `get_file_contents`).
+        REST direct en fallback uniquement si MCP échoue vraiment.
+
+        max_chars : limite de caractères (LLM budget). 0 ou négatif = illimité
+        (utilisé par la résolution de conflits qui a besoin du fichier ENTIER —
+        une troncature corromprait le merge).
 
         FIX v7.2 — Détection contenu déjà décodé :
           Le serveur MCP npm retourne parfois encoding='base64' MAIS le contenu
           est déjà du texte clair (pas du vrai base64). Si on tente b64decode()
           sur du texte Java, on obtient du garbage binaire.
-
-          SOLUTION : vérifier si le contenu ressemble déjà à du texte lisible
-          AVANT de tenter le décodage base64. Si oui, utiliser tel quel.
         """
+        def _cap(text: str) -> str:
+            return text[:max_chars] if (max_chars and max_chars > 0) else text
+
+        # ── Stratégie MCP (prioritaire) ──────────────────────────────────────
         for args in [
             {"owner": owner, "repo": repo, "path": path, "branch": ref},
             {"owner": owner, "repo": repo, "path": path, "ref": ref},
@@ -625,7 +739,7 @@ class MCPGitHubService:
                             except Exception:
                                 # base64 decode échoué — garder le contenu tel quel
                                 pass
-                    content = (content or "")[:max_chars]
+                    content = _cap(content or "")
                     # Validation : rejeter le contenu binaire (NUL bytes)
                     if content and "\x00" in content:
                         logger.warning(
@@ -635,9 +749,55 @@ class MCPGitHubService:
                         return ""
                     return content
                 if isinstance(result, str) and result:
-                    return result[:max_chars]
+                    return _cap(result)
             except Exception:
                 continue
+
+        # ── Fallback REST : seulement si MCP n'a rien renvoyé ────────────────
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+        token = os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+        if token:
+            import urllib.request
+            import urllib.parse
+            import base64 as _b64
+            api_url = (
+                f"https://api.github.com/repos/{owner}/{repo}/contents/"
+                f"{urllib.parse.quote(path, safe='/')}"
+                f"?ref={urllib.parse.quote(ref, safe='')}"
+            )
+            headers_rest = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "code-auditor/1.0",
+            }
+            try:
+                req = urllib.request.Request(api_url, headers=headers_rest)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode())
+                raw_b64 = data.get("content", "") if isinstance(data, dict) else ""
+                if raw_b64:
+                    raw_bytes = _b64.b64decode(raw_b64.replace("\n", ""))
+                    text = None
+                    for enc in ("utf-8", "latin-1", "cp1252"):
+                        try:
+                            text = raw_bytes.decode(enc)
+                            break
+                        except (UnicodeDecodeError, ValueError):
+                            continue
+                    if text is None:
+                        text = raw_bytes.decode("utf-8", errors="replace")
+                    if "\x00" in text[:1000]:
+                        sys.stderr.write(f"[REST] get_file_content: binaire ignoré {path}@{ref}\n")
+                        sys.stderr.flush()
+                        return ""
+                    return _cap(text)
+            except Exception as e:
+                sys.stderr.write(f"[REST] get_file_content erreur {path}@{ref}: {e}\n")
+                sys.stderr.flush()
         return ""
 
     @staticmethod
@@ -688,6 +848,40 @@ class MCPGitHubService:
         content: str, message: str, branch: str,
         sha: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # ── Stratégie 0 : REST PUT /contents (fiable) ────────────────────────
+        try:
+            import base64 as _b64
+            import urllib.parse
+            url = (
+                f"https://api.github.com/repos/{owner}/{repo}/contents/"
+                f"{urllib.parse.quote(path, safe='/')}"
+            )
+            # Récupérer le SHA existant sur la branche (requis pour un update)
+            if not sha:
+                try:
+                    existing = self._rest_api(
+                        "GET", f"{url}?ref={urllib.parse.quote(branch, safe='')}"
+                    )
+                    if isinstance(existing, dict):
+                        sha = existing.get("sha")
+                except Exception:
+                    sha = None  # le fichier n'existe pas encore → création
+            payload = {
+                "message": message,
+                "content": _b64.b64encode(content.encode("utf-8")).decode("ascii"),
+                "branch":  branch,
+            }
+            if sha:
+                payload["sha"] = sha
+            result = self._rest_api("PUT", url, payload)
+            sys.stderr.write(f"[REST] push_file OK: {path}@{branch}\n")
+            sys.stderr.flush()
+            return result if isinstance(result, dict) else {}
+        except Exception as e:
+            sys.stderr.write(f"[REST] push_file erreur {path}@{branch}: {e}\n")
+            sys.stderr.flush()
+
+        # ── Fallback MCP ─────────────────────────────────────────────────────
         if "push_files" in self._available_tools:
             try:
                 result = await self._call_tool("push_files", {
@@ -705,9 +899,48 @@ class MCPGitHubService:
         }
         if sha:
             args["sha"] = sha
-        return await self._call_alias("create_file", args) or {}
+        try:
+            return await self._call_alias("create_file", args) or {}
+        except Exception as e:
+            sys.stderr.write(f"[MCP] create_file erreur {path}: {e}\n")
+            sys.stderr.flush()
+            return {}
 
     async def create_branch(self, owner: str, repo: str, branch_name: str, from_ref: str = "main") -> Dict[str, Any]:
+        # ── Stratégie 0 : REST (fiable) ──────────────────────────────────────
+        try:
+            import urllib.parse
+            import urllib.error as _ue
+            # from_ref peut être un nom de branche OU un SHA. Résoudre le SHA de base.
+            is_sha = len(from_ref) == 40 and all(c in "0123456789abcdef" for c in from_ref.lower())
+            base_sha = from_ref
+            if not is_sha:
+                ref_data = self._rest_api(
+                    "GET",
+                    f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/"
+                    f"{urllib.parse.quote(from_ref, safe='')}",
+                )
+                base_sha = ref_data.get("object", {}).get("sha", from_ref)
+            try:
+                result = self._rest_api(
+                    "POST",
+                    f"https://api.github.com/repos/{owner}/{repo}/git/refs",
+                    {"ref": f"refs/heads/{branch_name}", "sha": base_sha},
+                )
+                sys.stderr.write(f"[REST] create_branch OK: {branch_name}\n")
+                sys.stderr.flush()
+                return result if isinstance(result, dict) else {}
+            except _ue.HTTPError as he:
+                if he.code == 422:  # la branche existe déjà → réutilisable
+                    sys.stderr.write(f"[REST] create_branch: {branch_name} existe déjà (OK)\n")
+                    sys.stderr.flush()
+                    return {"ref": f"refs/heads/{branch_name}", "exists": True}
+                raise
+        except Exception as e:
+            sys.stderr.write(f"[REST] create_branch erreur: {e}\n")
+            sys.stderr.flush()
+
+        # ── Fallback MCP ─────────────────────────────────────────────────────
         for args in [
             {"owner": owner, "repo": repo, "branch": branch_name, "from_branch": from_ref},
             {"owner": owner, "repo": repo, "branch": branch_name, "sha": from_ref},
@@ -724,6 +957,41 @@ class MCPGitHubService:
         self, owner: str, repo: str,
         title: str, body: str, head: str, base: str
     ) -> Dict[str, Any]:
+        # ── Stratégie 0 : REST POST /pulls (fiable) ──────────────────────────
+        try:
+            import urllib.error as _ue
+            try:
+                result = self._rest_api(
+                    "POST",
+                    f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                    {"title": title, "body": body, "head": head, "base": base},
+                )
+                if isinstance(result, dict) and result.get("html_url"):
+                    sys.stderr.write(f"[REST] create_pull_request OK: {result.get('html_url')}\n")
+                    sys.stderr.flush()
+                    return result
+            except _ue.HTTPError as he:
+                # 422 : une PR existe déjà pour ce head/base → la retrouver
+                if he.code == 422:
+                    sys.stderr.write(f"[REST] create_pull_request: PR existe déjà pour {head}→{base}\n")
+                    sys.stderr.flush()
+                    try:
+                        existing = self._rest_api(
+                            "GET",
+                            f"https://api.github.com/repos/{owner}/{repo}/pulls"
+                            f"?head={owner}:{head}&base={base}&state=open",
+                        )
+                        if isinstance(existing, list) and existing:
+                            return existing[0]
+                    except Exception:
+                        pass
+                else:
+                    raise
+        except Exception as e:
+            sys.stderr.write(f"[REST] create_pull_request erreur: {e}\n")
+            sys.stderr.flush()
+
+        # ── Fallback MCP ─────────────────────────────────────────────────────
         if "create_pull_request" not in self._available_tools:
             return {}
         try:
@@ -737,10 +1005,76 @@ class MCPGitHubService:
             logger.debug("create_pull_request: %s", e)
             return {}
 
+    def _rest_create_review(
+        self, owner: str, repo: str, pr_number: int,
+        body: str, event: str, comments: List[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Soumet un review via l'API REST GitHub directe — contrôle total du format
+        des commentaires inline ({path, line, side, start_line, start_side, body}).
+
+        Gère le cas 422 : GitHub interdit APPROVE/REQUEST_CHANGES sur sa PROPRE PR.
+        On replie alors sur l'event COMMENT, ce qui poste quand même les
+        commentaires inline + le corps du review.
+
+        Retourne le dict review en cas de succès, None sinon (→ repli MCP).
+        """
+        token = (os.getenv("GITHUB_TOKEN")
+                 or os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+                 or _get_github_token())
+        if not token:
+            return None
+
+        import urllib.request as _ur
+        import urllib.error as _ue
+
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "code-auditor/1.0",
+            "Content-Type": "application/json",
+        }
+
+        def _post(evt: str) -> Dict[str, Any]:
+            payload: Dict[str, Any] = {"body": body or "", "event": evt}
+            if comments:
+                payload["comments"] = comments
+            req = _ur.Request(
+                api_url, data=json.dumps(payload).encode("utf-8"),
+                headers=headers, method="POST",
+            )
+            with _ur.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+
+        try:
+            return _post(event)
+        except _ue.HTTPError as e:
+            # 422 : impossible d'APPROVE/REQUEST_CHANGES sa propre PR → repli COMMENT
+            if e.code == 422 and event in ("APPROVE", "REQUEST_CHANGES"):
+                try:
+                    logger.debug("create_review 422 (own PR) → retry as COMMENT")
+                    return _post("COMMENT")
+                except Exception as e2:
+                    logger.debug("REST create_review COMMENT retry: %s", e2)
+                    return None
+            logger.debug("REST create_review HTTPError %s", e.code)
+            return None
+        except Exception as e:
+            logger.debug("REST create_review: %s", e)
+            return None
+
     async def create_pr_review(
         self, owner: str, repo: str, pr_number: int,
         body: str, event: str, comments: List[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        # Avec commentaires inline : REST d'abord (format fiable + gestion du 422
+        # own-PR). Le serveur MCP gère mal le schéma inline {path,line,side}.
+        if comments:
+            rest = self._rest_create_review(owner, repo, pr_number, body, event, comments)
+            if isinstance(rest, dict) and rest.get("id"):
+                return rest
+
         for key in ["pullNumber", "pull_number"]:
             args = {"owner": owner, "repo": repo, key: pr_number, "body": body, "event": event}
             if comments:
@@ -751,6 +1085,12 @@ class MCPGitHubService:
                     return result if isinstance(result, dict) else {}
             except Exception:
                 continue
+
+        # Repli REST sans inline (gère aussi le 422 own-PR pour un review simple)
+        rest2 = self._rest_create_review(owner, repo, pr_number, body, event, None)
+        if isinstance(rest2, dict) and rest2.get("id"):
+            return rest2
+
         return await self.post_pr_comment(owner, repo, pr_number, f"[{event}]\n\n{body[:2000]}")
 
     async def get_pr_reviews(self, owner: str, repo: str, pr_number: int) -> List[Dict[str, Any]]:
@@ -786,6 +1126,71 @@ class MCPGitHubService:
         result = await self._call_alias("search_code", {"q": query})
         if isinstance(result, dict):
             return result.get("items", [])
+        return []
+
+    async def list_open_prs(
+        self, owner: str, repo: str, base: str = "", per_page: int = 30
+    ) -> List[Dict[str, Any]]:
+        """Liste les PRs ouvertes sur un dépôt (optionnellement filtrées par base branch)."""
+        params: Dict[str, Any] = {"owner": owner, "repo": repo, "state": "open"}
+        if base:
+            params["base"] = base
+
+        for alias in ["list_pull_requests", "list_pulls", "list_prs"]:
+            if self.has_tool(alias):
+                for key in ["pullNumber", "pull_number", "number"]:
+                    try:
+                        result = await self._call_alias(alias, params)
+                        if isinstance(result, list):
+                            return result
+                        if isinstance(result, dict):
+                            return result.get("pull_requests", result.get("items", []))
+                    except Exception:
+                        break
+
+        # Fallback : search PRs via search_code or REST
+        try:
+            result = await self._call_tool("search_issues", {
+                "owner": owner, "repo": repo,
+                "q": f"repo:{owner}/{repo} is:pr is:open",
+            })
+            if isinstance(result, dict):
+                return result.get("items", [])
+        except Exception:
+            pass
+
+        return []
+
+    async def get_pr_commits(
+        self, owner: str, repo: str, pr_number: int
+    ) -> List[Dict[str, Any]]:
+        """Liste les commits d'une PR (REST-first, MCP en fallback)."""
+        # ── Stratégie 0 : REST direct ────────────────────────────────────────
+        try:
+            data = self._rest_api(
+                "GET",
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits?per_page=100",
+            )
+            if isinstance(data, list) and data:
+                sys.stderr.write(f"[REST] get_pr_commits : {len(data)} commit(s) via REST\n")
+                sys.stderr.flush()
+                return data
+        except Exception as e:
+            sys.stderr.write(f"[REST] get_pr_commits erreur: {e}\n")
+            sys.stderr.flush()
+
+        # ── Fallback MCP ─────────────────────────────────────────────────────
+        for alias in ["list_pr_commits", "get_pull_request_commits", "list_commits"]:
+            if self.has_tool(alias):
+                for key in ["pullNumber", "pull_number"]:
+                    try:
+                        result = await self._call_alias(alias, {
+                            "owner": owner, "repo": repo, key: pr_number,
+                        })
+                        if isinstance(result, list) and result:
+                            return result
+                    except Exception:
+                        continue
         return []
 
     async def list_available_tools(self) -> List[str]:

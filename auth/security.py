@@ -17,7 +17,8 @@ import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from auth.config import settings
+from config import config as _cfg
+settings = _cfg.auth
 
 
 # ── Principal (request identity) ──────────────────────────────────────────────

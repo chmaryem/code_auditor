@@ -26,10 +26,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
+from auth.security import Principal, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ class ChatResponse(BaseModel):
     generation_valid: bool = True
     generation_errors: List[str] = Field(default_factory=list)
     elapsed_seconds: float = 0.0
+    context_sources: List[str] = Field(default_factory=list)
 
 
 class HistoryEntry(BaseModel):
@@ -99,6 +101,17 @@ class SessionHistoryResponse(BaseModel):
     turn_count: int = 0
 
 
+class SessionSummary(BaseModel):
+    session_id: str
+    title: str = "New conversation"
+    updated_at: int = 0
+    turn_count: int = 0
+
+
+class SessionListResponse(BaseModel):
+    sessions: List[SessionSummary] = Field(default_factory=list)
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 async def _run_chat(
@@ -106,6 +119,7 @@ async def _run_chat(
     project_path: str,
     session_id: str,
     target_file: str,
+    user_id: str = "",
     cursor_line: int = 0,
     active_function: str = "",
     selected_text: str = "",
@@ -120,6 +134,7 @@ async def _run_chat(
             message=message,
             project_path=project_path,
             session_id=session_id,
+            user_id=user_id,
             target_file=target_file,
             cursor_line=cursor_line,
             active_function=active_function,
@@ -145,6 +160,7 @@ async def _run_chat(
         generation_valid=result.get("generation_valid", True),
         generation_errors=result.get("generation_errors") or [],
         elapsed_seconds=elapsed,
+        context_sources=result.get("context_sources") or [],
     )
 
 
@@ -166,12 +182,13 @@ def _safe_write_generated_file(project_path: str, suggested_file: str, code: str
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 @chat_router.post("", response_model=ChatResponse, summary="Q&A / Explain")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, user: Principal = Depends(get_current_user)):
     """Project-aware Q&A and code explanation with IDE cursor context."""
     return await _run_chat(
         message         = req.message,
         project_path    = req.project_path,
         session_id      = req.session_id,
+        user_id         = user.id,
         target_file     = req.target_file,
         cursor_line     = req.cursor_line,
         active_function = req.active_function,
@@ -181,7 +198,7 @@ async def chat(req: ChatRequest):
 
 
 @chat_router.post("/stream", summary="Stream Q&A / Explain via SSE")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, user: Principal = Depends(get_current_user)):
     """
     Streaming version of Q&A endpoint.
 
@@ -199,6 +216,7 @@ async def chat_stream(req: ChatRequest):
                 message=req.message,
                 project_path=req.project_path,
                 session_id=req.session_id,
+                user_id=user.id,
                 target_file=req.target_file,
             ):
                 yield chunk
@@ -221,7 +239,7 @@ async def chat_stream(req: ChatRequest):
 
 
 @chat_router.post("/complete", response_model=ChatResponse, summary="Complete a function")
-async def complete_function(req: CompletionRequest):
+async def complete_function(req: CompletionRequest, user: Principal = Depends(get_current_user)):
     """Generate the body of an incomplete/stub function."""
     file_part = f" in {req.file_path}" if req.file_path else ""
     lang_part = f" using {req.language}" if req.language else ""
@@ -231,12 +249,13 @@ async def complete_function(req: CompletionRequest):
         message=message,
         project_path=req.project_path,
         session_id=req.session_id,
+        user_id=user.id,
         target_file=req.file_path,
     )
 
 
 @chat_router.post("/generate", response_model=ChatResponse, summary="Generate new class/file")
-async def generate_class(req: GenerateClassRequest):
+async def generate_class(req: GenerateClassRequest, user: Principal = Depends(get_current_user)):
     """Generate a complete new class following project conventions."""
     lang_part = f" in {req.language}" if req.language else ""
     desc_part = f" — {req.description}" if req.description else ""
@@ -246,6 +265,7 @@ async def generate_class(req: GenerateClassRequest):
         message=message,
         project_path=req.project_path,
         session_id=req.session_id,
+        user_id=user.id,
         target_file="",
     )
 
@@ -300,7 +320,7 @@ async def get_history(session_id: str):
     summary="Clear conversation history",
 )
 async def clear_history(session_id: str):
-    """Clear the conversation history for a session."""
+    """Clear the conversation history for a session and remove it from the sidebar index."""
     try:
         from services.chat_memory_service import chat_memory_service
         await asyncio.to_thread(chat_memory_service.clear_session, session_id)
@@ -308,6 +328,27 @@ async def clear_history(session_id: str):
     except Exception as e:
         logger.warning("clear_session failed: %s", e)
         return {"status": "error", "detail": str(e)}
+
+
+@chat_router.get(
+    "/sessions",
+    response_model=SessionListResponse,
+    summary="List past conversations for a project",
+)
+async def list_sessions(project_path: str = ".", limit: int = 50):
+    """List past chat sessions for a project, most recent first — powers the history sidebar."""
+    try:
+        from services.chat_memory_service import chat_memory_service
+        sessions = await asyncio.to_thread(
+            chat_memory_service.list_sessions, project_path, limit
+        )
+    except Exception as e:
+        logger.warning("list_sessions failed: %s", e)
+        sessions = []
+
+    return SessionListResponse(
+        sessions=[SessionSummary(**s) for s in sessions]
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -406,14 +447,24 @@ async def complete_inline_stream(req: InlineCompletionRequest):
             f"\nProject context (match style and types):\n{ctx}\n" if ctx else ""
         )
 
+        # Security gate (Phase A): redact before sending to external LLM
+        _safe_prefix = req.prefix_code
+        _safe_suffix = req.suffix_code
+        try:
+            from services.secret_redactor import redact_secrets as _redact
+            _safe_prefix, _np = _redact(_safe_prefix)
+            _safe_suffix, _ns = _redact(_safe_suffix)
+        except Exception:
+            pass
+
         import re as _re
         fim_prompt = (
             f"Complete the {language} code at <CURSOR>. Output ONLY the inserted text — "
             f"no explanation, no markdown fences.\n"
             f"Keep it concise (1–5 lines). Must be syntactically valid {language}."
             f"{context_section}\n"
-            f"<prefix>{req.prefix_code[-1200:]}</prefix><CURSOR>"
-            f"<suffix>{req.suffix_code[:300]}</suffix>\n\n"
+            f"<prefix>{_safe_prefix[-1200:]}</prefix><CURSOR>"
+            f"<suffix>{_safe_suffix[:300]}</suffix>\n\n"
             f"Completion:"
         )
 

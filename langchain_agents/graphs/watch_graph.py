@@ -490,9 +490,29 @@ def node_learn_feedback(state: WatchState) -> Dict[str, Any]:
 
     # ── 1. LangChain learning agent (simple path) ────────────────────────────
     result = lc_learning_agent.process_feedback(analysis, language)
-    promoted = result.get("rules_promoted", [])
-    if promoted:
-        print(f"    {_GR}KB rules promoted: {', '.join(promoted)}{_R}")
+    pending = result.get("pending_rules", [])
+    if pending:
+        names = ", ".join(r["pattern"] for r in pending)
+        print(f"    {_GR}KB rules staged for approval: {names}{_R}")
+
+        # Notify the developer so they can Accept/Reject. Rules no longer enter
+        # the KB silently — the plugin shows an approval prompt per suggestion.
+        ws_broadcast = state.get("_ws_broadcast")
+        if callable(ws_broadcast):
+            for r in pending:
+                try:
+                    ws_broadcast({
+                        "type":      "kb_suggestion",
+                        "pattern":   r["pattern"],
+                        "language":  r["language"],
+                        "severity":  r.get("severity", "MEDIUM"),
+                        "count":     r.get("count", 0),
+                        "rule_md":   r.get("rule_md", ""),
+                        "file_path": state.get("file_path", ""),
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    })
+                except Exception as _e:
+                    logger.debug("kb_suggestion broadcast failed: %s", _e)
 
     # ── 2. Legacy LearningAgent (enriched with project context) ──────────────
     learning_agent = state.get("_learning_agent")
@@ -512,7 +532,7 @@ def node_learn_feedback(state: WatchState) -> Dict[str, Any]:
             except Exception as e:
                 logger.debug("Legacy learning feedback: %s", e)
 
-    # ── 3. Display recurring patterns ────────────────────────────────────────
+    # ── 3. Display recurring patterns + broadcast to plugin ──────────────────
     try:
         from langchain_agents.memory.redis_memory import PatternMemory
         pm = PatternMemory()
@@ -522,10 +542,55 @@ def node_learn_feedback(state: WatchState) -> Dict[str, Any]:
             print(f"\n    {_YL}⚠  Patterns récurrents ({language}) :{_R}")
             for p in recurring:
                 print(f"      {_YL}• {p['pattern']} — vu {p['count']}× → vérifiez la KB{_R}")
+            # Broadcast kb_suggestion for patterns not already staged in step 1
+            already_staged = {r["pattern"] for r in pending}
+            ws_broadcast_r = state.get("_ws_broadcast")
+            if callable(ws_broadcast_r):
+                for p in recurring:
+                    if p["pattern"] in already_staged:
+                        continue  # already broadcast above
+                    try:
+                        ws_broadcast_r({
+                            "type":      "kb_suggestion",
+                            "pattern":   p["pattern"],
+                            "language":  language,
+                            "severity":  p.get("severity", "MEDIUM"),
+                            "count":     p.get("count", 0),
+                            "rule_md":   p.get("fix", ""),
+                            "file_path": state.get("file_path", ""),
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        })
+                    except Exception as _e:
+                        logger.debug("kb_suggestion (recurring) broadcast failed: %s", _e)
     except Exception:
         pass
 
     return {"learning_result": result}
+
+
+def _is_test_path(path: str) -> bool:
+    """True if `path` is a test file (Python / JS-TS / Java conventions).
+
+    Test files are written to verify code, not application code to audit; they must
+    not enter the watch pipeline as primary files or as dependents.
+    """
+    from pathlib import Path as _P
+    p = _P(str(path))
+    name = p.name.lower()
+    parts = {x.lower() for x in p.parts}
+    if parts & {"tests", "test", "__tests__", "__mocks__"}:
+        return True
+    if "test" in parts and "src" in parts:  # Java src/test/java
+        return True
+    if name.endswith(".py"):
+        return name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py"
+    if name.endswith((".js", ".jsx", ".ts", ".tsx")):
+        stem = name.rsplit(".", 1)[0]
+        return stem.endswith(".test") or stem.endswith(".spec")
+    if name.endswith(".java"):
+        base = name[:-5]
+        return base.endswith("test") or base.endswith("tests") or base.endswith("it")
+    return False
 
 
 def node_analyze_dependents(state: WatchState) -> Dict[str, Any]:
@@ -544,6 +609,39 @@ def node_analyze_dependents(state: WatchState) -> Dict[str, Any]:
                 "falling back to %d neighborhood predecessors",
                 len(dependents),
             )
+
+    # Ground dependents in the ACTUAL watched project. The dependency graph can
+    # still contain entries from the backend repo or other indexed projects, which
+    # previously caused bogus dependents (config.py/main.py) to be analyzed and
+    # their fixes mis-applied. Keep only files that exist on disk AND live under
+    # project_path, excluding the changed file itself. This mirrors the filter in
+    # node_emit_ws_events so the analysis path and the WS event agree.
+    import os as _os
+    _proj = state.get("project_path", "") or ""
+    if dependents and _proj:
+        _proj_abs = _os.path.normcase(_os.path.abspath(_proj))
+        _self_abs = _os.path.normcase(_os.path.abspath(state.get("file_path", "")))
+        _grounded: list = []
+        _seen: set = set()
+        for _d in dependents:
+            try:
+                _da = _os.path.normcase(_os.path.abspath(str(_d)))
+            except Exception:
+                continue
+            if _da in _seen or _da == _self_abs:
+                continue
+            if not _os.path.exists(_d) or not _da.startswith(_proj_abs):
+                continue
+            if _is_test_path(_d):  # never audit generated test files as dependents
+                continue
+            _seen.add(_da)
+            _grounded.append(str(_d))
+        if len(_grounded) != len(dependents):
+            logger.info(
+                "analyze_dependents: grounded %d → %d dependents inside project",
+                len(dependents), len(_grounded),
+            )
+        dependents = _grounded
 
     if not dependents:
         return {}
@@ -575,11 +673,34 @@ def node_analyze_dependents(state: WatchState) -> Dict[str, Any]:
     max_deps = config.watcher.max_impacted_files
     to_analyze = dependents[:max_deps]
     changed_file = Path(state["file_path"]).name
-    analysis_text = state.get("analysis", {}).get("analysis", "")[:1500]
+    _raw_analysis = state.get("analysis", {}).get("analysis", "")
+    # Strip code blocks from the analysis summary injected into dependent context.
+    # The raw LLM text contains fix blocks with before/after code from the CHANGED
+    # file. Without stripping, the dependent LLM sees that code in its context and
+    # copies it into its own current_code anchor — causing "original code not found"
+    # because that code belongs to a different file.
+    import re as _re_dep
+    _analysis_no_code = _re_dep.sub(r'(?s)```[^\n]*\n.*?```', '[code omitted]', _raw_analysis)
+    analysis_text = _analysis_no_code[:1200]
     print_lock = state.get("_print_lock")
+    ws_broadcast = state.get("_ws_broadcast")
+    loop_start = state.get("stats", {}).get("start_time", time.time())
+    # Hard per-cascade budget. The primary result has already been broadcast, so
+    # dependents are best-effort: if the cascade runs long (rate-limit backoff,
+    # cold reranker), stop rather than stall the watch loop for minutes.
+    DEPENDENT_BUDGET_S = 60.0
     analyzed = 0
 
     for dep_str in to_analyze:
+        # Re-check budget EVERY iteration (the old single pre-loop check let a
+        # fast primary unlock an unbounded dependent cascade → 297s latency).
+        if time.time() - loop_start > DEPENDENT_BUDGET_S:
+            logger.info(
+                "analyze_dependents: budget %.0fs exhausted, stopping after %d dep(s)",
+                DEPENDENT_BUDGET_S, analyzed,
+            )
+            break
+
         dep_path = Path(dep_str)
         if not dep_path.exists():
             logger.warning("Dependent not found on disk, skipping: %s", dep_str)
@@ -627,8 +748,15 @@ def node_analyze_dependents(state: WatchState) -> Dict[str, Any]:
 
         context_dep["upstream_change"] = (
             f"IMPORTANT: {changed_file} was just refactored. "
-            f"Verify that THIS file still compiles and works correctly with it.\n"
-            f"Summary of changes in {changed_file}:\n{analysis_text[:800]}"
+            f"Verify that {dep_path.name} still compiles and works correctly with it.\n"
+            f"=== Summary of changes in {changed_file} "
+            f"(read-only context — DO NOT copy this code into your fix blocks) ===\n"
+            f"{analysis_text[:800]}\n"
+            f"=== End of {changed_file} context ===\n\n"
+            f"CRITICAL: You are analyzing {dep_path.name} ONLY. "
+            f"In every fix block, 'current_code' MUST be a snippet that exists "
+            f"verbatim in {dep_path.name}. "
+            f"NEVER use code from {changed_file} as current_code."
         )
         context_dep["post_solution_mode"] = True
         context_dep["post_solution_hint"] = (
@@ -677,6 +805,32 @@ def node_analyze_dependents(state: WatchState) -> Dict[str, Any]:
                     print_lock.release()
                 except RuntimeError:
                     pass
+
+        # ── Stream this dependent's result to the plugin immediately ─────────
+        # Same builder as the primary → dependents get identical fix-anchoring /
+        # apply safety. Broadcast now so each dependent appears as it finishes
+        # instead of waiting for the whole cascade.
+        if callable(ws_broadcast):
+            try:
+                dep_built = build_analysis_result_event(
+                    file_path=str(dep_path),
+                    language=dep_lang,
+                    raw_text=result_text_dep,
+                    source_code=dep_content,
+                    strategy_default="block_fix",
+                    change_score=0,
+                    rag_docs_used=len(docs_dep),
+                    elapsed_ms=0,
+                )
+                dep_event = dep_built["event"]
+                # Tag as an upstream-impact result so the plugin can group it
+                # under the file the developer actually edited.
+                dep_event["triggered_by"] = state["file_path"]
+                dep_event["is_dependent"] = True
+                ws_broadcast(dep_event)
+            except Exception as exc:
+                logger.warning("[WS] dependent broadcast failed for %s: %s",
+                               dep_path.name, exc)
 
         # Self-Improving RAG for dependent
         fix_blocks_dep = parse_fix_blocks(result_text_dep)
@@ -1090,6 +1244,189 @@ def _extract_fixes_from_llm(
     return deduped[:10]
 
 
+def _anchor_current_code(current: str, source: str) -> "str | None":
+    """
+    Anchor a fix's `current_code` to the EXACT text present in `source`.
+
+    The LLM frequently returns `current_code` that is paraphrased, re-indented,
+    or (with weak models) partially hallucinated — so an exact `current in source`
+    test fails and the plugin reports "original code not found", or worse, applies
+    the patch at the wrong place and corrupts the file.
+
+    Resolution order:
+      1. Exact substring        → return `current` unchanged.
+      2. Whitespace-normalized  → find the contiguous block of source lines whose
+         per-line stripped form equals `current`'s, and return that EXACT source
+         slice (so downstream exact-match apply succeeds).
+      3. Un-anchorable          → return None (caller marks the fix non-applicable).
+    """
+    current = (current or "").strip("\n")
+    if not current or not source:
+        return None
+
+    # 1. Exact
+    if current in source:
+        return current
+
+    def _norm(line: str) -> str:
+        return " ".join(line.split())
+
+    cur_lines = [l for l in current.splitlines() if l.strip()]
+    if not cur_lines:
+        return None
+    cur_norm = [_norm(l) for l in cur_lines]
+
+    src_lines = source.splitlines()
+    src_norm = [_norm(l) for l in src_lines]
+    window = len(cur_norm)
+
+    # 2. Sliding-window match on normalized lines, ignoring blank source lines
+    #    inside the window is intentionally NOT done — we need a contiguous slice
+    #    so the returned text is a real substring of `source`.
+    for i in range(0, len(src_lines) - window + 1):
+        if src_norm[i:i + window] == cur_norm:
+            return "\n".join(src_lines[i:i + window])
+
+    # 3. Single-line fixes: tolerate surrounding context by matching the one line
+    if window == 1:
+        target = cur_norm[0]
+        for i, sn in enumerate(src_norm):
+            if sn == target:
+                return src_lines[i]
+
+    return None
+
+
+def _align_fix_to_source(anchored: str, fixed: str, source: str):
+    """Re-align an anchored fix to the source's indentation.
+
+    The LLM returns ``current_code``/``fixed_code`` de-indented. When ``current``
+    then matches as a mid-line / un-indented substring, substituting a multi-line
+    ``fixed`` drops the indentation of every *added* line (it lands at column 0),
+    producing IndentationErrors and statements merged onto one line — the
+    file-corruption bug.
+
+    This expands ``anchored`` to span whole source lines (capturing the leading
+    indentation) and re-indents ``fixed`` to that same base indentation while
+    preserving its own relative nesting. Returns ``(current_full, fixed_aligned)``.
+    If the match is not cleanly line-aligned (real code before/after it on the
+    line), the inputs are returned unchanged — a safe no-op.
+    """
+    import textwrap
+
+    idx = source.find(anchored)
+    if idx < 0:
+        return anchored, fixed
+
+    line_start = source.rfind("\n", 0, idx) + 1
+    pre = source[line_start:idx]
+    if pre.strip():
+        return anchored, fixed  # real code precedes the match on its line
+
+    end = idx + len(anchored)
+    nl = source.find("\n", end)
+    line_end = nl if nl != -1 else len(source)
+    if source[end:line_end].strip():
+        return anchored, fixed  # real code follows the match on its line
+
+    current_full = source[line_start:line_end]
+    first_line = current_full.splitlines()[0] if current_full.splitlines() else current_full
+    base_indent = first_line[: len(first_line) - len(first_line.lstrip())]
+
+    fixed_norm = textwrap.dedent(fixed).strip("\n")
+    aligned = "\n".join(
+        (base_indent + line) if line.strip() else ""
+        for line in fixed_norm.splitlines()
+    )
+    return current_full, aligned
+
+
+def _py_compiles(code: str) -> bool:
+    """True unless `code` has a Python *syntax* error (runtime errors don't count)."""
+    try:
+        compile(code, "<chk>", "exec")
+        return True
+    except SyntaxError:
+        return False
+    except Exception:
+        # Non-syntax issues (e.g. null bytes) — don't claim the code is broken.
+        return True
+
+
+def _py_undefined_names(code: str) -> set:
+    """Names that are READ but never BOUND anywhere in `code` (flat, non-scoped).
+
+    Deliberately conservative: a name bound *anywhere* in the module counts as
+    defined, so we only flag names that are used yet defined nowhere — which keeps
+    false positives near zero while still catching the motivating case (a fix that
+    drops ``rows = cursor.fetchall()`` but keeps ``return ... rows``).
+    """
+    import ast
+    import builtins
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()  # syntax is handled by the compile gate
+
+    bound: set = set()
+    loaded: set = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.add(node.id)        # covers assignments, for/with/comprehension targets, unpacking
+            elif isinstance(node.ctx, ast.Load):
+                loaded.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    return set()  # star import → can't reason; never reject
+                bound.add(alias.asname or alias.name)
+
+    safe = set(dir(builtins)) | {
+        "__name__", "__file__", "__doc__", "__builtins__",
+        "__spec__", "__loader__", "__package__",
+    }
+    return {n for n in loaded if n not in bound and n not in safe}
+
+
+def _fix_breaks_code(original: str, patched: str, language: str) -> "str | None":
+    """Return a human reason if `patched` is provably WORSE than `original`
+    (introduces a syntax error or a newly-undefined name), else None.
+
+    Only languages we can statically validate are gated (Python today). For
+    everything else we return None — we never reject a fix we cannot prove broken,
+    so good fixes are never lost. This is the Phase-A trust gate: the plugin must
+    never offer a one-click fix that breaks the file.
+    """
+    if (language or "").lower() != "python":
+        return None
+    if original == patched:
+        return None
+
+    orig_ok = _py_compiles(original)
+    patched_ok = _py_compiles(patched)
+    if orig_ok and not patched_ok:
+        return "introduce a syntax error"
+    if orig_ok and patched_ok:
+        new_undef = _py_undefined_names(patched) - _py_undefined_names(original)
+        if new_undef:
+            return "leave undefined name(s): " + ", ".join(sorted(new_undef))
+    return None
+
+
 def _attach_fixes_to_issues(issues: list, fixes: list) -> list:
     """
     Attach fix fields to issues so the VS Code plugin can show
@@ -1115,9 +1452,14 @@ def _attach_fixes_to_issues(issues: list, fixes: list) -> list:
             matching_fix = fixes[idx]
 
         if matching_fix:
-            item["current_code"] = matching_fix.get("current_code", "")
-            item["fixed_code"] = matching_fix.get("fixed_code", "")
-            item["fix_preview"] = matching_fix.get("fix_preview", "")
+            # Only attach replacement code when the fix is anchorable/applicable.
+            # Otherwise the plugin would think a one-click fix exists and apply it
+            # at the wrong place (the file-corruption bug). Advisory fixes still
+            # contribute their explanation so the user gets guidance.
+            if matching_fix.get("applicable"):
+                item["current_code"] = matching_fix.get("current_code", "")
+                item["fixed_code"] = matching_fix.get("fixed_code", "")
+                item["fix_preview"] = matching_fix.get("fix_preview", "")
             item["fix_explanation"] = matching_fix.get("explanation", "")
 
             if not item.get("suggestion"):
@@ -1126,6 +1468,275 @@ def _attach_fixes_to_issues(issues: list, fixes: list) -> list:
         enriched.append(item)
 
     return enriched
+
+
+# Tokens that prove a "issue"/"fix" is actually leaked prompt scaffolding or the
+# weak model echoing the output template — never a real finding. Matched
+# case-insensitively against an issue title/message or a fix's code.
+_PARSER_ARTIFACTS = (
+    "structured_output", "structured output", "---decision",
+    "**location**", "**problem**", "**severity**", "**current code**",
+    "**fixed code**", "fix start", "```", "<structured", "</structured",
+)
+
+# Phrases the model uses when it found NOTHING — these must not surface as issues.
+_NO_ISSUE_PHRASES = (
+    "no specific issue", "no issues found", "no issue found",
+    "does not contain", "no obvious issue", "appears to be clean",
+    "no problems found", "n/a",
+)
+
+
+def _is_artifact(*texts: str) -> bool:
+    """True if any text is empty/garbage or contains parser scaffolding."""
+    blob = " ".join(t for t in texts if t).lower()
+    if not blob.strip():
+        return True
+    return any(tok in blob for tok in _PARSER_ARTIFACTS)
+
+
+def _sanitize_issues(issues_raw: list) -> list:
+    """Drop parser artifacts and 'nothing found' non-issues.
+
+    The weak LLM frequently echoes the output template (titles like
+    ``</STRUCTURED_OUTPUT>`` or ``**LOCATION**: execute_query, line 1``) or
+    reports 'No specific issues found' as if it were a finding. Surfacing these
+    as actionable issues is what made the plugin's issue list look broken.
+    """
+    clean = []
+    for issue in issues_raw or []:
+        title = str(issue.get("title", "")).strip()
+        message = str(issue.get("message", "")).strip()
+        if _is_artifact(title, message):
+            continue
+        low = f"{title} {message}".lower()
+        if any(p in low for p in _NO_ISSUE_PHRASES):
+            continue
+        clean.append(issue)
+    return clean
+
+
+def _sanitize_fixes(fixes_raw: list) -> list:
+    """Drop fixes whose code is parser scaffolding or has no real content."""
+    clean = []
+    for fix in fixes_raw or []:
+        current = str(fix.get("current_code", ""))
+        fixed = str(fix.get("fixed_code", ""))
+        if _is_artifact(current) or _is_artifact(fixed):
+            continue
+        clean.append(fix)
+    return clean
+
+
+def build_analysis_result_event(
+    file_path: str,
+    language: str,
+    raw_text: str,
+    source_code: str,
+    strategy_default: str = "block_fix",
+    change_score: int = 0,
+    rag_docs_used: int = 0,
+    elapsed_ms: int = 0,
+) -> Dict[str, Any]:
+    """
+    Build a single schema-v2.0 `analysis_result` event from one file's LLM output.
+
+    Shared by node_emit_ws_events (primary file) and node_analyze_dependents
+    (each dependent), so both go through the SAME structured-parse + fix-anchoring
+    path — guaranteeing dependents get the same apply-fix safety as the primary.
+    """
+    import uuid
+
+    analyzed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    request_id  = str(uuid.uuid4())
+
+    # ── Structured output first, regex fallback ──────────────────────────────
+    try:
+        from langchain_agents.agents.lc_analysis_agent import parse_structured_output
+        structured = parse_structured_output(raw_text)
+    except Exception:
+        structured = {}
+
+    if structured.get("issues") is not None:
+        issues_raw      = structured.get("issues", [])
+        fixes_raw       = structured.get("fixes", [])
+        strategy        = structured.get("strategy") or strategy_default
+        strategy_reason = structured.get("strategy_reason", "")
+        logger.info(
+            "[WS] structured output used for %s: strategy=%s issues=%d fixes=%d",
+            Path(file_path).name, strategy, len(issues_raw), len(fixes_raw),
+        )
+    else:
+        issues_raw = _parse_issues_from_llm(raw_text, file_path)
+        fixes_raw  = _extract_fixes_from_llm(
+            raw_text, file_path, language,
+            source_code=source_code, strategy=strategy_default,
+        )
+        strategy        = strategy_default
+        strategy_reason = ""
+        logger.info(
+            "[WS] regex fallback used for %s: issues=%d fixes=%d raw_len=%d",
+            Path(file_path).name, len(issues_raw), len(fixes_raw), len(raw_text or ""),
+        )
+
+    # Strip leaked prompt scaffolding / "nothing found" non-issues before anything
+    # downstream treats them as real, actionable findings.
+    _n_issues, _n_fixes = len(issues_raw), len(fixes_raw)
+    issues_raw = _sanitize_issues(issues_raw)
+    fixes_raw  = _sanitize_fixes(fixes_raw)
+    if len(issues_raw) != _n_issues or len(fixes_raw) != _n_fixes:
+        logger.info(
+            "[WS] sanitized %s: issues %d→%d, fixes %d→%d (dropped parser artifacts)",
+            Path(file_path).name, _n_issues, len(issues_raw), _n_fixes, len(fixes_raw),
+        )
+
+    try:
+        from api.diff_utils import compute_diff_hunks, truncate_code_for_ws
+        _diff_available = True
+    except ImportError:
+        _diff_available = False
+
+    enriched_fixes = []
+    for fix in fixes_raw:
+        current    = str(fix.get("current_code", "")).strip()
+        fixed      = str(fix.get("fixed_code",   "")).strip("\n")  # keep indentation for re-alignment
+        apply_mode = str(fix.get("apply_mode", "replace_snippet"))
+        fix_id     = str(uuid.uuid4())
+
+        # Anchor current_code to the EXACT file text (see _anchor_current_code).
+        applicable = False
+        if apply_mode != "full_file" and source_code and current and fixed:
+            anchored = _anchor_current_code(current, source_code)
+            if anchored is not None:
+                # Re-align current/fixed to the source indentation so multi-line
+                # fixes don't land at column 0 (the file-corruption bug). See
+                # _align_fix_to_source.
+                current, fixed = _align_fix_to_source(anchored, fixed, source_code)
+                applicable = True
+            else:
+                logger.info(
+                    "[WS] fix not anchorable in %s (current_code not found) — "
+                    "marked advisory: %.60s",
+                    Path(file_path).name, current.replace("\n", "\\n"),
+                )
+
+        diff_hunks = []
+        patched = None
+        if applicable and current != fixed:
+            try:
+                patched = source_code.replace(current, fixed, 1)
+                if _diff_available:
+                    diff_hunks = compute_diff_hunks(source_code, patched)
+            except Exception as exc:
+                logger.debug("diff_hunks failed: %s", exc)
+
+        if apply_mode == "full_file" and current and fixed:
+            applicable = True
+            patched = fixed
+
+        # ── Validation gate (Phase A — trust) ───────────────────────────────────
+        # Never offer a one-click fix that makes the file WORSE: a new syntax error
+        # or a newly-undefined name (e.g. a fix that drops `rows = cursor.fetchall()`
+        # but keeps `return pd.DataFrame(rows)`). Such fixes are downgraded to
+        # advisory — the dev still gets the guidance, but the plugin won't auto-apply
+        # broken code. Only statically-checkable languages are gated; others pass.
+        if applicable and patched is not None and patched != source_code:
+            break_reason = _fix_breaks_code(source_code, patched, language)
+            if break_reason:
+                applicable = False
+                diff_hunks = []
+                logger.info(
+                    "[WS] fix rejected in %s (would %s) — marked advisory",
+                    Path(file_path).name, break_reason,
+                )
+
+        if _diff_available and apply_mode == "full_file" and (
+            len(current) > 300 or len(fixed) > 300
+        ):
+            current_ws = truncate_code_for_ws(current)
+            fixed_ws   = truncate_code_for_ws(fixed)
+        else:
+            current_ws = current
+            fixed_ws   = fixed
+
+        # Derive the TRUE 1-based line from the anchored position in source. The
+        # LLM's reported line is unreliable (weak models miscount, reporting e.g.
+        # line 5 for code that lives at line 16) — which threw the gutter dots off
+        # and could send a line-based apply to the wrong line. Fall back to the
+        # LLM line only when the fix isn't anchored (advisory / full_file).
+        fix_line = fix.get("line")
+        if applicable and apply_mode != "full_file" and current and source_code:
+            _pos = source_code.find(current)
+            if _pos >= 0:
+                fix_line = source_code.count("\n", 0, _pos) + 1
+
+        enriched_fixes.append({
+            "id":           fix_id,
+            "issue_id":     fix.get("issue_id"),
+            "title":        str(fix.get("title", "Suggested fix"))[:160],
+            "apply_mode":   apply_mode if applicable else "manual",
+            "applicable":   applicable,
+            "file_path":    file_path,
+            "line":         fix_line,
+            "diff_hunks":   diff_hunks,
+            "current_code": current_ws,
+            "fixed_code":   fixed_ws,
+            "explanation":  str(fix.get("explanation", fix.get("why", "")))[:500],
+            "language":     language,
+        })
+
+    enriched_issues = []
+    for idx, issue in enumerate(issues_raw):
+        matched_fix = enriched_fixes[idx] if idx < len(enriched_fixes) else None
+        fix_id_ref  = matched_fix["id"] if matched_fix else None
+        fix_ok      = bool(matched_fix and matched_fix.get("applicable"))
+        # Prefer the fix's anchored line for the gutter / "Go to line" (the real
+        # position) over the LLM's guess. Keep the LLM line only for advisory
+        # issues that have no anchored fix to derive from.
+        issue_line = issue.get("line")
+        if matched_fix and matched_fix.get("applicable") and matched_fix.get("line"):
+            issue_line = matched_fix["line"]
+        enriched_issues.append({
+            **issue,
+            "line":          issue_line,
+            "id":            str(uuid.uuid4()),
+            "fix_available": fix_ok,
+            "fix_id":        fix_id_ref,
+        })
+
+    enriched_issues = _attach_fixes_to_issues(enriched_issues, enriched_fixes)
+
+    _sev_order = {"critical": 4, "error": 3, "warning": 2, "info": 1}
+    top_sev    = max(
+        (_sev_order.get(str(i.get("severity", "info")).lower(), 1) for i in enriched_issues),
+        default=1,
+    )
+    sev_label  = {4: "critical", 3: "error", 2: "warning", 1: "info"}[top_sev]
+
+    event = {
+        "type":            "analysis_result",
+        "schema_version":  "2.0",
+        "request_id":      request_id,
+        "file_path":       file_path,
+        "file_name":       Path(file_path).name,
+        "language":        language,
+        "severity":        sev_label,
+        "strategy":        strategy,
+        "strategy_reason": strategy_reason,
+        "change_score":    int(change_score),
+        "issues":          enriched_issues,
+        "fixes":           enriched_fixes,
+        "elapsed_ms":      elapsed_ms,
+        "analyzed_at":     analyzed_at,
+        "rag_docs_used":   rag_docs_used,
+    }
+    return {
+        "event":           event,
+        "enriched_issues": enriched_issues,
+        "enriched_fixes":  enriched_fixes,
+        "strategy":        strategy,
+    }
+
 
 def node_emit_ws_events(state: WatchState) -> Dict[str, Any]:
     """
@@ -1163,134 +1774,25 @@ def node_emit_ws_events(state: WatchState) -> Dict[str, Any]:
 
     events: list = []
 
-    # ── 1. analysis_result ────────────────────────────────────────────────────
-    # Try structured output first (JSON produced by STEP 3 in the LLM prompt)
-    try:
-        from langchain_agents.agents.lc_analysis_agent import parse_structured_output
-        structured = parse_structured_output(raw_text)
-    except Exception:
-        structured = {}
-
-    if structured.get("issues") is not None:
-        # ── Structured path — clean JSON from LLM ────────────────────────────
-        issues_raw      = structured.get("issues", [])
-        fixes_raw       = structured.get("fixes", [])
-        strategy        = structured.get("strategy") or state.get("strategy", "block_fix")
-        strategy_reason = structured.get("strategy_reason", "")
-        logger.info(
-            "[WS] structured output used for %s: strategy=%s issues=%d fixes=%d",
-            Path(file_path).name, strategy, len(issues_raw), len(fixes_raw),
-        )
-    else:
-        # ── Fallback — regex parsers (for LLMs that ignored STEP 3) ──────────
-        issues_raw = _parse_issues_from_llm(raw_text, file_path)
-        fixes_raw  = _extract_fixes_from_llm(
-            raw_text, file_path, language,
-            source_code=source_code,
-            strategy=state.get("strategy", "block_fix"),
-        )
-        strategy        = state.get("strategy", "block_fix")
-        strategy_reason = ""
-        logger.info(
-            "[WS] regex fallback used for %s: issues=%d fixes=%d raw_len=%d",
-            Path(file_path).name, len(issues_raw), len(fixes_raw), len(raw_text or ""),
-        )
-
-    # ── Enrich fixes: add UUIDs + diff_hunks ─────────────────────────────────
-    try:
-        from api.diff_utils import compute_diff_hunks, truncate_code_for_ws
-        _diff_available = True
-    except ImportError:
-        _diff_available = False
-
-    enriched_fixes = []
-    for fix in fixes_raw:
-        current    = str(fix.get("current_code", "")).strip()
-        fixed      = str(fix.get("fixed_code",   "")).strip()
-        apply_mode = str(fix.get("apply_mode", "replace_snippet"))
-        fix_id     = str(uuid.uuid4())
-
-        diff_hunks = []
-        if _diff_available and current and fixed and current != fixed:
-            try:
-                # FILE-ABSOLUTE hunks: locate the snippet in the FULL source and
-                # diff the whole file before/after. Diffing the snippet alone
-                # produced snippet-relative line numbers (start at 1) that the
-                # plugin applied as file-absolute → it patched unrelated lines
-                # and corrupted the file. Patching the full source fixes this.
-                if source_code and current in source_code:
-                    patched = source_code.replace(current, fixed, 1)
-                    diff_hunks = compute_diff_hunks(source_code, patched)
-                # else: snippet not found verbatim → leave hunks empty so the
-                # plugin falls back to exact/normalized current_code matching,
-                # which locates the real position instead of guessing a line.
-            except Exception as exc:
-                logger.debug("diff_hunks failed: %s", exc)
-
-        # Truncate blobs for full_file to keep WS payload lean
-        if _diff_available and apply_mode == "full_file" and (
-            len(current) > 300 or len(fixed) > 300
-        ):
-            current_ws = truncate_code_for_ws(current)
-            fixed_ws   = truncate_code_for_ws(fixed)
-        else:
-            current_ws = current
-            fixed_ws   = fixed
-
-        enriched_fixes.append({
-            "id":           fix_id,
-            "issue_id":     fix.get("issue_id"),
-            "title":        str(fix.get("title", "Suggested fix"))[:160],
-            "apply_mode":   apply_mode,
-            "file_path":    file_path,
-            "line":         fix.get("line"),
-            "diff_hunks":   diff_hunks,
-            "current_code": current_ws,
-            "fixed_code":   fixed_ws,
-            "explanation":  str(fix.get("explanation", fix.get("why", "")))[:500],
-            "language":     language,
-        })
-
-    # ── Attach UUIDs + fix_available to issues ────────────────────────────────
-    enriched_issues = []
-    for idx, issue in enumerate(issues_raw):
-        issue_id   = str(uuid.uuid4())
-        fix_id_ref = enriched_fixes[idx]["id"] if idx < len(enriched_fixes) else None
-        enriched_issues.append({
-            **issue,
-            "id":            issue_id,
-            "fix_available": fix_id_ref is not None,
-            "fix_id":        fix_id_ref,
-        })
-
-    # Also enrich issues with current_code/fixed_code (compat with WatchInlineManager)
-    enriched_issues = _attach_fixes_to_issues(enriched_issues, enriched_fixes)
-
-    # ── Severity summary (worst-case across all issues) ───────────────────────
-    _sev_order = {"critical": 4, "error": 3, "warning": 2, "info": 1}
-    top_sev    = max(
-        (_sev_order.get(str(i.get("severity", "info")).lower(), 1) for i in enriched_issues),
-        default=1,
+    # ── 1. analysis_result (shared builder) ───────────────────────────────────
+    built = build_analysis_result_event(
+        file_path=file_path,
+        language=language,
+        raw_text=raw_text,
+        source_code=source_code,
+        strategy_default=state.get("strategy", "block_fix"),
+        change_score=int(state.get("change_info", {}).get("score", 0)),
+        rag_docs_used=len(state.get("rag_docs", [])),
+        elapsed_ms=elapsed_ms,
     )
-    sev_label  = {4: "critical", 3: "error", 2: "warning", 1: "info"}[top_sev]
-
-    events.append({
-        "type":            "analysis_result",
-        "schema_version":  "2.0",
-        "request_id":      request_id,
-        "file_path":       file_path,
-        "file_name":       Path(file_path).name,
-        "language":        language,
-        "severity":        sev_label,
-        "strategy":        strategy,
-        "strategy_reason": strategy_reason,
-        "change_score":    int(state.get("change_info", {}).get("score", 0)),
-        "issues":          enriched_issues,
-        "fixes":           enriched_fixes,
-        "elapsed_ms":      elapsed_ms,
-        "analyzed_at":     analyzed_at,
-        "rag_docs_used":   len(state.get("rag_docs", [])),
-    })
+    ar_event        = built["event"]
+    enriched_issues = built["enriched_issues"]
+    enriched_fixes  = built["enriched_fixes"]
+    strategy        = built["strategy"]
+    # Re-stamp request_id so downstream events correlate with this emission.
+    ar_event["request_id"] = request_id
+    ar_event["analyzed_at"] = analyzed_at
+    events.append(ar_event)
 
     # ── 2. dependency_impact ──────────────────────────────────────────────────
     impacted = (
@@ -1439,9 +1941,24 @@ def node_emit_ws_events(state: WatchState) -> Dict[str, Any]:
         elapsed_ms,
     )
 
+    # ── Push the PRIMARY result to the plugin immediately ────────────────────
+    # This runs BEFORE node_analyze_dependents, so the developer sees the result
+    # of the file they just edited in ~real time instead of waiting for the whole
+    # dependent cascade (root cause of the 297s lag). Dependents stream in after.
+    broadcasted = False
+    ws_broadcast = state.get("_ws_broadcast")
+    if callable(ws_broadcast):
+        for event in events:
+            try:
+                ws_broadcast(event)
+            except Exception as exc:
+                logger.warning("[WS] primary broadcast failed: %s", exc)
+        broadcasted = True
+
     return {
-        "issues":    enriched_issues,
-        "ws_events": events,
+        "issues":         enriched_issues,
+        "ws_events":      events,
+        "ws_broadcasted": broadcasted,
     }
 
 
@@ -1487,9 +2004,11 @@ def build_watch_graph():
         hash_check ──→ read_file ──→ change_filter ──→ parse_ast
         ──→ index_chromadb ──→ update_kg ──→ update_dep_graph
         ──→ test_gap_detect ──→ get_neighborhood ──→ rag_retrieve ──→ git_session
-        ──→ build_context ──→ llm_analyze ──→ cache_results ──→ learn_feedback
-        ──→ [if deps] analyze_dependents ──→ emit_ws_events ──→ END
-        ──→ [no deps]                    ──→ emit_ws_events ──→ END
+        ──→ build_context ──→ llm_analyze ──→ cache_results
+        ──→ emit_ws_events (broadcast PRIMARY result in real time)
+        ──→ learn_feedback (KB promotion — after the developer already has results)
+        ──→ [if deps] analyze_dependents (stream each dependent) ──→ END
+        ──→ [no deps]                                            ──→ END
     """
     graph = StateGraph(WatchState)
 
@@ -1540,15 +2059,19 @@ def build_watch_graph():
     graph.add_edge("git_session",       "build_context")
     graph.add_edge("build_context",     "llm_analyze")
     graph.add_edge("llm_analyze",       "cache_results")
-    graph.add_edge("cache_results",     "learn_feedback")
 
-    # Dependents branch → both paths converge at emit_ws_events
+    # Emit the PRIMARY result FIRST (real-time), THEN do KB learning + dependents.
+    # Previously emit ran after analyze_dependents AND after the per-issue learning
+    # LLM calls, so the primary result was held hostage for the whole cascade
+    # (up to ~300s). Now emit broadcasts immediately after caching; learning and
+    # the dependent stream happen afterwards without blocking the developer.
+    graph.add_edge("cache_results",  "emit_ws_events")
+    graph.add_edge("emit_ws_events", "learn_feedback")
     graph.add_conditional_edges("learn_feedback", has_dependents, {
         "yes": "analyze_dependents",
-        "no":  "emit_ws_events",
+        "no":  END,
     })
-    graph.add_edge("analyze_dependents", "emit_ws_events")
-    graph.add_edge("emit_ws_events",     END)
+    graph.add_edge("analyze_dependents", END)
 
     return graph.compile()
 
@@ -1569,6 +2092,7 @@ def invoke_watch(
     print_lock: Any = None,
     learning_agent: Any = None,
     file_counter: Any = None,
+    ws_broadcast: Any = None,
 ) -> Dict[str, Any]:
     """
     Convenience wrapper to invoke the WatchGraph for a single file.
@@ -1601,6 +2125,7 @@ def invoke_watch(
         "_print_lock": print_lock,
         "_learning_agent": learning_agent,
         "_file_counter": file_counter,
+        "_ws_broadcast": ws_broadcast,
         "skip_reason": None,
         "post_solution_mode": False,
         "dependents_to_analyze": [],

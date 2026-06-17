@@ -174,6 +174,9 @@ def _build_llm_with_fallback():
                 temperature=config.api.temperature,
                 max_tokens=min(config.api.max_tokens, 8192),  # marge sous la TPM Groq (30k)
                 max_retries=1,
+                # frequency_penalty discourages the "Best regards / Have a great day"
+                # sign-off loop some Llama models fall into at temperature=0.
+                model_kwargs={"frequency_penalty": 0.4},
             ))
         except Exception as e:
             logger.debug("Groq LLM build failed: %s", e)
@@ -190,6 +193,7 @@ def _build_llm_with_fallback():
                 temperature=config.api.temperature,
                 max_tokens=config.api.max_tokens,
                 max_retries=0,
+                model_kwargs={"frequency_penalty": 0.4},
                 default_headers={
                     "HTTP-Referer": "https://github.com/code-auditor",
                     "X-Title": "Code Auditor",

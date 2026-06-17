@@ -49,7 +49,7 @@ Last 3 conversation turns:
 
 Return ONLY valid JSON (no markdown, no explanation):
 {{
-  "intent": "<one of: explain|complete_fn|new_class|code_generation|git_question|ci_question|test_generation|question>",
+  "intent": "<one of: explain|complete_fn|new_class|code_generation|git_question|ci_question|test_generation|project_state|question>",
   "target_file": "<filename or empty string>",
   "target_symbol": "<function or class name, or empty string>",
   "generation_target": "<name to generate, or empty string>",
@@ -71,6 +71,9 @@ Intent guide:
 - git_question  : about commits, branches, merges, PRs, conflicts, diffs
 - ci_question   : about CI/CD pipeline, builds, deployments, GitHub Actions, SonarCloud
 - test_generation: generate or suggest unit tests
+- project_state : holistic project health — "can I deploy?", "is my project ready?",
+                   "what should I fix next?", "show me security/quality issues",
+                   "am I missing tests?", combining git risk + CI readiness + tests + security
 - question      : general project Q&A, architecture, dependencies, risks
 
 context_level guide:
@@ -219,6 +222,7 @@ class LCChatDecisionAgent:
             "git_question":     ["git_agent", "analysis_agent", "chat_agent"],
             "ci_question":      ["ci_agent", "retriever_agent", "chat_agent"],
             "test_generation":  ["test_agent", "retriever_agent", "validator_agent"],
+            "project_state":    ["project_state_agent", "chat_agent"],
             "question":         ["retriever_agent", "chat_agent"],
         }.get(intent, ["retriever_agent", "chat_agent"])
 
@@ -258,6 +262,17 @@ class LCChatDecisionAgent:
             "confidence":         0.6,
             "reason":             "regex fallback",
         }
+
+        if self._contains_word(msg, [
+            "can i deploy", "can i merge safely", "is my project ready", "project ready",
+            "next actions", "what should i fix", "what should i do next",
+            "project state", "project health", "état du projet", "puis-je déployer",
+            "quoi faire ensuite", "prochaines actions",
+        ]):
+            plan.update({"intent": "project_state", "agents": ["project_state_agent", "chat_agent"],
+                         "context_level": "deep", "needs_file": False,
+                         "reason": "holistic project-state keyword"})
+            return plan
 
         if self._contains_word(msg, [
             "ci/cd", "pipeline", "github actions", "github action", "workflow",

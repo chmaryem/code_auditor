@@ -23,7 +23,10 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from services.ast_extractor import extract_signatures_ast
 from services.test_discovery import TestDiscoveryService
+from services.test_generation_cache import test_generation_cache
+from services.test_runner import TestRunner, TestRunResult
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,7 @@ class TestGeneratorAgent:
         self._test_kb = test_kb
         self._project_code_indexer = project_code_indexer
         self._knowledge_graph = knowledge_graph
+        self._runner = TestRunner(project_path)
 
     # ── API publique ─────────────────────────────────────────────────────────
 
@@ -84,6 +88,11 @@ class TestGeneratorAgent:
         """
         if not source_path.exists():
             return {"error": f"Fichier introuvable : {source_path}", "test_file": None}
+
+        # 0. Cache Redis — éviter un appel LLM si le fichier source n'a pas changé
+        cached = test_generation_cache.get(source_path, incremental)
+        if cached:
+            return cached
 
         # 1. Discovery — conventions
         test_info = self._discovery.find_test_for(source_path)
@@ -144,10 +153,19 @@ class TestGeneratorAgent:
         # 7. Contexte Knowledge Graph (dépendances, classes liées)
         kg_context = self._get_kg_context(source_path)
 
+        # Security gate (Phase A): redact before source_code enters the LLM prompt.
+        # Signatures/imports extraction above already used the real source_code.
+        safe_source_code = source_code
+        try:
+            from services.secret_redactor import redact_secrets
+            safe_source_code, _n = redact_secrets(source_code)
+        except Exception:
+            pass
+
         # 8. Prompt LLM enrichi
         prompt = self._build_prompt(
             source_path=source_path,
-            source_code=source_code,
+            source_code=safe_source_code,
             signatures=untested_signatures,
             imports=source_imports,
             framework=framework,
@@ -171,7 +189,8 @@ class TestGeneratorAgent:
         # _run_validation retourne (code_final, is_valid) — le code peut avoir été corrigé par le retry
         test_code, validated = self._run_validation(test_code, source_path, all_signatures, language, prompt)
 
-        # 12. Écriture si demandé
+        # 12. Écriture + boucle d'exécution runtime
+        run_result: Optional[TestRunResult] = None
         if write:
             try:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,15 +198,47 @@ class TestGeneratorAgent:
             except Exception as e:
                 return {"error": f"Écriture impossible : {e}", "test_file": None}
 
-        return {
-            "test_file": target_path,
-            "test_code": test_code,
-            "framework": framework,
-            "error": None,
-            "rag_docs_used": rag_context.get("total_docs", 0),
-            "validated": validated,
-            "incremental": is_incremental,
+            # Exécution des tests générés — détecte les erreurs runtime (ImportError, etc.)
+            run_result = self._runner.run(target_path, language)
+            if not run_result.success:
+                logger.info(
+                    "Exécution échouée pour %s : %s",
+                    target_path.name, run_result.error_summary[:200],
+                )
+                # Retry LLM avec l'erreur d'exécution comme contexte
+                fixed_code = self._retry_with_runtime_error(
+                    test_code, source_path, prompt, run_result
+                )
+                if fixed_code:
+                    test_code = fixed_code
+                    target_path.write_text(test_code, encoding="utf-8")
+                    run_result = self._runner.run(target_path, language)
+                    if run_result.success:
+                        validated = True
+                        logger.info("Retry runtime réussi : tests passent maintenant")
+                    else:
+                        logger.info(
+                            "Retry runtime échoué : %s", run_result.error_summary[:150]
+                        )
+
+        result = {
+            "test_file":          target_path,
+            "test_code":          test_code,
+            "framework":          framework,
+            "error":              None,
+            "rag_docs_used":      rag_context.get("total_docs", 0),
+            "validated":          validated,
+            "incremental":        is_incremental,
+            "run_success":        run_result.success if run_result else None,
+            "run_error_summary":  run_result.error_summary if run_result and not run_result.success else None,
         }
+
+        # Mettre en cache uniquement si le test est valide ET passe à l'exécution
+        cache_ok = validated and (run_result is None or run_result.success)
+        if cache_ok:
+            test_generation_cache.set(source_path, incremental, result)
+
+        return result
 
     # ── Helpers pour le mode incrémentiel ────────────────────────────────────
 
@@ -288,15 +339,21 @@ class TestGeneratorAgent:
     def _extract_signatures(code: str, file_path: Path) -> List[Dict[str, Any]]:
         """
         Extrait les signatures avec info de visibilité.
-        Pour Java, distingue public/private/protected/package-private
-        afin que le LLM sache quelles méthodes il peut tester directement.
+
+        Stratégie : AST tree-sitter en priorité (précis, gère les edge cases),
+        fallback regex si tree-sitter est indisponible ou si le parse échoue.
         """
+        # ── Tentative AST (tree-sitter) ──────────────────────────────────────
+        ast_sigs = extract_signatures_ast(code, file_path)
+        if ast_sigs:
+            return ast_sigs
+
+        # ── Fallback regex (comportement d'origine) ───────────────────────────
+        logger.debug("AST indisponible pour %s — fallback regex", file_path.name)
         sigs = []
         lang = file_path.suffix.lower()
 
         if lang == ".py":
-            # Fonctions et méthodes — capture async def, def, signatures multilignes
-            # Stratégie : on détecte le début (def/async def) puis on lit jusqu'à ":"
             py_func_pat = re.compile(
                 r"^(?P<indent>[ \t]*)(?P<async>async\s+)?def\s+(?P<name>[A-Za-z_]\w*)"
                 r"\s*\((?P<args>[^)]*)\)",
@@ -310,8 +367,6 @@ class TestGeneratorAgent:
                 seen_names.add(name)
                 is_async = bool(m.group("async"))
                 visibility = "private" if name.startswith("_") else "public"
-
-                # Détecter le décorateur juste avant pour identifier @property / @classmethod / @staticmethod
                 start = m.start()
                 preceding = code[max(0, start - 120): start]
                 decorator_lines = [
@@ -325,21 +380,15 @@ class TestGeneratorAgent:
                         method_type = "property"
                     elif "@classmethod" in last_dec or "@staticmethod" in last_dec:
                         method_type = "classmethod"
-
                 sig = f"{'async ' if is_async else ''}def {name}({m.group('args')})"
                 sigs.append({
-                    "type": method_type,
-                    "name": name,
-                    "signature": sig,
-                    "visibility": visibility,
-                    "async": is_async,
+                    "type": method_type, "name": name,
+                    "signature": sig, "visibility": visibility, "async": is_async,
                 })
-            # classes
             for m in re.finditer(r"^class\s+([A-Za-z_]\w*)", code, re.M):
                 sigs.append({"type": "class", "name": m.group(1), "visibility": "public"})
 
         elif lang == ".java":
-            # Java : capturer la visibilité et le type de retour
             java_pat = re.compile(
                 r"^\s*(?:(public|private|protected)\s+)?"
                 r"(?:(static)\s+)?"
@@ -349,50 +398,40 @@ class TestGeneratorAgent:
             )
             for m in java_pat.finditer(code):
                 vis = m.group(1) or "package-private"
-                is_static = bool(m.group(2))
-                ret_type = (m.group(3) or "").strip()
                 name = m.group(4)
                 if name in ("if", "while", "for", "switch", "catch", "try"):
                     continue
                 sigs.append({
                     "type": "method", "name": name,
-                    "visibility": vis,
-                    "static": is_static,
-                    "return_type": ret_type,
+                    "visibility": vis, "static": bool(m.group(2)),
+                    "return_type": (m.group(3) or "").strip(),
                     "signature": m.group(0).strip(),
                 })
 
         elif lang in (".js", ".ts", ".jsx", ".tsx"):
             seen_js: set = set()
-            _JS_KEYWORDS = {"if", "while", "for", "switch", "catch", "return", "typeof", "instanceof"}
-
-            # Fonctions nommées classiques : function foo() / export async function foo()
+            _KW = {"if", "while", "for", "switch", "catch", "return", "typeof", "instanceof"}
             for m in re.finditer(
                 r"(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(",
                 code, re.M,
             ):
                 name = m.group(1)
-                if name not in _JS_KEYWORDS and name not in seen_js:
+                if name not in _KW and name not in seen_js:
                     seen_js.add(name)
                     sigs.append({"type": "function", "name": name, "visibility": "public"})
-
-            # Arrow functions : const foo = (args) => / const foo = async (args) =>
             for m in re.finditer(
                 r"(?:export\s+)?(?:const|let)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_]\w*)\s*=>",
                 code, re.M,
             ):
                 name = m.group(1)
-                if name not in _JS_KEYWORDS and name not in seen_js:
+                if name not in _KW and name not in seen_js:
                     seen_js.add(name)
                     sigs.append({"type": "arrow_function", "name": name, "visibility": "public"})
-
-            # Méthodes de classe : methodName() / async methodName()
             for m in re.finditer(
-                r"^\s+(?:async\s+)?([A-Za-z_]\w*)\s*\([^)]*\)\s*\{",
-                code, re.M,
+                r"^\s+(?:async\s+)?([A-Za-z_]\w*)\s*\([^)]*\)\s*\{", code, re.M,
             ):
                 name = m.group(1)
-                if name not in _JS_KEYWORDS and name not in seen_js and not name[0].isupper():
+                if name not in _KW and name not in seen_js and not name[0].isupper():
                     seen_js.add(name)
                     sigs.append({"type": "method", "name": name, "visibility": "public"})
 
@@ -1035,6 +1074,52 @@ RAPPEL : chaque variable utilisee dans un test DOIT etre declaree dans CE test.
 Code uniquement, pas d'explications."""
 
         return self._call_llm(retry_prompt, f"retry:{source_path.name}")
+
+    def _retry_with_runtime_error(
+        self,
+        failed_code: str,
+        source_path: Path,
+        original_prompt: str,
+        run_result: "TestRunResult",
+    ) -> Optional[str]:
+        """
+        Retente la génération LLM en incluant l'erreur d'exécution exacte.
+        Utilisé quand le code passe la validation structurelle mais échoue à l'exécution.
+        """
+        error_summary = run_result.error_summary[:2000]
+
+        # Conseil ciblé selon le type d'erreur
+        hint = ""
+        if run_result.has_import_error:
+            hint = ("HINT: Le chemin d'import est probablement incorrect. "
+                    "Vérifie les noms de modules et de classes dans le code source fourni.")
+        elif run_result.has_attribute_error:
+            hint = ("HINT: Une méthode ou attribut n'existe pas dans la classe. "
+                    "N'invente pas de méthodes — utilise uniquement celles listées dans les signatures.")
+
+        retry_prompt = f"""{original_prompt}
+
+## ERREUR D'EXÉCUTION — Le test généré a échoué à l'exécution :
+
+```
+{error_summary}
+```
+
+{hint}
+
+## Code problématique :
+```
+{failed_code[:3000]}
+```
+
+Corrige les erreurs et régénère le fichier de test complet.
+- Corrige les imports incorrects
+- N'utilise que les méthodes qui existent réellement dans le code source
+- Chaque variable doit être déclarée dans le test qui l'utilise
+Code uniquement, sans explication."""
+
+        logger.info("Retry runtime pour %s", source_path.name)
+        return self._call_llm(retry_prompt, f"runtime_retry:{source_path.name}")
 
     # ── Utilitaires ──────────────────────────────────────────────────────────
 

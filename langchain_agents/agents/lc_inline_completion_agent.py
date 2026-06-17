@@ -450,11 +450,20 @@ class LCInlineCompletionAgent:
             f"\nProject context (match style and types):\n{ctx}\n" if ctx else ""
         )
 
+        # Security gate (Phase A): redact before sending to external LLM
+        safe_prefix, safe_suffix = prefix_code, suffix_code
+        try:
+            from services.secret_redactor import redact_secrets
+            safe_prefix, _ = redact_secrets(prefix_code)
+            safe_suffix, _ = redact_secrets(suffix_code)
+        except Exception:
+            pass
+
         prompt = _INLINE_PROMPT.format(
             language        = language,
             context_section = context_section,
-            prefix          = prefix_code[-1500:],
-            suffix          = suffix_code[:300],
+            prefix          = safe_prefix[-1500:],
+            suffix          = safe_suffix[:300],
         )
 
         completion = ""

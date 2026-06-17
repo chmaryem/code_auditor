@@ -344,13 +344,14 @@ def _validate_resolution(code: str) -> tuple:
 def resolve_file_smart(
     filename: str, base_content: str, ours_content: str, theirs_content: str,
     rag_context: list = None,
+    interactive: bool = False,
 ) -> Tuple[Optional[str], str, list]:
     """
-    Pipeline interactif à 3 niveaux. Retourne (contenu, méthode, details[]).
+    Pipeline de résolution à 3 niveaux. Retourne (contenu, méthode, details[]).
 
-    v7.3 — Résolution interactive :
-      - Auto : imports, package, whitespace, simple changes
-      - Interactif : method bodies, logique → [1] OURS [2] THEIRS [3] LLM
+    v7.4 — interactive=False par défaut (safe pour API FastAPI) :
+      - Auto    : imports, package, whitespace, simple changes
+      - Interactif (interactive=True, terminal uniquement) : [1] OURS [2] THEIRS [3] LLM
       - Sandbox : validation après résolution LLM
     """
     # Niveau 0 : fichiers identiques
@@ -383,8 +384,9 @@ def resolve_file_smart(
             return result, "3way", [{"type": "import", "choice": "auto"}]
         return ours_content, "conservative", [{"type": "import", "choice": "auto"}]
 
-    # Niveau 2 : Résolution interactive bloc par bloc
-    print(f"\n  {_CY}Résolution interactive pour {Path(filename).name}{_R}")
+    # Niveau 2 : Résolution bloc par bloc (interactive si terminal, LLM si API)
+    if interactive:
+        print(f"\n  {_CY}Résolution interactive pour {Path(filename).name}{_R}")
     resolved_lines = []
     details = []
     used_llm = False
@@ -403,25 +405,33 @@ def resolve_file_smart(
             resolved_lines.extend(merged.splitlines(keepends=True))
             details.append({"type": "import", "choice": "auto",
                             "ours": ours_block[:100], "theirs": theirs_block[:100]})
-            print(f"    {_GR}✓ Imports fusionnés automatiquement{_R}")
+            if interactive:
+                print(f"    {_GR}✓ Imports fusionnés automatiquement{_R}")
         elif btype == "simple":
             resolved_lines.extend(ours_lines[i1:i2])
             details.append({"type": "simple", "choice": "auto"})
         else:
-            # Interactive
-            choice = _prompt_user_choice(filename, ours_block, theirs_block, btype)
+            if interactive:
+                # Mode terminal : demander le choix à l'utilisateur
+                choice = _prompt_user_choice(filename, ours_block, theirs_block, btype)
+            else:
+                # Mode API : résolution LLM automatique sans input()
+                choice = "llm"
+
             if choice == "ours":
                 resolved_lines.extend(ours_lines[i1:i2])
             elif choice == "theirs":
                 resolved_lines.extend(theirs_lines[j1:j2])
             elif choice == "llm":
                 used_llm = True
-                print(f"    {_YL}Résolution LLM en cours...{_R}", end="", flush=True)
+                if interactive:
+                    print(f"    {_YL}Résolution LLM en cours...{_R}", end="", flush=True)
                 merged = _resolve_block_with_llm(filename, ours_block, theirs_block, rag_context)
                 resolved_lines.extend(merged.splitlines(keepends=True))
                 if not merged.endswith("\n"):
                     resolved_lines.append("\n")
-                print(f" {_GR}✓{_R}")
+                if interactive:
+                    print(f" {_GR}✓{_R}")
             details.append({"type": btype, "choice": choice,
                             "ours": ours_block[:200], "theirs": theirs_block[:200]})
 
@@ -585,7 +595,12 @@ def _generate_resolve_readme(
     return "\n".join(lines)
 
 
-async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
+async def resolve_pr_conflicts(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    emit: Optional[Any] = None,  # Callable[[dict], None] — SSE progress hook
+) -> Dict[str, Any]:
     """
     Résout les conflits d'une PR via MCP github.* wrappers + pipeline RAG.
 
@@ -595,6 +610,13 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
       - resolver pipeline -> 3-way diff -> conservative -> Gemini + RAG context
       - RESOLVE_README.md -> résumé automatique pushé sur la branche
     """
+    def _emit(event: dict) -> None:
+        if emit is not None:
+            try:
+                emit(event)
+            except Exception:
+                pass
+
     print(f"\n  {_CY}{_B}Code Auditor — Résolution conflits PR #{pr_number}{_R}")
     print(f"  {_DM}Repo : {owner}/{repo}{_R}")
     print(f"  {_DM}Mode : 3-way diff -> RAG context -> Gemini enrichi{_R}\n")
@@ -602,6 +624,7 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
     try:
         from services.code_mode_client import github
     except ImportError:
+        _emit({"event": "error", "message": "code_mode_client non disponible"})
         return {"success": False, "error": "code_mode_client non disponible"}
 
     try:
@@ -613,6 +636,7 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
             msg = f"No conflicts detected. PR #{pr_number} is mergeable directly."
             print(f"  {_GR}✓ {msg}{_R}\n")
             github.post_comment(owner, repo, pr_number, f"✅ {msg}")
+            _emit({"event": "no_conflicts", "message": msg})
             return {"success": True, "resolved": [], "failed": [], "branch": "", "pr_url": "", "iterations": 1}
 
         base_ref = status.get("base_ref", "main")
@@ -628,6 +652,14 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
             and f.get("status") not in ("removed", "added")
         ]
         print(f"  Fichiers à traiter : {len(code_files)}\n")
+        _emit({
+            "event":     "detected",
+            "has_conflicts": True,
+            "base_ref":  base_ref,
+            "head_ref":  head_ref,
+            "file_count": len(code_files),
+            "files":     [f.get("filename", f.get("path", "")) for f in code_files],
+        })
 
         # 3. Initialiser le pipeline RAG (0 token LLM)
         print(f"  Chargement contexte RAG...")
@@ -652,17 +684,32 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
         rag_patterns = {}  # {filename: [pattern_names]} pour le README
         resolution_details = {}  # {filename: [detail_dicts]} pour le README enrichi
 
+        # SHA de l'ancêtre commun — disponible dans le pr_data de la stratégie 0 REST
+        merge_base_sha = (
+            status.get("pr_data", {}).get("merge_base_sha")
+            or status.get("pr_data", {}).get("merge_base_commit", {}).get("sha")
+            or base_ref  # fallback : base_ref si le SHA n'est pas disponible
+        )
+
         for f in code_files:
             filename = f.get("filename", f.get("path", ""))
             ext = Path(filename).suffix.lstrip(".")
             print(f"  {_DM}-> {filename}{_R}", end="", flush=True)
+            _emit({"event": "resolving_file", "file": filename})
 
-            base_content = github.get_file_content(owner, repo, filename, base_ref)
-            head_content = github.get_file_content(owner, repo, filename, head_ref)
+            # Télécharger les 3 versions distinctes pour le merge 3-way
+            # ancestor : version à la création de la branche (ancêtre commun)
+            # ours     : version sur la feature branch (ce que la PR apporte)
+            # theirs   : version actuelle sur main (où on veut merger)
+            # max_chars=0 → fichier ENTIER (la résolution ne tolère pas de troncature)
+            ancestor_content = github.get_file_content(owner, repo, filename, merge_base_sha, max_chars=0)
+            head_content     = github.get_file_content(owner, repo, filename, head_ref, max_chars=0)
+            base_content     = github.get_file_content(owner, repo, filename, base_ref, max_chars=0)
 
-            if not base_content or not head_content:
+            if not head_content or not base_content:
                 print(f"  {_RD}x contenu inaccessible{_R}")
                 failed_files.append(filename)
+                _emit({"event": "file_failed", "file": filename, "reason": "content_inaccessible"})
                 continue
 
             if base_content == head_content:
@@ -699,8 +746,12 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
                 rag_patterns[filename] = pattern_names
 
             resolved, method, details = resolve_file_smart(
-                filename, base_content, base_content, head_content,
+                filename,
+                ancestor_content or base_content,  # base = ancêtre commun (fallback: main)
+                head_content,                       # ours = feature branch
+                base_content,                       # theirs = main actuel
                 rag_context=file_rag_context,
+                interactive=False,                  # jamais interactif via API
             )
 
             if resolved:
@@ -713,9 +764,17 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
                 r = len(resolved.splitlines())
                 diffs.append(f"- **{filename}**: {b}L -> {h}L -> resolved {r}L (`{method}`)")
                 print(f"  {_GR}v [{method}]{_R}")
+                _emit({
+                    "event":   "file_resolved",
+                    "file":    filename,
+                    "method":  method,
+                    "details": details,
+                    "lines":   {"base": b, "head": h, "resolved": r},
+                })
             else:
                 print(f"  {_RD}x echec{_R}")
                 failed_files.append(filename)
+                _emit({"event": "file_failed", "file": filename, "reason": "resolution_failed"})
 
         # 5. Poster le rapport sur la PR originale
         comment_lines = [
@@ -803,6 +862,13 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
                 print(f"    {_YL}x{_R}  {fn}")
         print()
 
+        _emit({
+            "event":    "done",
+            "resolved": resolved_files,
+            "failed":   failed_files,
+            "branch":   branch_name,
+            "pr_url":   pr_url,
+        })
         return {
             "success": True,
             "resolved": resolved_files, "failed": failed_files,
@@ -813,6 +879,7 @@ async def resolve_pr_conflicts(owner: str, repo: str, pr_number: int) -> Dict[st
     except Exception as e:
         logger.error("resolve_pr_conflicts failed: %s", e)
         print(f"\n  {_RD}✗ Erreur : {e}{_R}\n")
+        _emit({"event": "error", "message": str(e)})
         return {"success": False, "resolved": [], "failed": [], "error": str(e), "iterations": 1}
     finally:
         try:

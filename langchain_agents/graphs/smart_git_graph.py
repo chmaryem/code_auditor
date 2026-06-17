@@ -151,6 +151,31 @@ def node_conflict(state: SmartGitState) -> Dict[str, Any]:
     }
 
 
+def node_secret_scan(state: SmartGitState) -> Dict[str, Any]:
+    from langchain_agents.agents.lc_git_secret_agent import LCGitSecretAgent
+    return LCGitSecretAgent().run(dict(state))
+
+
+def node_commit_lint(state: SmartGitState) -> Dict[str, Any]:
+    from langchain_agents.agents.lc_git_commit_linter_agent import LCGitCommitLinterAgent
+    return LCGitCommitLinterAgent().run(dict(state))
+
+
+def node_test_impact(state: SmartGitState) -> Dict[str, Any]:
+    from langchain_agents.agents.lc_git_test_impact_agent import LCGitTestImpactAgent
+    return LCGitTestImpactAgent().run(dict(state))
+
+
+def node_cross_pr(state: SmartGitState) -> Dict[str, Any]:
+    from langchain_agents.agents.lc_git_cross_pr_agent import LCGitCrossPRAgent
+    return LCGitCrossPRAgent().run(dict(state))
+
+
+def node_pr_description(state: SmartGitState) -> Dict[str, Any]:
+    from langchain_agents.agents.lc_git_pr_description_agent import LCGitPRDescriptionAgent
+    return LCGitPRDescriptionAgent().run(dict(state))
+
+
 def node_synthesize(state: SmartGitState) -> Dict[str, Any]:
     from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
@@ -186,6 +211,21 @@ def route_after_decision(state: SmartGitState) -> str:
     if intent == "conflict_resolution_dry_run":
         return "conflict"
 
+    if intent == "secret_scan":
+        return "secret_scan"
+
+    if intent == "commit_lint":
+        return "commit_lint"
+
+    if intent == "test_impact":
+        return "test_impact"
+
+    if intent == "cross_pr_conflicts":
+        return "cross_pr"
+
+    if intent == "pr_description":
+        return "pr_description"
+
     return "session"
 
 
@@ -214,6 +254,11 @@ def build_smart_git_graph():
     graph.add_node("branch", node_branch)
     graph.add_node("pr", node_pr)
     graph.add_node("conflict", node_conflict)
+    graph.add_node("secret_scan", node_secret_scan)
+    graph.add_node("commit_lint", node_commit_lint)
+    graph.add_node("test_impact", node_test_impact)
+    graph.add_node("cross_pr", node_cross_pr)
+    graph.add_node("pr_description", node_pr_description)
     graph.add_node("synthesize", node_synthesize)
 
     graph.set_entry_point("decide")
@@ -222,11 +267,16 @@ def build_smart_git_graph():
         "decide",
         route_after_decision,
         {
-            "session": "session",
-            "diff": "diff",
-            "branch": "branch",
-            "pr": "pr",
-            "conflict": "conflict",
+            "session":       "session",
+            "diff":          "diff",
+            "branch":        "branch",
+            "pr":            "pr",
+            "conflict":      "conflict",
+            "secret_scan":   "secret_scan",
+            "commit_lint":   "commit_lint",
+            "test_impact":   "test_impact",
+            "cross_pr":      "cross_pr",
+            "pr_description": "pr_description",
         },
     )
 
@@ -243,6 +293,11 @@ def build_smart_git_graph():
     graph.add_edge("branch", "synthesize")
     graph.add_edge("pr", "synthesize")
     graph.add_edge("conflict", "synthesize")
+    graph.add_edge("secret_scan", "synthesize")
+    graph.add_edge("commit_lint", "synthesize")
+    graph.add_edge("test_impact", "synthesize")
+    graph.add_edge("cross_pr", "synthesize")
+    graph.add_edge("pr_description", "synthesize")
 
     graph.add_edge("synthesize", END)
 

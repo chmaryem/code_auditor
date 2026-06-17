@@ -121,8 +121,9 @@ class LCChatAgent:
         user_message: str,
         response: str,
         metadata: Dict[str, Any] | None = None,
+        project_path: str = "",
     ) -> None:
-        self.memory.save_exchange(session_id, user_message, response, metadata)
+        self.memory.save_exchange(session_id, user_message, response, metadata, project_path)
 
   
 
@@ -174,6 +175,13 @@ class LCChatAgent:
         intent_params = state.get("intent_params") or {}
         method_hint = intent_params.get("method_hint", "")
 
+        # Security gate (Phase A): redact before sending to external LLM
+        try:
+            from services.secret_redactor import redact_secrets
+            file_code, _ = redact_secrets(file_code)
+        except Exception:
+            pass
+
         file_excerpt = file_code[:4500] if file_code else ""
 
         method_focus = ""
@@ -192,6 +200,9 @@ Fast mode:
 - Do not invent RAG sources, CI status, Git status, or hidden files.
 - Be practical for a developer.
 - Answer in the same language as the developer.
+- Stop writing as soon as the answer is complete. Do not add sign-offs,
+  closing remarks, or filler like "Let me know if you have questions" or
+  "Best regards". Write the answer exactly once, never repeat it.
 
 Required structure:
 1. Role
@@ -243,6 +254,13 @@ Developer question:
         else:
             analysis_text = str(file_analysis)[:1800]
 
+        # Security gate (Phase A): redact before sending to external LLM
+        try:
+            from services.secret_redactor import redact_secrets
+            file_code, _ = redact_secrets(file_code)
+        except Exception:
+            pass
+
         file_excerpt = file_code[:3500] if file_code else ""
 
         intent_params = state.get("intent_params") or {}
@@ -270,6 +288,12 @@ Developer question:
                     "- If you don't have enough context, say so explicitly\n"
                     "- Never invent imports, classes, methods, files, CI status, or Git status\n"
                     "- When explaining code, structure: purpose → key logic → risks → suggestions\n\n"
+                    "OUTPUT RULES (strict):\n"
+                    "- Stop writing as soon as the answer is complete. Do not continue.\n"
+                    "- Never add sign-offs, closing remarks, or filler such as "
+                    "'Let me know if you have questions', 'Best regards', 'Have a great day', "
+                    "or any repetition of the same sentence.\n"
+                    "- Write the answer exactly once. Do not restate or summarize it afterward.\n\n"
                     "CURRENT PROJECT CONTEXT:\n"
                     "{project_summary}\n\n"
                     "DEPENDENCY MAP for {target_file}:\n"

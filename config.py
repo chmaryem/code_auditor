@@ -1,9 +1,14 @@
 import os
 import logging
+import secrets
 from pathlib import Path
 from typing import List
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, field_validator, model_validator
+
+
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -80,11 +85,6 @@ class RAGConfig(BaseModel):
     embedding_dimension: int   = 768
     embedding_device:    str   = None
     vector_store:        str   = "chromadb"
-    # Métrique RÉELLE des collections ChromaDB principales : L2 (défaut Chroma,
-    # aucun hnsw:space="cosine" n'est passé à leur création). Les embeddings Jina
-    # étant normalisés, L2² = 2(1-cos). Les seuils sont calibrés pour L2 :
-    #   SystemAwareRAG.THRESHOLD=1.2 · ProjectCodeIndexer=0.75 · relevance_threshold=0.45
-    # (La mémoire sémantique du chat est la seule à utiliser explicitement cosine.)
     distance_metric:     str   = "l2"
     chunk_size:          int   = 800
     chunk_overlap:       int   = 150
@@ -165,6 +165,82 @@ class LangGraphConfig(BaseModel):
     langsmith_endpoint: str  = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 
 
+class DatabaseConfig:
+    """PostgreSQL connection settings. Async DSN for SQLAlchemy; sync DSN for Alembic."""
+    url: str          = os.getenv("DATABASE_URL",      "postgresql+asyncpg://codeauditor:codeauditor@localhost:5432/codeauditor")
+    sync_url: str     = os.getenv("DATABASE_SYNC_URL", "postgresql+psycopg2://codeauditor:codeauditor@localhost:5432/codeauditor")
+    pool_size: int    = int(os.getenv("DB_POOL_SIZE",    "10"))
+    max_overflow: int = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+    pool_timeout: int = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+    echo: bool        = os.getenv("DB_ECHO", "false").lower() == "true"
+
+
+class AuthConfig:
+    """All authentication settings. Consumed by auth/ sub-package."""
+
+    def __init__(self) -> None:
+        self.app_name: str   = os.getenv("AUTH_APP_NAME", "Code Auditor AI")
+        self.auth_required: bool = os.getenv("AUTH_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
+
+        # Redis — auth uses a dedicated redis-py client (same server, separate connection)
+        self.redis_url: str  = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+        # JWT
+        self.jwt_secret: str       = os.getenv("AUTH_JWT_SECRET", "")
+        self.jwt_algorithm: str    = os.getenv("AUTH_JWT_ALGORITHM", "HS256")
+        self.access_ttl_min: int   = int(os.getenv("AUTH_ACCESS_TTL_MIN",  "60"))
+        self.refresh_ttl_days: int = int(os.getenv("AUTH_REFRESH_TTL_DAYS", "14"))
+        self.pairing_ttl_sec: int  = int(os.getenv("AUTH_PAIRING_TTL_SEC",  "90"))
+        self.jwt_ephemeral: bool   = False
+
+        if not self.jwt_secret:
+            self.jwt_secret    = secrets.token_urlsafe(48)
+            self.jwt_ephemeral = True
+            logging.getLogger("auth").warning(
+                "AUTH_JWT_SECRET is not set — using an ephemeral secret. "
+                "All sessions will be invalidated on restart. Set AUTH_JWT_SECRET in .env."
+            )
+
+        # OTP
+        self.otp_length: int              = int(os.getenv("AUTH_OTP_LENGTH",            "6"))
+        self.otp_ttl_sec: int             = int(os.getenv("AUTH_OTP_TTL_SEC",           "600"))
+        self.otp_max_attempts: int        = int(os.getenv("AUTH_OTP_MAX_ATTEMPTS",       "5"))
+        self.otp_resend_cooldown_sec: int = int(os.getenv("AUTH_OTP_RESEND_COOLDOWN_SEC","60"))
+        self.otp_rate_per_hour: int       = int(os.getenv("AUTH_OTP_RATE_PER_HOUR",      "5"))
+
+        # Email domain allow-list (empty = any domain allowed)
+        raw_domains = os.getenv("AUTH_ALLOWED_EMAIL_DOMAINS", "")
+        self.allowed_email_domains: list[str] = [
+            d.strip().lower() for d in raw_domains.split(",") if d.strip()
+        ]
+
+        # SMTP
+        self.smtp_host: str      = os.getenv("SMTP_HOST",         "smtp.gmail.com")
+        self.smtp_port: int      = int(os.getenv("SMTP_PORT",     "587"))
+        self.smtp_user: str      = os.getenv("SMTP_USER",         "")
+        self.smtp_password: str  = os.getenv("SMTP_APP_PASSWORD", "").replace(" ", "")
+        self.smtp_from: str      = os.getenv("SMTP_FROM",         "") or self.smtp_user
+        self.smtp_from_name: str = os.getenv("SMTP_FROM_NAME",    self.app_name)
+
+    @property
+    def access_ttl_sec(self) -> int:
+        return self.access_ttl_min * 60
+
+    @property
+    def refresh_ttl_sec(self) -> int:
+        return self.refresh_ttl_days * 86_400
+
+    @property
+    def smtp_configured(self) -> bool:
+        return bool(self.smtp_user and self.smtp_password)
+
+    def is_email_domain_allowed(self, email: str) -> bool:
+        if not self.allowed_email_domains:
+            return True
+        domain = email.rsplit("@", 1)[-1].lower()
+        return domain in self.allowed_email_domains
+
+
 class Config:
     BASE_DIR           = Path(__file__).parent
     DATA_DIR           = BASE_DIR / "data"
@@ -186,6 +262,8 @@ class Config:
     watcher   = WatcherConfig()
     redis     = RedisConfig()
     langgraph = LangGraphConfig()
+    database  = DatabaseConfig()
+    auth      = AuthConfig()
 
     HOST  = os.getenv("SERVER_HOST", "127.0.0.1")
     PORT  = int(os.getenv("SERVER_PORT", "8000"))

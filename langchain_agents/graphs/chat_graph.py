@@ -44,6 +44,7 @@ def _initial_state(
     message: str,
     project_path: str = ".",
     session_id: str = "",
+    user_id: str = "",
     target_file: str = "",
     cursor_line: int = 0,
     active_function: str = "",
@@ -53,6 +54,7 @@ def _initial_state(
 ) -> ChatState:
     return {
         "session_id": session_id,
+        "user_id": user_id,
         "user_message": message,
         "project_path": str(Path(project_path).resolve()),
         "target_file": target_file or "",
@@ -442,19 +444,85 @@ async def node_git_question(state: ChatState) -> Dict[str, Any]:
     }
 
 
-def node_ci_question(state: ChatState) -> Dict[str, Any]:
-    """Placeholder for CIGraph integration."""
-    return {
-        "response": (
-            "## CI/CD Intelligence\n\n"
-            "Cette demande doit être traitée par le **CI/CD System**.\n\n"
-            "L’intégration directe `ChatAgent → CIGraph` est prévue dans la prochaine étape.\n\n"
-            "Pour l’instant, utilise le module CI existant :\n\n"
-            "```bash\n"
-            "python main.py ci-analyze --repo OWNER/REPO --pr PR_NUMBER --project-key SONAR_PROJECT_KEY\n"
-            "```"
-        )
-    }
+def _resolve_owner_repo(project_path: str) -> tuple[str, str]:
+    """Best-effort owner/repo from the git remote — no network call."""
+    try:
+        import re as _re
+        import subprocess
+        url = subprocess.run(
+            ["git", "-C", project_path, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        m = _re.search(r"[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?$", url)
+        if m:
+            return m.group(1), m.group(2)
+    except Exception as e:
+        logger.debug("owner/repo resolution failed: %s", e)
+    return "", ""
+
+
+async def node_ci_question(state: ChatState) -> Dict[str, Any]:
+    """CI/CD readiness via the same scorer used by the CI/CD dashboard."""
+    from langchain_agents.tools.project_state_tools import tool_chat_ci_readiness
+    from langchain_agents.agents.lc_chat_agent import lc_chat_agent
+
+    project_path = state.get("project_path", ".") or "."
+    owner, repo = _resolve_owner_repo(project_path)
+    ci = await asyncio.to_thread(tool_chat_ci_readiness, project_path, repo, owner)
+
+    if not ci.get("available"):
+        return {
+            "response": (
+                "## CI/CD Readiness\n\n"
+                f"Je n'ai pas pu calculer le score de déploiement ({ci.get('reason', 'raison inconnue')}).\n\n"
+                "Lance une analyse depuis la page **CI/CD** du dashboard pour lier ce projet à son repo GitHub."
+            ),
+            "project_state_context": {"ci_readiness": ci},
+        }
+
+    enriched_state = dict(state)
+    enriched_state["user_message"] = (
+        f"{state.get('user_message', '')}\n\n"
+        f"[CI/CD readiness data]\n"
+        f"score={ci['score']} verdict={ci['verdict']}\n"
+        f"blocking_reasons={ci['blocking_reasons']}\n"
+        f"warnings={ci['warnings']}\n"
+        f"component_scores={ci['component_scores']}\n"
+    )
+    response = await lc_chat_agent.aanswer(enriched_state)
+    return {"response": response, "project_state_context": {"ci_readiness": ci}}
+
+
+async def node_project_state(state: ChatState) -> Dict[str, Any]:
+    """Holistic project-state answer — git risk + secrets + test gaps +
+    security/quality + CI readiness, combined into one developer-facing summary."""
+    from langchain_agents.tools.project_state_tools import tool_chat_project_state_summary
+    from langchain_agents.agents.lc_chat_agent import lc_chat_agent
+
+    project_path = state.get("project_path", ".") or "."
+    target_file = state.get("target_file")
+    owner, repo = _resolve_owner_repo(project_path)
+
+    summary = await asyncio.to_thread(
+        tool_chat_project_state_summary, project_path, target_file, repo, owner
+    )
+
+    lines = ["[Project state snapshot]"]
+    for key, section in summary.items():
+        if section.get("available"):
+            lines.append(f"- {key}: {json.dumps({k: v for k, v in section.items() if k != 'available'})[:600]}")
+        else:
+            lines.append(f"- {key}: unavailable ({section.get('reason', '')})")
+
+    enriched_state = dict(state)
+    enriched_state["user_message"] = (
+        f"{state.get('user_message', '')}\n\n" + "\n".join(lines) +
+        "\n\nUsing ONLY the data above, answer the developer's question. "
+        "If a section is unavailable, say so briefly instead of guessing. "
+        "Prioritize what's blocking or risky, then suggest concrete next actions."
+    )
+    response = await lc_chat_agent.aanswer(enriched_state)
+    return {"response": response, "project_state_context": summary}
 
 
 def node_test_generation(state: ChatState) -> Dict[str, Any]:
@@ -565,16 +633,99 @@ def node_memory_save(state: ChatState) -> Dict[str, Any]:
     }
 
     session_id   = state.get("session_id", "")
+    user_id      = state.get("user_id", "")
     user_message = state.get("user_message", "")
     response     = state.get("response", "")
+    project_path = state.get("project_path", "")
 
-    # Redis history (existing)
+    # Redis history (primary fast-path — always runs)
     lc_chat_agent.save_exchange(
         session_id=session_id,
         user_message=user_message,
         response=response,
         metadata=metadata,
+        project_path=project_path,
     )
+
+    # PostgreSQL dual-write (background, non-blocking — durable history)
+    if user_id and session_id:
+        def _write_pg() -> None:
+            try:
+                from datetime import datetime, timezone
+                from database.connection import SyncSessionLocal
+                from database.models import User, Conversation, Message
+                from sqlalchemy import select, update
+
+                # resolve PG-authoritative email from auth Redis store (sync call)
+                try:
+                    from auth.store import get_user as _get_auth_user
+                    _auth_user = _get_auth_user(user_id)
+                    user_email = (_auth_user or {}).get("email", "")
+                except Exception:
+                    user_email = ""
+
+                if not user_email or user_email == "local@localhost":
+                    return
+
+                _now = lambda: datetime.now(timezone.utc)
+
+                with SyncSessionLocal() as db:
+                    # 1. upsert PG user by email (fixes Redis-ID vs PG-ID mismatch)
+                    pg_user = db.execute(
+                        select(User).where(User.email == user_email)
+                    ).scalar_one_or_none()
+                    if not pg_user:
+                        pg_user = User(
+                            email=user_email,
+                            name=user_email.split("@")[0],
+                            role="Developer",
+                        )
+                        db.add(pg_user)
+                        db.flush()
+
+                    # 2. get or create conversation row
+                    conv = db.execute(
+                        select(Conversation).where(Conversation.session_id == session_id)
+                    ).scalar_one_or_none()
+                    if not conv:
+                        title = (user_message or "")[:80] or "New conversation"
+                        conv = Conversation(
+                            session_id = session_id,
+                            user_id    = pg_user.id,
+                            title      = title,
+                            intent     = state.get("intent"),
+                            created_at = _now(),
+                            updated_at = _now(),
+                        )
+                        db.add(conv)
+                        db.flush()
+
+                    # 3. append user + assistant messages
+                    db.add(Message(
+                        conversation_id = conv.id,
+                        role            = "user",
+                        content         = user_message,
+                        metadata_       = metadata,
+                        created_at      = _now(),
+                    ))
+                    db.add(Message(
+                        conversation_id = conv.id,
+                        role            = "assistant",
+                        content         = response,
+                        metadata_       = metadata,
+                        created_at      = _now(),
+                    ))
+                    db.execute(
+                        update(Conversation)
+                        .where(Conversation.id == conv.id)
+                        .values(turn_count=conv.turn_count + 2, updated_at=_now())
+                    )
+                    db.commit()
+            except Exception as _exc:
+                logger.debug("node_memory_save: PG write failed: %s", _exc)
+
+        import threading
+        threading.Thread(target=_write_pg, daemon=True).start()
 
     # ── Phase C1: Semantic memory write (background, non-blocking) ────────────
     def _write_semantic():
@@ -634,7 +785,12 @@ def node_format_response(state: ChatState) -> Dict[str, Any]:
         if routing:
             formatted += f" · _routing: {routing}_"
 
-    return {"formatted_response": formatted}
+    sources = sorted(
+        k for k, v in (state.get("project_state_context") or {}).items()
+        if v.get("available")
+    )
+
+    return {"formatted_response": formatted, "context_sources": sources}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -649,6 +805,8 @@ def _route_after_decision(state: ChatState) -> str:
         return "ci_question"
     if intent == "git_question":
         return "git_question"
+    if intent == "project_state":
+        return "project_state"
     # Phase C3: deep context_level → tool-calling pair programmer
     if context_level == "deep" and intent == "question":
         return "semantic_recall"
@@ -707,6 +865,7 @@ def build_chat_graph():
     graph.add_node("answer_question",    node_answer_question)
     graph.add_node("git_question",       node_git_question)
     graph.add_node("ci_question",        node_ci_question)
+    graph.add_node("project_state",      node_project_state)
     graph.add_node("test_generation",    node_test_generation)
 
     # Generation nodes
@@ -731,6 +890,7 @@ def build_chat_graph():
             "load_file_context": "load_file_context",
             "git_question":      "git_question",
             "ci_question":       "ci_question",
+            "project_state":     "project_state",
             "semantic_recall":   "semantic_recall",   # Phase C3 fast track
         },
     )
@@ -779,7 +939,7 @@ def build_chat_graph():
 
     # All answer paths → memory_save → format → END
     for node in ("fast_answer", "answer_question", "git_question",
-                 "ci_question", "test_generation", "validate_generated",
+                 "ci_question", "project_state", "test_generation", "validate_generated",
                  "tool_calling_answer"):
         graph.add_edge(node, "memory_save")
 
@@ -850,6 +1010,7 @@ async def ainvoke_chat(
     message: str,
     project_path: str = ".",
     session_id: str = "",
+    user_id: str = "",
     target_file: str = "",
     cursor_line: int = 0,
     active_function: str = "",
@@ -863,6 +1024,7 @@ async def ainvoke_chat(
         message=message,
         project_path=project_path,
         session_id=session_id,
+        user_id=user_id,
         target_file=target_file,
         cursor_line=cursor_line,
         active_function=active_function,
@@ -912,6 +1074,7 @@ async def stream_chat(
     message: str,
     project_path: str = ".",
     session_id: str = "",
+    user_id: str = "",
     target_file: str = "",
     **services: Any,
 ):
@@ -930,6 +1093,7 @@ async def stream_chat(
         message=message,
         project_path=project_path,
         session_id=session_id,
+        user_id=user_id,
         target_file=target_file,
         **services,
     )
@@ -940,6 +1104,7 @@ async def stream_chat(
     final_target_file = target_file or ""
     final_context_level = "context"
     final_response = ""
+    final_context_sources: list = []
 
     yield _sse({"type": "status", "content": "Démarrage..."})
 
@@ -1001,6 +1166,7 @@ async def stream_chat(
 
                 elif node_name == "format_response" and isinstance(output, dict):
                     final_response = output.get("formatted_response", final_response)
+                    final_context_sources = output.get("context_sources") or final_context_sources
 
         yield _sse({
             "type": "done",
@@ -1010,6 +1176,7 @@ async def stream_chat(
             "context_level": final_context_level,
             "elapsed_seconds": round(time.time() - started_at, 2),
             "response": final_response,
+            "context_sources": final_context_sources,
         })
 
     except Exception as e:

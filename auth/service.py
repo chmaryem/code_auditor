@@ -9,7 +9,8 @@ from __future__ import annotations
 import logging
 
 from auth import security, store
-from auth.config import settings
+from config import config as _cfg
+settings = _cfg.auth
 from auth.schemas import PairingTokenOut, RequestCodeOut, TokenOut, UserOut
 
 logger = logging.getLogger("auth")

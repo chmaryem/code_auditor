@@ -162,10 +162,14 @@ class GitHubClient:
         r = _loop_manager.run(svc.get_pr_files(owner, repo, pr_number))
         return r if isinstance(r, list) else []
 
-    def get_file_content(self, owner: str, repo: str, path: str, ref: str = "main") -> str:
-        """Contenu d'un fichier GitHub (base64 décodé automatiquement)."""
+    def get_file_content(self, owner: str, repo: str, path: str, ref: str = "main",
+                         max_chars: int = 8000) -> str:
+        """Contenu d'un fichier GitHub (base64 décodé automatiquement).
+
+        max_chars=0 → fichier entier (requis pour la résolution de conflits ;
+        une troncature corromprait le merge 3-way)."""
         svc = self._ensure_connected()
-        r = _loop_manager.run(svc.get_file_content(owner, repo, path, ref))
+        r = _loop_manager.run(svc.get_file_content(owner, repo, path, ref, max_chars))
         return r if isinstance(r, str) else ""
 
     def post_review(self, owner: str, repo: str, pr_number: int,
@@ -217,6 +221,18 @@ class GitHubClient:
 
     def get_file_contents(self, owner: str, repo: str, path: str, ref: str = "main") -> str:
         return self.get_file_content(owner, repo, path, ref)
+
+    def list_open_prs(self, owner: str, repo: str, base: str = "") -> list:
+        """Liste les PRs ouvertes. Returns: [{number, title, head:{ref,sha}, base:{ref}, ...}]"""
+        svc = self._ensure_connected()
+        r = _loop_manager.run(svc.list_open_prs(owner, repo, base))
+        return r if isinstance(r, list) else []
+
+    def get_pr_commits(self, owner: str, repo: str, pr_number: int) -> list:
+        """Commits d'une PR. Returns: [{sha, commit:{message, author:{name}}}]"""
+        svc = self._ensure_connected()
+        r = _loop_manager.run(svc.get_pr_commits(owner, repo, pr_number))
+        return r if isinstance(r, list) else []
 
     def create_pull_request_review(self, owner: str, repo: str, pr_number: int,
                                    body: str, event: str, comments: list = None) -> dict:

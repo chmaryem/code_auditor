@@ -163,6 +163,29 @@ class LCGitDecisionAgent:
             )
             return plan
 
+        # ── F7: PR description — AVANT conflict/test_impact ─────────────────
+        # Les noms de branche / titres de PR contiennent souvent "conflict" ou
+        # "test" (ex: branche "test-analyzer-conflict"). On teste donc cette
+        # intention spécifique AVANT les règles génériques par mot-clé, sinon
+        # "generate pr description for branch test-analyzer-conflict" est
+        # mal routé vers la résolution de conflits.
+        if self._has_any(
+            msg,
+            ["description pr", "pr description", "génère description", "genere description",
+             "describe pr", "generate description", "rédige pr", "redige pr",
+             "description pull request", "generate pr description", "generate pr desc",
+             "pr desc"],
+        ):
+            plan.update(
+                {
+                    "intent": "pr_description",
+                    "confidence": 0.92,
+                    "selected_agents": ["pr_description_agent"],
+                    "reason": "generate PR description from commits and diff",
+                }
+            )
+            return plan
+
         # ── Conflict resolution ─────────────────────────────────────────────
         if self._has_any(
             msg,
@@ -190,6 +213,71 @@ class LCGitDecisionAgent:
             )
             return plan
 
+        # ── F1: Secret scan ──────────────────────────────────────────────────
+        if self._has_any(
+            msg,
+            ["secret", "credential", "token", "api key", "clé", "mot de passe",
+             "password", "scan secret", "détecte secret", "detecte secret"],
+        ):
+            plan.update(
+                {
+                    "intent": "secret_scan",
+                    "confidence": 0.92,
+                    "selected_agents": ["secret_agent"],
+                    "reason": "scan staged files for secrets/credentials",
+                }
+            )
+            return plan
+
+        # ── F3: Commit lint ──────────────────────────────────────────────────
+        if self._has_any(
+            msg,
+            ["lint", "valide", "valider", "validate", "conventional commit",
+             "format commit", "message valide", "commit valide"],
+        ):
+            plan.update(
+                {
+                    "intent": "commit_lint",
+                    "confidence": 0.9,
+                    "selected_agents": ["commit_linter_agent"],
+                    "reason": "validate commit message against Conventional Commits",
+                }
+            )
+            return plan
+
+
+        # ── F4: Test impact ──────────────────────────────────────────
+        if self._has_any(
+            msg,
+            ["impact test", "test impact", "fichier test",
+             "test file", "couverture", "coverage", "quel test", "which test",
+             "tests impactés", "impacted tests"],
+        ):
+            plan.update(
+                {
+                    "intent": "test_impact",
+                    "confidence": 0.88,
+                    "selected_agents": ["test_impact_agent"],
+                    "reason": "find test files impacted by staged changes",
+                }
+            )
+            return plan
+
+        # ── F6: Cross-PR conflicts ───────────────────────────────────────────
+        if self._has_any(
+            msg,
+            ["cross pr", "cross-pr", "entre pr", "between pr", "plusieurs pr",
+             "multiple pr", "pr parallèle", "conflit pr", "pr conflict"],
+        ):
+            plan.update(
+                {
+                    "intent": "cross_pr_conflicts",
+                    "confidence": 0.9,
+                    "selected_agents": ["cross_pr_agent"],
+                    "reason": "detect cross-PR file conflicts",
+                }
+            )
+            return plan
         return plan
 
     @staticmethod

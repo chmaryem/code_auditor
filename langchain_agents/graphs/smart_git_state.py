@@ -47,6 +47,13 @@ class SmartGitState(TypedDict, total=False):
     conflict_report: Dict[str, Any]
     commit_message: str
 
+    # ── F1-F7 Feature Reports ─────────────────────────────────────────────────
+    secret_scan_report: Dict[str, Any]
+    commit_lint_report: Dict[str, Any]
+    test_impact_report: Dict[str, Any]
+    cross_pr_report: Dict[str, Any]
+    pr_description: Dict[str, Any]
+
     # ── Output ───────────────────────────────────────────────────────────────
     response: str
     actions: List[Dict[str, Any]]

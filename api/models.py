@@ -131,6 +131,15 @@ class GenerateTestsResponse(BaseModel):
     validated: bool = False
     incremental: bool = False
     error: str = ""
+    run_success: Optional[bool] = Field(
+        None,
+        description="True si les tests ont été exécutés et passent, None si write=False"
+    )
+    run_error_summary: Optional[str] = Field(
+        None,
+        description="Résumé de l'erreur d'exécution si run_success=False"
+    )
+    cached: bool = Field(False, description="True si le résultat vient du cache Redis")
 
 
 # ── WebSocket Events ─────────────────────────────────────────────────────────

@@ -109,39 +109,76 @@ class LCLearningAgent:
 
     # ── Tool: KB promotion ───────────────────────────────────────────────────
 
-    def promote_to_kb(
+    @staticmethod
+    def _safe_name(pattern: str) -> str:
+        return pattern.lower().replace(" ", "_").replace("/", "_")[:50]
+
+    def promote_to_pending(
         self,
         pattern: str,
         language: str,
         rule_content: str,
-    ) -> bool:
+    ) -> Optional[Path]:
         """
-        Write a new rule to the Knowledge Base (Tool pillar).
+        Stage a learned rule for HUMAN APPROVAL (Tool pillar).
 
-        Creates a markdown file in data/knowledge_base/{language}/learned/.
+        Writes the rule to data/knowledge_base/{language}/pending/ instead of
+        learned/. The developer reviews it in the plugin and explicitly accepts
+        (→ moved to learned/, used by RAG) or rejects (→ deleted). Auto-writing to
+        learned/ without consent was incorrect: it silently changed the KB the
+        auditor relies on.
 
-        Args:
-            pattern: Pattern name.
-            language: Programming language.
-            rule_content: Markdown rule content.
-
-        Returns:
-            True if written successfully.
+        Returns the pending file path, or None on failure.
         """
         from config import config
 
-        kb_dir = config.KNOWLEDGE_BASE_DIR / language / "learned"
-        kb_dir.mkdir(parents=True, exist_ok=True)
-
-        safe_name = pattern.lower().replace(" ", "_").replace("/", "_")[:50]
-        rule_file = kb_dir / f"{safe_name}.md"
+        pending_dir = config.KNOWLEDGE_BASE_DIR / language / "pending"
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        rule_file = pending_dir / f"{self._safe_name(pattern)}.md"
 
         try:
             rule_file.write_text(rule_content, encoding="utf-8")
-            logger.info("New KB rule written: %s", rule_file)
+            logger.info("KB rule staged for approval: %s", rule_file)
+            return rule_file
+        except Exception as e:
+            logger.error("Failed to stage KB rule: %s", e)
+            return None
+
+    def approve_pending(self, language: str, pattern: str) -> bool:
+        """Promote a pending rule to learned/ (developer accepted)."""
+        from config import config
+
+        safe = self._safe_name(pattern)
+        pending_file = config.KNOWLEDGE_BASE_DIR / language / "pending" / f"{safe}.md"
+        if not pending_file.exists():
+            logger.warning("approve_pending: no pending rule %s/%s", language, safe)
+            return False
+
+        learned_dir = config.KNOWLEDGE_BASE_DIR / language / "learned"
+        learned_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            content = pending_file.read_text(encoding="utf-8")
+            (learned_dir / f"{safe}.md").write_text(content, encoding="utf-8")
+            pending_file.unlink()
+            logger.info("KB rule approved → learned: %s/%s", language, safe)
             return True
         except Exception as e:
-            logger.error("Failed to write KB rule: %s", e)
+            logger.error("approve_pending failed: %s", e)
+            return False
+
+    def reject_pending(self, language: str, pattern: str) -> bool:
+        """Delete a pending rule (developer rejected)."""
+        from config import config
+
+        safe = self._safe_name(pattern)
+        pending_file = config.KNOWLEDGE_BASE_DIR / language / "pending" / f"{safe}.md"
+        try:
+            if pending_file.exists():
+                pending_file.unlink()
+            logger.info("KB rule rejected: %s/%s", language, safe)
+            return True
+        except Exception as e:
+            logger.error("reject_pending failed: %s", e)
             return False
 
     # ── Full pipeline: process feedback ──────────────────────────────────────
@@ -164,7 +201,7 @@ class LCLearningAgent:
             Dict with 'patterns_recorded', 'rules_promoted'.
         """
         patterns_recorded = 0
-        rules_promoted = []
+        pending_rules: List[Dict[str, Any]] = []
 
         # Extract pattern-like strings from analysis
         analysis_text = analysis_result.get("analysis", "")
@@ -172,12 +209,12 @@ class LCLearningAgent:
 
         for pattern_name, severity in patterns:
             # Memory: record
-            self.record_pattern(language, pattern_name, severity)
+            count = self.record_pattern(language, pattern_name, severity)
             patterns_recorded += 1
 
-            # Planning: should promote?
+            # Planning: should we suggest promotion?
             if self.should_promote(language, pattern_name, severity):
-                # Check if rule already exists
+                # Skip if already learned or already awaiting approval
                 if self._rule_exists(language, pattern_name):
                     continue
 
@@ -186,13 +223,24 @@ class LCLearningAgent:
                 rule_content = self.generalize_to_rule(pattern_name, language, examples)
 
                 if rule_content:
-                    # Tool: write to KB
-                    if self.promote_to_kb(pattern_name, language, rule_content):
-                        rules_promoted.append(pattern_name)
+                    # Tool: STAGE for human approval (not auto-promote)
+                    staged = self.promote_to_pending(pattern_name, language, rule_content)
+                    if staged:
+                        pending_rules.append({
+                            "pattern":   pattern_name,
+                            "language":  language,
+                            "severity":  severity,
+                            "count":     count,
+                            "rule_md":   rule_content,
+                            "file":      str(staged),
+                        })
 
         return {
             "patterns_recorded": patterns_recorded,
-            "rules_promoted": rules_promoted,
+            # Rules now require developer approval before entering the KB.
+            "pending_rules":     pending_rules,
+            # Back-compat: callers that log "rules_promoted" still get the names.
+            "rules_promoted":    [r["pattern"] for r in pending_rules],
         }
 
     def _extract_patterns(self, analysis_text: str) -> List[tuple]:
@@ -213,11 +261,12 @@ class LCLearningAgent:
         return patterns
 
     def _rule_exists(self, language: str, pattern: str) -> bool:
-        """Check if a rule file already exists in the KB."""
+        """True if the rule is already learned OR already awaiting approval."""
         from config import config
-        safe_name = pattern.lower().replace(" ", "_").replace("/", "_")[:50]
-        rule_file = config.KNOWLEDGE_BASE_DIR / language / "learned" / f"{safe_name}.md"
-        return rule_file.exists()
+        safe_name = self._safe_name(pattern)
+        learned = config.KNOWLEDGE_BASE_DIR / language / "learned" / f"{safe_name}.md"
+        pending = config.KNOWLEDGE_BASE_DIR / language / "pending" / f"{safe_name}.md"
+        return learned.exists() or pending.exists()
 
 
 # Singleton

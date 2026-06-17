@@ -15,15 +15,36 @@ import asyncio
 import logging
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+
+from auth.security import Principal, get_current_user
 
 logger = logging.getLogger(__name__)
 
 ci_router = APIRouter(tags=["CI/CD"])
+
+
+# ── helpers REST GitHub ────────────────────────────────────────────────────────
+
+def _gh(token: str, method: str, url: str, data: dict | None = None):
+    """Appel GitHub REST API minimal via urllib."""
+    import json as _json
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept":        "application/vnd.github.v3+json",
+        "Content-Type":  "application/json",
+    }
+    body = _json.dumps(data).encode() if data else None
+    req  = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return _json.loads(resp.read().decode())
 
 # Shared polling state
 _ci_poller_thread: Optional[threading.Thread] = None
@@ -76,10 +97,91 @@ class CDStatusRequest(BaseModel):
     environment: str = Field("production")
 
 
+# ── PostgreSQL background save helper ────────────────────────────────────────
+
+def _pg_save_cicd_report(
+    user_email: str,
+    github_slug: str,
+    outcome: str = "",
+    failure_type: str = "",
+    stage_failed: str = "",
+    root_cause: str = "",
+    pr_number: Optional[int] = None,
+    elapsed_seconds: float = 0.0,
+    raw_data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Background-thread write to PostgreSQL (Supabase).
+    Sync psycopg2 — no asyncio, no event-loop conflict.
+    Guard: skipped for local/anonymous dev mode.
+    """
+    if not user_email or user_email == "local@localhost":
+        return
+
+    def _write() -> None:
+        try:
+            import hashlib
+            from database.connection import SyncSessionLocal
+            from database.models import User, Project, CICDReport
+            from sqlalchemy import select
+
+            path_hash = hashlib.sha256(github_slug.lower().encode()).hexdigest()[:12]
+            p_name    = github_slug.split("/")[-1] or "unknown"
+
+            with SyncSessionLocal() as db:
+                # 1. upsert user by email
+                pg_user = db.execute(
+                    select(User).where(User.email == user_email)
+                ).scalar_one_or_none()
+                if not pg_user:
+                    pg_user = User(
+                        email=user_email,
+                        name=user_email.split("@")[0],
+                        role="Developer",
+                    )
+                    db.add(pg_user)
+                    db.flush()
+
+                # 2. get or create project row
+                project = db.execute(
+                    select(Project).where(
+                        Project.owner_id  == pg_user.id,
+                        Project.path_hash == path_hash,
+                    )
+                ).scalar_one_or_none()
+                if not project:
+                    project = Project(
+                        owner_id   = pg_user.id,
+                        name       = p_name,
+                        path_hash  = path_hash,
+                        local_path = github_slug,
+                    )
+                    db.add(project)
+                    db.flush()
+
+                # 3. persist cicd_report
+                db.add(CICDReport(
+                    project_id      = project.id,
+                    repo            = github_slug,
+                    outcome         = outcome or None,
+                    failure_type    = failure_type or None,
+                    stage_failed    = stage_failed or None,
+                    root_cause      = root_cause[:4000] if root_cause else None,
+                    pr_number       = pr_number,
+                    elapsed_seconds = elapsed_seconds,
+                    raw_data        = raw_data or {},
+                ))
+                db.commit()
+        except Exception as _exc:
+            logger.debug("ci_router: PG save failed: %s", _exc)
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
 # ── CI Analyze ────────────────────────────────────────────────────────────────
 
 @ci_router.post("/ci/analyze", response_model=CIAnalyzeResponse, summary="Analyze a CI run")
-async def ci_analyze(req: CIAnalyzeRequest):
+async def ci_analyze(req: CIAnalyzeRequest, user: Principal = Depends(get_current_user)):
     """
     Lance une analyse d'un run GitHub Actions via le CIGraph IA.
     Si run_id est vide, détecte automatiquement le dernier run du repo.
@@ -151,6 +253,20 @@ async def ci_analyze(req: CIAnalyzeRequest):
         logger.exception("ci/analyze error")
         raise HTTPException(500, f"CIGraph error: {e}")
 
+    elapsed = round(time.time() - t0, 2)
+
+    _pg_save_cicd_report(
+        user_email      = user.email,
+        github_slug     = req.repo,
+        outcome         = result.get("outcome", ""),
+        failure_type    = result.get("failure_type", ""),
+        stage_failed    = result.get("stage_failed", "") or "",
+        root_cause      = result.get("root_cause", "") or "",
+        pr_number       = result.get("pr_number"),
+        elapsed_seconds = elapsed,
+        raw_data        = result,
+    )
+
     return CIAnalyzeResponse(
         outcome            = result.get("outcome", ""),
         failure_type       = result.get("failure_type", ""),
@@ -159,7 +275,7 @@ async def ci_analyze(req: CIAnalyzeRequest):
         pr_number          = result.get("pr_number"),
         comment_posted     = bool(result.get("comment_posted")),
         notification_level = result.get("notification_level", ""),
-        elapsed_seconds    = round(time.time() - t0, 2),
+        elapsed_seconds    = elapsed,
     )
 
 
@@ -218,7 +334,7 @@ async def ci_poll_status():
 # ── CD Score ──────────────────────────────────────────────────────────────────
 
 @ci_router.post("/cd/score", response_model=CDScoreResponse, summary="Release Readiness Score")
-async def cd_score(req: CDScoreRequest):
+async def cd_score(req: CDScoreRequest, user: Principal = Depends(get_current_user)):
     """
     Calcule le Release Readiness Score avant un déploiement.
     Agrège CI, SonarCloud, sécurité, PR approvals, risk fichiers.
@@ -245,13 +361,32 @@ async def cd_score(req: CDScoreRequest):
         logger.exception("cd/score error")
         raise HTTPException(500, f"CDReleaseScorer error: {e}")
 
+    elapsed = round(time.time() - t0, 2)
+
+    _pg_save_cicd_report(
+        user_email      = user.email,
+        github_slug     = req.repo,
+        outcome         = report.verdict,
+        failure_type    = "deploy_blocked" if report.verdict == "DEPLOY_BLOCKED" else "",
+        root_cause      = "; ".join(report.blocking_reasons) if report.blocking_reasons else "",
+        pr_number       = req.pr_number,
+        elapsed_seconds = elapsed,
+        raw_data        = {
+            "verdict":          report.verdict,
+            "score":            report.score,
+            "component_scores": report.component_scores,
+            "blocking_reasons": report.blocking_reasons,
+            "warnings":         report.warnings,
+        },
+    )
+
     return CDScoreResponse(
         verdict          = report.verdict,
         score            = report.score,
         component_scores = report.component_scores,
         blocking_reasons = report.blocking_reasons,
         warnings         = report.warnings,
-        elapsed_seconds  = round(time.time() - t0, 2),
+        elapsed_seconds  = elapsed,
     )
 
 
@@ -304,3 +439,304 @@ async def cd_status(req: CDStatusRequest):
     except Exception as e:
         logger.exception("cd/status error")
         raise HTTPException(500, f"CDDeployTracker error: {e}")
+
+
+# ── Generate Files ─────────────────────────────────────────────────────────────
+
+class GeneratedFile(BaseModel):
+    name:    str
+    path:    str
+    content: str
+    label:   str
+    stage:   str   # "generate" | "docker"
+
+class ProjectDetection(BaseModel):
+    language:       str   = "unknown"
+    build_system:   str   = "unknown"
+    java_version:   str   = "17"
+    python_version: str   = "3.11"
+    node_version:   str   = "20"
+    has_dockerfile: bool  = False
+
+class GenerateFilesRequest(BaseModel):
+    repo:   str = Field(..., description="owner/repo")
+    branch: str = Field("main", description="Branch to analyze for project detection")
+
+class GenerateFilesResponse(BaseModel):
+    files:           List[GeneratedFile]         = Field(default_factory=list)
+    project:         Optional[ProjectDetection]  = None
+    elapsed_seconds: float                       = 0.0
+
+
+@ci_router.post("/ci/generate-files", response_model=GenerateFilesResponse,
+                summary="Detect project + generate ci.yml, Dockerfile, docker-compose.yml")
+async def ci_generate_files(req: GenerateFilesRequest):
+    """
+    1. Fetches candidate build files from the repo via GitHub Contents API.
+    2. Detects the project profile (language, build system, versions).
+    3. Generates ci.yml (7-job workflow) + Dockerfile + docker-compose.yml.
+    Returns content only — nothing is pushed to the repo yet.
+    """
+    import os
+    import base64 as _b64
+    import json as _json
+    from dotenv import load_dotenv
+
+    load_dotenv(override=True)
+
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    if not token:
+        raise HTTPException(401, "GITHUB_TOKEN manquant dans .env")
+
+    parts     = req.repo.split("/")
+    owner     = parts[0]
+    repo_name = parts[-1]
+    branch    = req.branch or "main"
+
+    t0 = time.time()
+
+    # ── Detect project profile via GitHub Contents API ────────────────────────
+
+    def _fetch_file(path: str) -> str:
+        try:
+            url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{path}?ref={branch}"
+            data = _gh(token, "GET", url)
+            if data.get("encoding") == "base64":
+                return _b64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return ""
+
+    def _list_files() -> list[str]:
+        try:
+            url  = f"https://api.github.com/repos/{owner}/{repo_name}/git/trees/{branch}?recursive=1"
+            data = _gh(token, "GET", url)
+            return [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
+        except Exception:
+            return []
+
+    try:
+        from ci_cd.workflow_generator import (
+            detect_project_profile,
+            generate_workflow,
+            generate_dockerfile,
+            generate_docker_compose,
+            ProjectProfile,
+        )
+    except ImportError as e:
+        raise HTTPException(500, f"workflow_generator import error: {e}")
+
+    profile = await asyncio.to_thread(
+        detect_project_profile, _fetch_file, _list_files
+    )
+
+    # ── Generate files ────────────────────────────────────────────────────────
+
+    yaml_content    = generate_workflow(profile, enable_publish=True, enable_deploy=False)
+    dockerfile      = generate_dockerfile(profile)
+    docker_compose  = generate_docker_compose(profile)
+
+    # Human-readable labels
+    lang_label = f"{profile.language.capitalize()}"
+    if profile.build_system not in ("unknown", profile.language):
+        lang_label += f"/{profile.build_system}"
+
+    files: List[GeneratedFile] = [
+        GeneratedFile(
+            name    = "ci.yml",
+            path    = ".github/workflows/ci.yml",
+            content = yaml_content,
+            label   = f"7 jobs · {lang_label}",
+            stage   = "generate",
+        ),
+        GeneratedFile(
+            name    = "Dockerfile",
+            path    = "Dockerfile",
+            content = dockerfile,
+            label   = f"multi-stage · {lang_label}",
+            stage   = "docker",
+        ),
+        GeneratedFile(
+            name    = "docker-compose.yml",
+            path    = "docker-compose.yml",
+            content = docker_compose,
+            label   = _compose_label(profile),
+            stage   = "docker",
+        ),
+    ]
+
+    detection = ProjectDetection(
+        language       = profile.language,
+        build_system   = profile.build_system,
+        java_version   = profile.java_version,
+        python_version = profile.python_version,
+        node_version   = profile.node_version,
+        has_dockerfile = profile.has_dockerfile,
+    )
+
+    return GenerateFilesResponse(
+        files           = files,
+        project         = detection,
+        elapsed_seconds = round(time.time() - t0, 2),
+    )
+
+
+def _compose_label(profile) -> str:
+    lang = profile.language.lower()
+    if lang == "java":
+        return "app + postgres"
+    if lang == "python":
+        return "app + redis"
+    return "app"
+
+
+# ── Open PR ───────────────────────────────────────────────────────────────────
+
+class OpenPRFile(BaseModel):
+    path:    str
+    content: str
+
+class OpenPRRequest(BaseModel):
+    repo:     str            = Field(..., description="owner/repo")
+    files:    List[OpenPRFile]
+    base:     str            = Field("main",  description="Target branch for the PR")
+    branch:   str            = Field("",      description="Feature branch (auto if empty)")
+    pr_title: str            = Field("",      description="PR title (auto if empty)")
+    pr_body:  str            = Field("",      description="PR body (auto if empty)")
+
+class OpenPRResponse(BaseModel):
+    pr_url:         str
+    branch:         str
+    files_pushed:   int
+    elapsed_seconds: float = 0.0
+
+
+@ci_router.post("/ci/open-pr", response_model=OpenPRResponse,
+                summary="Create feature branch, push generated files, open PR")
+async def ci_open_pr(req: OpenPRRequest):
+    """
+    GitOps-compliant file delivery:
+      1. Resolve default branch HEAD SHA.
+      2. Create feature/ci-cd-setup-{timestamp} branch.
+      3. Push each file via GitHub Contents API (create or update).
+      4. Open PR against `base` with LLM-friendly description.
+    """
+    import os
+    import base64 as _b64
+    import json as _json
+    from datetime import datetime
+    from dotenv import load_dotenv
+
+    load_dotenv(override=True)
+
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    if not token:
+        raise HTTPException(401, "GITHUB_TOKEN manquant dans .env")
+
+    parts     = req.files  # keep name
+    owner, repo_name = req.repo.split("/", 1)
+    base      = req.base or "main"
+    t0        = time.time()
+
+    # ── 1. Get HEAD SHA of base branch ───────────────────────────────────────
+    try:
+        ref_data = _gh(token, "GET",
+            f"https://api.github.com/repos/{owner}/{repo_name}/git/refs/heads/{base}")
+        head_sha = ref_data["object"]["sha"]
+    except Exception as e:
+        raise HTTPException(500, f"Impossible de lire la branche '{base}': {e}")
+
+    # ── 2. Create feature branch ──────────────────────────────────────────────
+    timestamp   = datetime.utcnow().strftime("%Y%m%d-%H%M")
+    new_branch  = req.branch or f"feature/ci-cd-setup-{timestamp}"
+
+    try:
+        _gh(token, "POST",
+            f"https://api.github.com/repos/{owner}/{repo_name}/git/refs",
+            {"ref": f"refs/heads/{new_branch}", "sha": head_sha})
+    except urllib.error.HTTPError as e:
+        if e.code == 422:
+            pass   # Branch already exists — reuse it
+        else:
+            raise HTTPException(500, f"Création branche '{new_branch}' échouée: {e}")
+
+    # ── 3. Push each file ─────────────────────────────────────────────────────
+    pushed = 0
+    for f in req.files:
+        encoded = _b64.b64encode(f.content.encode()).decode()
+        payload: dict = {
+            "message": f"ci: add {f.path.split('/')[-1]} (Code Auditor)",
+            "content": encoded,
+            "branch":  new_branch,
+        }
+        # Check if file exists (need SHA for update)
+        try:
+            existing = _gh(token, "GET",
+                f"https://api.github.com/repos/{owner}/{repo_name}/contents/{f.path}?ref={new_branch}")
+            payload["sha"] = existing["sha"]
+        except Exception:
+            pass   # File doesn't exist → create
+
+        try:
+            _gh(token, "PUT",
+                f"https://api.github.com/repos/{owner}/{repo_name}/contents/{f.path}",
+                payload)
+            pushed += 1
+        except Exception as e:
+            logger.warning("Push failed for %s: %s", f.path, e)
+
+    if pushed == 0:
+        raise HTTPException(500, "Aucun fichier n'a pu être poussé sur GitHub")
+
+    # ── 4. Open PR ────────────────────────────────────────────────────────────
+    pr_title = req.pr_title or f"ci: add Code Auditor CI/CD pipeline ({pushed} files)"
+    pr_body  = req.pr_body  or _default_pr_body(req.files, new_branch)
+
+    try:
+        pr_data = _gh(token, "POST",
+            f"https://api.github.com/repos/{owner}/{repo_name}/pulls",
+            {"title": pr_title, "body": pr_body, "head": new_branch, "base": base})
+        pr_url = pr_data.get("html_url", "")
+    except urllib.error.HTTPError as e:
+        body_txt = e.read().decode() if hasattr(e, "read") else str(e)
+        if "already exists" in body_txt or e.code == 422:
+            # PR already open for this branch — find it
+            try:
+                prs = _gh(token, "GET",
+                    f"https://api.github.com/repos/{owner}/{repo_name}/pulls?head={owner}:{new_branch}&state=open")
+                pr_url = prs[0]["html_url"] if prs else ""
+            except Exception:
+                pr_url = ""
+        else:
+            raise HTTPException(500, f"Création PR échouée: {e.code} {body_txt[:200]}")
+
+    return OpenPRResponse(
+        pr_url          = pr_url,
+        branch          = new_branch,
+        files_pushed    = pushed,
+        elapsed_seconds = round(time.time() - t0, 2),
+    )
+
+
+def _default_pr_body(files: "List[OpenPRFile]", branch: str) -> str:
+    file_list = "\n".join(f"- `{f.path}`" for f in files)
+    return f"""## CI/CD Pipeline — Code Auditor
+
+This PR was automatically generated by **Code Auditor AI** after analyzing your project.
+
+### Files added
+{file_list}
+
+### What was detected
+- Language and build system auto-detected from your repository
+- Workflow tailored to your stack (Java/Python/Node.js)
+- Dockerfile uses multi-stage build for minimal image size
+- docker-compose.yml includes appropriate backing services
+
+### Next steps
+1. Review each generated file
+2. Add required GitHub Secrets (see `ci.yml` header comments)
+3. Merge this PR — the pipeline will trigger automatically
+
+> Generated by [Code Auditor](https://github.com/chmaryem/code_auditor) on branch `{branch}`
+"""

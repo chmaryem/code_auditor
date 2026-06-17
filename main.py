@@ -1,22 +1,3 @@
-"""
-main.py — Point d'entrée unique du projet Code Auditor AI.
-
-Commandes disponibles :
-  python main.py file    <fichier>        # analyser un seul fichier
-  python main.py project <dossier>        # analyser un projet complet
-  python main.py watch   <dossier>        # surveillance temps réel
-  python main.py git     <dossier>        # analyser le dernier commit Git
-  python main.py hook    <dossier>        # installer le pre-commit hook Git
-
-  # Smart Git Merge
-  python main.py resolve-conflicts <dossier>       # résoudre les conflits locaux via LLM
-  python main.py merge-hook <dossier>               # installer le pre-merge hook
-
-  # MCP Code Mode (agents autonomes)
-  python main.py pr-check       --repo owner/repo --pr N  # revue PR via agent
-  python main.py pr-resolve     --repo owner/repo --pr N  # résoudre conflits PR via agent
-  python main.py pr-merge-check --repo owner/repo --pr N  # vérifier readiness merge
-"""
 import sys
 import io
 import argparse
