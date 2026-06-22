@@ -65,6 +65,16 @@ class _RedisLoopManager:
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+
+        def _exc_handler(loop, context):
+            exc = context.get("exception")
+            # Suppress anyio cancel-scope errors from GC cleanup of abandoned
+            # stdio_client transports (harmless side-effect of reconnection).
+            if isinstance(exc, RuntimeError) and "cancel scope" in str(exc):
+                return
+            loop.default_exception_handler(context)
+
+        self._loop.set_exception_handler(_exc_handler)
         self._ready.set()
         self._loop.run_forever()
 
@@ -226,7 +236,9 @@ class MCPRedisService:
         if self._cm:
             try:
                 await self._cm.__aexit__(None, None, None)
-            except Exception:
+            except (Exception, BaseException):
+                # anyio raises RuntimeError if __aexit__ is called from a different
+                # task than __aenter__ — safe to swallow, transport is already dead.
                 pass
             self._cm = None
         self._connected = False
@@ -258,8 +270,11 @@ class MCPRedisService:
         try:
             result = await self._session.call_tool(tool_name, arguments)
         except Exception as e:
-            # Tentative de reconnexion une fois
+            # Abandon the broken transport without calling __aexit__ — calling it
+            # from a different anyio task raises "cancel scope in a different task".
             logger.warning("MCP-Redis call_tool erreur, reconnexion : %s", e)
+            self._session = None
+            self._cm = None
             self._connected = False
             await self._connect()
             result = await self._session.call_tool(tool_name, arguments)

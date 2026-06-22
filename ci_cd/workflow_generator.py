@@ -276,11 +276,13 @@ def _build_steps(profile: ProjectProfile) -> str:
         run: mvn compile -q
 
       - name: "Tests + JaCoCo Coverage"
-        run: mvn test -Dmaven.test.failure.ignore=true
-        continue-on-error: true
-
-      - name: "Generate JaCoCo XML report"
-        run: mvn jacoco:report -q || echo "JaCoCo non configure -- ajoutez jacoco-maven-plugin dans pom.xml"
+        run: >
+          mvn -B
+          org.jacoco:jacoco-maven-plugin:prepare-agent
+          test
+          org.jacoco:jacoco-maven-plugin:report
+          -Dmaven.test.failure.ignore=true
+          -q
         continue-on-error: true
 
       - name: "Package"

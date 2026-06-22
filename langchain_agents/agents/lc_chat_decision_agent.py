@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ── LLM Decision Prompt ───────────────────────────────────────────────────────
 
 _DECISION_PROMPT = """\
-You are a routing agent for a code assistant embedded in an IDE.
+You are a routing agent for Code Auditor AI, an expert developer assistant embedded in an IDE.
 Your ONLY job is to classify the developer's message and return a JSON routing plan.
 
 Developer message: {message}
@@ -49,7 +49,7 @@ Last 3 conversation turns:
 
 Return ONLY valid JSON (no markdown, no explanation):
 {{
-  "intent": "<one of: explain|complete_fn|new_class|code_generation|git_question|ci_question|test_generation|project_state|question>",
+  "intent": "<one of: explain|complete_fn|new_class|code_generation|git_question|ci_question|project_state|question>",
   "target_file": "<filename or empty string>",
   "target_symbol": "<function or class name, or empty string>",
   "generation_target": "<name to generate, or empty string>",
@@ -58,28 +58,36 @@ Return ONLY valid JSON (no markdown, no explanation):
   "needs_ci": <true|false>,
   "needs_rag": <true|false>,
   "needs_generation": <true|false>,
-  "needs_tests": <true|false>,
   "confidence": <0.0 to 1.0>,
   "reason": "<one sentence>"
 }}
 
 Intent guide:
-- explain       : user asks what code does, how it works, summarize
-- complete_fn   : user asks to complete/implement an existing function stub
-- new_class     : user asks to create a new class from scratch
-- code_generation: user asks to write/generate code (not a specific class or fn)
-- git_question  : about commits, branches, merges, PRs, conflicts, diffs
-- ci_question   : about CI/CD pipeline, builds, deployments, GitHub Actions, SonarCloud
-- test_generation: generate or suggest unit tests
-- project_state : holistic project health — "can I deploy?", "is my project ready?",
-                   "what should I fix next?", "show me security/quality issues",
-                   "am I missing tests?", combining git risk + CI readiness + tests + security
-- question      : general project Q&A, architecture, dependencies, risks
+- explain        : user asks what code does, how it works, summarize a file or function
+- complete_fn    : user asks to complete/implement an existing function stub
+- new_class      : user asks to create a new class from scratch
+- code_generation: user EXPLICITLY asks to write/generate/create NEW code, implement a feature,
+                   or produce a code snippet (e.g. "write a function to...", "generate X", "create Y")
+                   NEVER use for analysis/review tasks even if file context is needed
+- git_question   : about commits, branches, merges, PRs, conflicts, diffs, what changed
+- ci_question    : about CI/CD pipeline, builds, deployments, GitHub Actions, SonarCloud, quality gate
+- project_state  : holistic project health — "can I deploy?", "is my project ready?",
+                   "what should I fix next?", "show me all issues", combining git + CI + security
+- question       : general Q&A, analysis, code review — includes "find bugs", "check for issues",
+                   "security review", "analyze", "what's wrong with", "review this code",
+                   "find vulnerabilities", "detect problems", "audit", and any explain/analysis
+                   request that is NOT about writing new code
 
 context_level guide:
-- fast    : simple explain, 1 file, no RAG needed
-- context : needs file + deps + RAG
-- deep    : multi-file, git + CI context needed
+- fast    : simple explain of 1 file, no external context needed
+- context : needs file content + dependencies + RAG knowledge base
+- deep    : multi-file reasoning, or needs git + CI data
+
+RAG usage criteria — set needs_rag=true ONLY when:
+- intent is explain, code_generation, complete_fn, new_class, or question about code structure
+- AND a target_file is present or the question references specific code
+- Set needs_rag=false for: git_question, ci_question, project_state, simple general questions,
+  and any fast-level explain (context_level=fast handles those with file code alone)
 """
 
 
@@ -252,7 +260,8 @@ class LCChatDecisionAgent:
             "context_level":      "context",
             "needs_file":         True,
             "needs_project_summary": True,
-            "needs_rag":          True,
+            # RAG off by default in regex fallback — enabled per-intent below
+            "needs_rag":          False,
             "needs_git":          False,
             "needs_ci":           False,
             "needs_generation":   False,
@@ -279,38 +288,39 @@ class LCChatDecisionAgent:
             "build failed", "test failed", "sonar", "quality gate",
             "deploy", "deployment", "rollback", "release", "staging", "production",
         ]):
-            plan.update({"intent": "ci_question", "agents": ["ci_agent", "retriever_agent", "chat_agent"],
-                         "context_level": "deep", "needs_file": False, "needs_ci": True,
-                         "reason": "CI/CD keyword"})
+            plan.update({
+                "intent": "ci_question", "agents": ["ci_agent", "chat_agent"],
+                "context_level": "deep", "needs_file": False,
+                "needs_ci": True, "needs_rag": False,
+                "reason": "CI/CD keyword",
+            })
             return plan
 
         if self._contains_word(msg, [
             "commit", "merge", "branch", "pull request", "pr", "conflict",
             "rebase", "stash", "diff", "safe to merge", "can i merge",
             "est-ce que je peux merge", "est-ce que je peux commit", "résume mes changements",
+            "what changed", "qu'est-ce que j'ai changé",
         ]):
-            plan.update({"intent": "git_question", "agents": ["git_agent", "analysis_agent", "chat_agent"],
-                         "context_level": "deep", "needs_file": False, "needs_git": True,
-                         "reason": "Git keyword"})
-            return plan
-
-        if self._contains_word(msg, [
-            "generate test", "generate tests", "génère test", "générer test",
-            "tests manquants", "missing tests", "pytest", "junit", "jest",
-            "unit test", "test coverage", "coverage",
-        ]):
-            plan.update({"intent": "test_generation", "agents": ["test_agent", "retriever_agent", "validator_agent"],
-                         "needs_generation": True, "needs_tests": True, "needs_validation": True,
-                         "reason": "test generation keyword"})
+            plan.update({
+                "intent": "git_question", "agents": ["git_agent", "chat_agent"],
+                "context_level": "deep", "needs_file": False,
+                "needs_git": True, "needs_rag": False,
+                "reason": "Git keyword",
+            })
             return plan
 
         if base_intent in ("complete_fn", "new_class"):
             target = (params.get("generation_target") or params.get("method_hint")
                       or self._extract_generation_target(msg_raw))
-            plan.update({"intent": base_intent, "target_symbol": target, "generation_target": target,
-                         "agents": ["code_generation_agent", "validator_agent"],
-                         "needs_file": base_intent == "complete_fn", "needs_generation": True,
-                         "needs_validation": True, "reason": f"Phase 2: {base_intent}"})
+            plan.update({
+                "intent": base_intent, "target_symbol": target, "generation_target": target,
+                "agents": ["code_generation_agent", "validator_agent"],
+                "needs_file": base_intent == "complete_fn",
+                "needs_generation": True, "needs_validation": True,
+                "needs_rag": True,
+                "reason": f"Phase 2: {base_intent}",
+            })
             return plan
 
         if self._contains_word(msg, [
@@ -320,38 +330,53 @@ class LCChatDecisionAgent:
         ]):
             target = (params.get("generation_target") or params.get("method_hint")
                       or self._extract_generation_target(msg_raw))
-            plan.update({"intent": "code_generation", "target_symbol": target, "generation_target": target,
-                         "agents": ["code_generation_agent", "validator_agent"],
-                         "needs_generation": True, "needs_validation": True,
-                         "reason": "code generation keyword"})
+            plan.update({
+                "intent": "code_generation", "target_symbol": target, "generation_target": target,
+                "agents": ["code_generation_agent", "validator_agent"],
+                "needs_generation": True, "needs_validation": True,
+                "needs_rag": True,
+                "reason": "code generation keyword",
+            })
             return plan
 
         if (recent_intent in ("explain_code", "contextual_code_question", "explain")
                 and self._contains_word(msg, ["dependencies", "dépendances", "risks", "risques",
                                               "impact", "details", "more", "plus", "pourquoi"])):
-            plan.update({"intent": "contextual_code_question",
-                         "agents": ["code_agent", "retriever_agent", "chat_agent"],
-                         "reason": "follow-up from history"})
+            plan.update({
+                "intent": "question",
+                "agents": ["code_agent", "retriever_agent", "chat_agent"],
+                "needs_rag": bool(resolved_target),
+                "reason": "follow-up from history",
+            })
             return plan
 
         if base_intent == "explain" or self._contains_word(msg, [
             "explain", "explique", "what does", "que fait", "résume", "resume",
             "describe", "décrire", "comment fonctionne", "understand",
         ]):
-            plan.update({"intent": "explain_code", "agents": ["code_agent", "chat_agent"],
-                         "context_level": "fast", "needs_project_summary": False, "needs_rag": False,
-                         "reason": "explain keyword — fast path"})
+            # Fast path: file code is enough, RAG not needed
+            plan.update({
+                "intent": "explain", "agents": ["code_agent", "chat_agent"],
+                "context_level": "fast", "needs_project_summary": False,
+                "needs_rag": False,
+                "reason": "explain keyword — fast path",
+            })
             return plan
 
         if self._contains_word(msg, [
             "risk", "risque", "impact", "impacted", "depend", "dépend",
             "used by", "where is used", "refactor", "architecture", "coupling",
         ]):
-            plan.update({"intent": "contextual_code_question",
-                         "agents": ["code_agent", "retriever_agent", "chat_agent"],
-                         "reason": "risk/impact keyword"})
+            plan.update({
+                "intent": "question",
+                "agents": ["code_agent", "retriever_agent", "chat_agent"],
+                "needs_rag": bool(resolved_target),
+                "reason": "risk/impact keyword",
+            })
             return plan
 
+        # Default general question — RAG only if a file is in context
+        plan.update({"needs_rag": bool(resolved_target)})
         return plan
 
     # ── Utilities ─────────────────────────────────────────────────────────────

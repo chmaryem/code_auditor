@@ -1484,6 +1484,23 @@ _NO_ISSUE_PHRASES = (
     "no specific issue", "no issues found", "no issue found",
     "does not contain", "no obvious issue", "appears to be clean",
     "no problems found", "n/a",
+    # llama-4-scout / weak-model hallucinations: "no change needed" issues
+    "no change needed", "no improvement needed", "already parameterized",
+    "already param", "no resource leak detected", "no improvement in",
+    "not needed", "sufficient", "properly managed", "properly handled",
+    "no action needed", "no action required",
+)
+
+# fixed_code values that are pure no-ops — fix contains no real change.
+_NOOP_FIXED_CODE_PHRASES = (
+    "# no change needed",
+    "# no change",
+    "# nothing to change",
+    "# no action needed",
+    "# no action required",
+    "# already correct",
+    "# already parameterized",
+    "# no improvement needed",
 )
 
 
@@ -1516,13 +1533,21 @@ def _sanitize_issues(issues_raw: list) -> list:
     return clean
 
 
+def _is_noop_fix(fixed_code: str) -> bool:
+    """True when the LLM's proposed fix is just a comment saying nothing changes."""
+    low = fixed_code.strip().lower()
+    return any(low.startswith(p) or low == p for p in _NOOP_FIXED_CODE_PHRASES)
+
+
 def _sanitize_fixes(fixes_raw: list) -> list:
-    """Drop fixes whose code is parser scaffolding or has no real content."""
+    """Drop fixes whose code is parser scaffolding, has no real content, or is a no-op."""
     clean = []
     for fix in fixes_raw or []:
         current = str(fix.get("current_code", ""))
         fixed = str(fix.get("fixed_code", ""))
         if _is_artifact(current) or _is_artifact(fixed):
+            continue
+        if _is_noop_fix(fixed):
             continue
         clean.append(fix)
     return clean
@@ -1589,6 +1614,52 @@ def build_analysis_result_event(
             "[WS] sanitized %s: issues %d→%d, fixes %d→%d (dropped parser artifacts)",
             Path(file_path).name, _n_issues, len(issues_raw), _n_fixes, len(fixes_raw),
         )
+
+    # ── Static injection: undefined names the LLM missed ────────────────────
+    # Weak models (llama-4-scout, OpenRouter fallbacks) frequently hallucinate
+    # false-positive issues on correct code while missing obvious NameErrors
+    # like a missing `import logging`. We run _py_undefined_names on the source
+    # directly and inject any undefined name not already reported by the LLM.
+    if language == "python" and source_code:
+        _already_reported = {
+            str(i.get("title", "")).lower() + str(i.get("message", "")).lower()
+            for i in issues_raw
+        }
+        _static_undef = _py_undefined_names(source_code)
+        for uname in sorted(_static_undef):
+            # Skip if already covered by the LLM output
+            if any(uname in blob for blob in _already_reported):
+                continue
+            # Build a minimal fix: inject `import <module>` at top of file
+            _fix_code = f"import {uname}"
+            _first_nonblank = next(
+                (i for i, ln in enumerate(source_code.splitlines()) if ln.strip()),
+                0,
+            )
+            _fix_line = _first_nonblank + 1
+            issues_raw.append({
+                "title":    f"Missing import: {uname}",
+                "message":  f"`{uname}` is used but never imported — will raise NameError at runtime.",
+                "severity": "error",
+                "rule":     "missing_import",
+                "line":     _fix_line,
+                "location": f"line {_fix_line}",
+            })
+            fixes_raw.append({
+                "title":       f"Add missing import: {uname}",
+                "current_code": source_code.splitlines()[_first_nonblank],
+                "fixed_code":  _fix_code + "\n" + source_code.splitlines()[_first_nonblank],
+                "explanation": (
+                    f"`{uname}` is used in this file but `import {uname}` is missing. "
+                    f"This causes a NameError at runtime the first time the code runs."
+                ),
+                "apply_mode": "replace_snippet",
+                "line":       _fix_line,
+            })
+            logger.info(
+                "[WS] static injection: undefined name '%s' in %s → injected error+fix",
+                uname, Path(file_path).name,
+            )
 
     try:
         from api.diff_utils import compute_diff_hunks, truncate_code_for_ws
@@ -1696,8 +1767,31 @@ def build_analysis_result_event(
         issue_line = issue.get("line")
         if matched_fix and matched_fix.get("applicable") and matched_fix.get("line"):
             issue_line = matched_fix["line"]
+
+        # Downgrade CRITICAL/ERROR → INFO when the matched fix is a no-op.
+        # Weak models (llama-4-scout) emit CRITICAL findings on already-correct
+        # code but then propose "# No change needed" as the fix — a contradiction.
+        # The real severity is INFO (the code pattern was noticed but is fine).
+        severity = str(issue.get("severity", "warning")).lower()
+        if matched_fix:
+            fix_current = str(matched_fix.get("current_code", "")).strip()
+            fix_fixed   = str(matched_fix.get("fixed_code",   "")).strip()
+            fix_is_noop = (
+                _is_noop_fix(fix_fixed)
+                or (fix_current and fix_fixed and fix_current == fix_fixed)
+            )
+            if fix_is_noop and severity in ("critical", "error"):
+                severity = "info"
+                logger.info(
+                    "[WS] downgraded %s issue '%s' from %s → info (fix is no-op)",
+                    Path(file_path).name,
+                    str(issue.get("title", ""))[:60],
+                    str(issue.get("severity", "")).upper(),
+                )
+
         enriched_issues.append({
             **issue,
+            "severity":      severity,
             "line":          issue_line,
             "id":            str(uuid.uuid4()),
             "fix_available": fix_ok,

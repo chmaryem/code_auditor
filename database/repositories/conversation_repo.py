@@ -1,12 +1,3 @@
-"""
-database/repositories/conversation_repo.py — Conversations and Messages.
-
-Design:
-  - session_id is the shared key between Redis (cache) and PostgreSQL (durable).
-  - On save_exchange: write to PostgreSQL. Redis is the hot cache.
-  - On load_history: prefer Redis (fast); fall back to PostgreSQL.
-  - On logout: Redis keys expire or are deleted; PostgreSQL rows remain.
-"""
 from __future__ import annotations
 
 from datetime import datetime, timezone

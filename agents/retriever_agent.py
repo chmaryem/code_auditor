@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -206,6 +207,7 @@ class SystemAwareRAG:
     # Singleton cross-encoder — chargé une seule fois pour tout le processus
     _reranker        = None
     _reranker_loaded = False
+    _reranker_lock   = threading.Lock()
 
     # Seuil L2 par défaut — écrasé par config.rag.rag_l2_threshold si présent
     THRESHOLD = 1.2
@@ -245,28 +247,31 @@ class SystemAwareRAG:
     @classmethod
     def _get_reranker(cls):
         """
-        Charge le cross-encoder une seule fois (lazy singleton).
-        Retourne None si sentence-transformers n'est pas installé.
-        → Le pipeline continue sans reranking (fallback L2).
+        Charge le cross-encoder une seule fois (lazy singleton thread-safe).
+        Double-checked locking pour éviter les chargements simultanés
+        lorsque les deux branches de parallel_context s'initialisent en parallèle.
         """
-        if not cls._reranker_loaded:
-            try:
-                from sentence_transformers import CrossEncoder
-                cls._reranker = CrossEncoder(
-                    "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                    max_length=512,
-                )
-                logger.info("Cross-encoder reranker chargé ✓")
-            except ImportError:
-                logger.debug(
-                    "sentence-transformers absent — reranking désactivé. "
-                    "Installez avec : pip install sentence-transformers"
-                )
-                cls._reranker = None
-            except Exception as e:
-                logger.warning("Cross-encoder chargement échoué : %s", e)
-                cls._reranker = None
-            cls._reranker_loaded = True
+        if cls._reranker_loaded:
+            return cls._reranker
+        with cls._reranker_lock:
+            if not cls._reranker_loaded:
+                try:
+                    from sentence_transformers import CrossEncoder
+                    cls._reranker = CrossEncoder(
+                        "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                        max_length=512,
+                    )
+                    logger.info("Cross-encoder reranker chargé ✓")
+                except ImportError:
+                    logger.debug(
+                        "sentence-transformers absent — reranking désactivé. "
+                        "Installez avec : pip install sentence-transformers"
+                    )
+                    cls._reranker = None
+                except Exception as e:
+                    logger.warning("Cross-encoder chargement échoué : %s", e)
+                    cls._reranker = None
+                cls._reranker_loaded = True
         return cls._reranker
 
     # ── Pipeline principal ────────────────────────────────────────────────────

@@ -46,18 +46,20 @@ from api.models import (
     GitBranchRequest,
     GenerateTestsRequest,
     GenerateTestsResponse,
+    RunTestsRequest,
+    RunTestsResponse,
     HealthResponse,
     WSEvent,
     IssueDiagnostic,
     FixSuggestion,
 )
-from api.websocket_manager import ConnectionManager
+from api.ws_broadcast import manager as _ws_manager
+import api.ws_broadcast as _ws_broadcast
 
 logger = logging.getLogger(__name__)
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
-_ws_manager       = ConnectionManager()
 _server_start_time: float = 0.0
 _default_project: Path    = Path(".")
 
@@ -98,6 +100,7 @@ async def lifespan(app: FastAPI):
 
     # Capture the running asyncio event loop BEFORE any background threads start
     _main_loop = asyncio.get_running_loop()
+    _ws_broadcast.set_loop(_main_loop)
 
     _server_start_time = time.time()
     logger.info("Code Auditor API v8 — démarrage (multi-agent mode)")
@@ -344,9 +347,15 @@ from api.diagnostics_router import diagnostics_router, feedback_router  # noqa: 
 from api.code_actions_router import code_actions_router  # noqa: E402
 from api.mcp_router         import mcp_router            # noqa: E402
 from api.hardening_router   import hardening_router      # noqa: E402
+from api.user_router        import user_router, github_callback_router  # noqa: E402
+from api.history_router          import history_router                   # noqa: E402
+from api.settings_router         import settings_router                  # noqa: E402
+from api.extension_chat_router   import extension_chat_router            # noqa: E402
 
 # Authentication endpoints — always public (login lives here).
-app.include_router(auth_router, prefix="/api")
+app.include_router(auth_router,             prefix="/api")
+# GitHub OAuth callback is also public — GitHub redirects here without a JWT.
+app.include_router(github_callback_router,  prefix="/api")
 
 # Everything else requires a valid access token (bypassed when AUTH_REQUIRED=false).
 _auth = [Depends(get_current_user)]
@@ -357,7 +366,11 @@ app.include_router(diagnostics_router, prefix="/api", dependencies=_auth)
 app.include_router(feedback_router,    prefix="/api", dependencies=_auth)
 app.include_router(code_actions_router, prefix="/api", dependencies=_auth)
 app.include_router(hardening_router,   prefix="/api", dependencies=_auth)
-app.include_router(mcp_router,         dependencies=_auth)
+app.include_router(user_router,        prefix="/api", dependencies=_auth)
+app.include_router(history_router,     prefix="/api", dependencies=_auth)
+app.include_router(settings_router,         prefix="/api", dependencies=_auth)
+app.include_router(extension_chat_router,   prefix="/api", dependencies=_auth)
+app.include_router(mcp_router,              dependencies=_auth)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -835,6 +848,40 @@ async def generate_tests(req: GenerateTestsRequest):
             status_code=500,
             detail=f"Erreur génération tests : {type(e).__name__}: {e}",
         )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Run Tests (existing file — no LLM, no regeneration)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/run-tests", response_model=RunTestsResponse, dependencies=[Depends(get_current_user)])
+async def run_tests(req: RunTestsRequest):
+    """Exécute un fichier de test existant sans régénérer (pytest/jest/mvn/gradle)."""
+    test_path = Path(req.test_file)
+    if not test_path.exists():
+        raise HTTPException(404, f"Fichier de test introuvable : {test_path}")
+
+    try:
+        from services.test_runner import TestRunner
+
+        project_path = Path(req.project_path).resolve() if req.project_path else test_path.parent
+        runner = TestRunner(project_path=project_path)
+
+        result = await asyncio.to_thread(runner.run, test_path, req.language)
+
+        return RunTestsResponse(
+            test_file=str(test_path),
+            run_success=result.success,
+            run_error_summary=result.error_summary or None,
+            duration_seconds=round(result.duration_seconds, 2),
+            error="",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("run_tests error")
+        raise HTTPException(status_code=500, detail=f"Erreur exécution tests : {type(e).__name__}: {e}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Knowledge Base — human approval of learned rules

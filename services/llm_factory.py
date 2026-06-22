@@ -23,6 +23,9 @@ def _is_quota_error(err: str) -> bool:
 def _is_auth_error(err: str) -> bool:
     return any(k in err for k in _AUTH_ERRORS)
 
+# Cooldown OpenRouter — si rate-limited, on skip pendant 60s pour aller direct sur Groq
+_openrouter_state: dict = {"cooling_until": 0.0}
+
 
 
 def _call_openrouter_http(prompt: str, api_key: str, model: str, max_tokens: int = 2048) -> str:
@@ -259,23 +262,28 @@ def invoke_with_fallback(
     # ── 1. OpenRouter via HTTP (zéro PyTorch) ────────────────────────────────
     api_key = config.api.openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "")
     if api_key:
-        model      = config.api.openrouter_model or "mistralai/mistral-7b-instruct:free"
-        short_name = model.split("/")[-1].replace(":free", "")
-        # 1 seule tentative : les modèles :free sont throttlés en amont (pool partagé) ;
-        # inutile d'attendre 100s en backoff — on bascule tout de suite sur Groq.
-        try:
-            print(f"    [{short_name}] {label} — appel HTTP...")
-            text = _call_openrouter_http(prompt_text, api_key, model, max_tokens)
-            logger.info("[%s] réponse via OpenRouter/%s (HTTP)", label, short_name)
-            return text
-        except Exception as e:
-            err = str(e)
-            if _is_quota_error(err):
-                logger.info("[%s] OpenRouter rate-limited → bascule Groq", label)
-            elif _is_auth_error(err):
-                logger.error("[%s] OpenRouter clé invalide", label)
-            else:
-                logger.warning("[%s] OpenRouter HTTP erreur: %s", label, err[:150])
+        if time.time() < _openrouter_state["cooling_until"]:
+            remaining = round(_openrouter_state["cooling_until"] - time.time())
+            logger.debug("[%s] OpenRouter cooldown actif (%ds restants) → Groq direct", label, remaining)
+        else:
+            model      = config.api.openrouter_model or "mistralai/mistral-7b-instruct:free"
+            short_name = model.split("/")[-1].replace(":free", "")
+            # 1 seule tentative : les modèles :free sont throttlés en amont (pool partagé) ;
+            # inutile d'attendre 100s en backoff — on bascule tout de suite sur Groq.
+            try:
+                print(f"    [{short_name}] {label} — appel HTTP...")
+                text = _call_openrouter_http(prompt_text, api_key, model, max_tokens)
+                logger.info("[%s] réponse via OpenRouter/%s (HTTP)", label, short_name)
+                return text
+            except Exception as e:
+                err = str(e)
+                if _is_quota_error(err):
+                    _openrouter_state["cooling_until"] = time.time() + 60
+                    logger.info("[%s] OpenRouter rate-limited → cooldown 60s → Groq", label)
+                elif _is_auth_error(err):
+                    logger.error("[%s] OpenRouter clé invalide", label)
+                else:
+                    logger.warning("[%s] OpenRouter HTTP erreur: %s", label, err[:150])
 
     # ── 2. Groq via HTTP (fallback free, très rapide) ────────────────────────
     api_key = config.api.groq_api_key or os.getenv("GROQ_API_KEY", "")

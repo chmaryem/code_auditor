@@ -96,7 +96,20 @@ class TestGeneratorAgent:
 
         # 1. Discovery — conventions
         test_info = self._discovery.find_test_for(source_path)
-        framework = test_info.test_framework or "pytest"
+        # Fallback: if discovery returns unknown, infer from file extension
+        _ext_framework = {
+            ".py":   "pytest",
+            ".java": "junit",
+            ".js":   "jest",
+            ".ts":   "jest",
+            ".jsx":  "jest",
+            ".tsx":  "jest",
+        }
+        framework = (
+            test_info.test_framework
+            if test_info.test_framework and test_info.test_framework != "unknown"
+            else _ext_framework.get(source_path.suffix.lower(), "pytest")
+        )
         convention = test_info.convention_used or "{name}_test.py"
 
         # 2. Lecture du code source

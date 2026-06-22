@@ -46,11 +46,17 @@ def _make_title(message: str, limit: int = 60) -> str:
 
 
 class ChatMemoryService:
-    """Small Redis-backed chat history service."""
+    """
+    Redis-backed chat history cache.
 
-    HISTORY_TTL_SECONDS = 24 * 3600
-    META_TTL_SECONDS = 30 * 24 * 3600
-    MAX_TURNS = 12
+    Redis is a hot cache only — PostgreSQL is the source of truth.
+    HISTORY_TTL_SECONDS: short (1h) — rebuilt from PG on cold start.
+    META_TTL_SECONDS: longer — needed for session-list ordering.
+    """
+
+    HISTORY_TTL_SECONDS = 3600          # 1h cache TTL (was 24h)
+    META_TTL_SECONDS = 7 * 24 * 3600   # 7d for session metadata
+    MAX_TURNS = 20
     MAX_SESSIONS_PER_PROJECT = 200
 
     def __init__(self, max_turns: int = MAX_TURNS, ttl_seconds: int = HISTORY_TTL_SECONDS):

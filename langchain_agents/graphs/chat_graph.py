@@ -50,6 +50,9 @@ def _initial_state(
     active_function: str = "",
     selected_text: str = "",
     visible_range: list | None = None,
+    active_module: str = "",
+    branch: str = "",
+    active_repository: str = "",
     **services: Any,
 ) -> ChatState:
     return {
@@ -59,6 +62,11 @@ def _initial_state(
         "project_path": str(Path(project_path).resolve()),
         "target_file": target_file or "",
         "target_lang": "unknown",
+
+        # Dashboard context
+        "active_module":     active_module or "",
+        "branch":            branch or "",
+        "active_repository": active_repository or "",
 
         # IDE cursor context
         "cursor_line":       cursor_line,
@@ -117,10 +125,40 @@ def _initial_state(
 # Nodes — Memory + Intent + Decision
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def node_load_ai_settings(state: ChatState) -> Dict[str, Any]:
+    """Load per-user AI settings from PostgreSQL. Falls back to defaults silently."""
+    user_id = state.get("user_id", "")
+    if not user_id:
+        return {}
+    try:
+        from database.connection import AsyncSessionLocal
+        from database.repositories.settings_repo import SettingsRepo
+        async with AsyncSessionLocal() as db:
+            async with db.begin():
+                ai = await SettingsRepo(db).get_ai_settings(user_id)
+        if ai:
+            return {
+                "ai_temperature":   ai.temperature,
+                "ai_mode":          ai.ai_mode,
+                "ai_response_style":ai.response_style,
+                "ai_use_rag":       ai.use_rag,
+                "ai_use_memory":    ai.use_conversation_memory,
+                "ai_max_context":   ai.max_context_size,
+                "ai_streaming":     ai.streaming_enabled,
+            }
+    except Exception as exc:
+        logger.debug("node_load_ai_settings: could not load settings: %s", exc)
+    return {}
+
+
 def node_load_memory(state: ChatState) -> Dict[str, Any]:
-    """Load conversation history from Redis."""
+    """Load conversation history from Redis (skipped when ai_use_memory=False)."""
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
     from services.chat_memory_service import chat_memory_service
+
+    if not state.get("ai_use_memory", True):
+        session_id = state.get("session_id") or chat_memory_service.new_session_id()
+        return {"session_id": session_id, "history": [], "memory_key": ""}
 
     session_id = state.get("session_id") or chat_memory_service.new_session_id()
     history = lc_chat_agent.load_history(session_id)
@@ -321,7 +359,12 @@ async def node_parallel_context(state: ChatState) -> Dict[str, Any]:
 
 
 def node_rag_retrieve(state: ChatState) -> Dict[str, Any]:
-    """Standalone RAG retrieve — used only by generation sub-path."""
+    """Standalone RAG retrieve — used only by generation sub-path.
+    Skipped when ai_use_rag is disabled in user settings.
+    """
+    if not state.get("ai_use_rag", True):
+        return {"rag_docs": [], "rag_scores": []}
+
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
     result = lc_chat_agent.retrieve(
@@ -615,30 +658,41 @@ def node_validate_generated(state: ChatState) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def node_memory_save(state: ChatState) -> Dict[str, Any]:
-    """Persist user/assistant exchange in Redis + semantic memory."""
+    """
+    Persiste l'échange user↔assistant.
+
+    Architecture dual-layer :
+      - Redis (cache chaud, TTL 1 h)  → via lc_chat_agent.save_exchange()
+      - PostgreSQL (source de vérité) → via persistent_chat_memory.save_exchange_sync()
+                                         dans un thread daemon non-bloquant
+
+    Les deux écritures sont indépendantes : un échec Redis n'affecte pas PG
+    et vice-versa.
+    """
+    import threading
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
-    plan = state.get("decision_plan") or {}
-
-    metadata = {
-        "intent":           state.get("intent"),
-        "target_file":      state.get("target_file"),
-        "language":         state.get("target_lang"),
-        "context_level":    state.get("context_level"),
-        "selected_agents":  state.get("selected_agents", []),
-        "decision_reason":  plan.get("reason", ""),
-        "generated_code":   state.get("generated_code", ""),
-        "cursor_line":      state.get("cursor_line", 0),
-        "active_function":  state.get("active_function", ""),
-    }
-
+    plan         = state.get("decision_plan") or {}
     session_id   = state.get("session_id", "")
     user_id      = state.get("user_id", "")
     user_message = state.get("user_message", "")
     response     = state.get("response", "")
     project_path = state.get("project_path", "")
+    intent       = state.get("intent", "")
 
-    # Redis history (primary fast-path — always runs)
+    metadata = {
+        "intent":          intent,
+        "target_file":     state.get("target_file"),
+        "language":        state.get("target_lang"),
+        "context_level":   state.get("context_level"),
+        "selected_agents": state.get("selected_agents", []),
+        "decision_reason": plan.get("reason", ""),
+        "generated_code":  state.get("generated_code", ""),
+        "cursor_line":     state.get("cursor_line", 0),
+        "active_function": state.get("active_function", ""),
+    }
+
+    # ── 1. Redis (cache chaud — synchrone, fast path) ─────────────────────────
     lc_chat_agent.save_exchange(
         session_id=session_id,
         user_message=user_message,
@@ -647,104 +701,38 @@ def node_memory_save(state: ChatState) -> Dict[str, Any]:
         project_path=project_path,
     )
 
-    # PostgreSQL dual-write (background, non-blocking — durable history)
+    # ── 2. PostgreSQL (source de vérité — thread daemon non-bloquant) ─────────
     if user_id and session_id:
-        def _write_pg() -> None:
-            try:
-                from datetime import datetime, timezone
-                from database.connection import SyncSessionLocal
-                from database.models import User, Conversation, Message
-                from sqlalchemy import select, update
+        def _persist_to_pg() -> None:
+            from services.persistent_chat_memory_service import persistent_chat_memory
+            persistent_chat_memory.save_exchange_sync(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_response=response,
+                user_id=user_id,
+                metadata=metadata,
+                project_path=project_path,
+                intent=intent or None,
+            )
 
-                # resolve PG-authoritative email from auth Redis store (sync call)
-                try:
-                    from auth.store import get_user as _get_auth_user
-                    _auth_user = _get_auth_user(user_id)
-                    user_email = (_auth_user or {}).get("email", "")
-                except Exception:
-                    user_email = ""
+        threading.Thread(target=_persist_to_pg, daemon=True).start()
 
-                if not user_email or user_email == "local@localhost":
-                    return
-
-                _now = lambda: datetime.now(timezone.utc)
-
-                with SyncSessionLocal() as db:
-                    # 1. upsert PG user by email (fixes Redis-ID vs PG-ID mismatch)
-                    pg_user = db.execute(
-                        select(User).where(User.email == user_email)
-                    ).scalar_one_or_none()
-                    if not pg_user:
-                        pg_user = User(
-                            email=user_email,
-                            name=user_email.split("@")[0],
-                            role="Developer",
-                        )
-                        db.add(pg_user)
-                        db.flush()
-
-                    # 2. get or create conversation row
-                    conv = db.execute(
-                        select(Conversation).where(Conversation.session_id == session_id)
-                    ).scalar_one_or_none()
-                    if not conv:
-                        title = (user_message or "")[:80] or "New conversation"
-                        conv = Conversation(
-                            session_id = session_id,
-                            user_id    = pg_user.id,
-                            title      = title,
-                            intent     = state.get("intent"),
-                            created_at = _now(),
-                            updated_at = _now(),
-                        )
-                        db.add(conv)
-                        db.flush()
-
-                    # 3. append user + assistant messages
-                    db.add(Message(
-                        conversation_id = conv.id,
-                        role            = "user",
-                        content         = user_message,
-                        metadata_       = metadata,
-                        created_at      = _now(),
-                    ))
-                    db.add(Message(
-                        conversation_id = conv.id,
-                        role            = "assistant",
-                        content         = response,
-                        metadata_       = metadata,
-                        created_at      = _now(),
-                    ))
-                    db.execute(
-                        update(Conversation)
-                        .where(Conversation.id == conv.id)
-                        .values(turn_count=conv.turn_count + 2, updated_at=_now())
-                    )
-                    db.commit()
-            except Exception as _exc:
-                logger.debug("node_memory_save: PG write failed: %s", _exc)
-
-        import threading
-        threading.Thread(target=_write_pg, daemon=True).start()
-
-    # ── Phase C1: Semantic memory write (background, non-blocking) ────────────
-    def _write_semantic():
+    # ── 3. Semantic memory (Phase C1 — thread daemon non-bloquant) ───────────
+    def _write_semantic() -> None:
         try:
             from langchain_agents.memory.lc_semantic_memory import semantic_memory
             semantic_memory.write_memory(
                 session_id=session_id,
                 user_message=user_message,
                 assistant_message=response,
-                metadata={"intent": state.get("intent", ""), "file": state.get("target_file", "")},
+                metadata={"intent": intent, "file": state.get("target_file", "")},
             )
-        except Exception as e:
-            logger.debug("semantic memory write failed: %s", e)
+        except Exception as exc:
+            logger.debug("semantic memory write failed: %s", exc)
 
-    import threading
     threading.Thread(target=_write_semantic, daemon=True).start()
 
-    # Notify LearningAgent only as "suggested", not "accepted".
-    intent = state.get("intent", "")
+    # ── 4. LearningAgent feedback (code generation uniquement) ────────────────
     if intent in ("complete_fn", "new_class", "code_generation"):
         generated = state.get("generated_code", "")
         lang = state.get("generation_language") or state.get("target_lang") or "unknown"
@@ -753,37 +741,32 @@ def node_memory_save(state: ChatState) -> Dict[str, Any]:
                 from langchain_agents.agents.lc_learning_agent import learning_agent
                 learning_agent.submit_feedback(
                     block={
-                        "problem": f"code_generation:{intent}",
+                        "problem":    f"code_generation:{intent}",
                         "fixed_code": generated,
-                        "severity": "LOW",
+                        "severity":   "LOW",
                     },
                     action="suggested",
                     language=lang,
                 )
-            except Exception as e:
-                logger.warning("Could not notify LearningAgent: %s", e)
+            except Exception as exc:
+                logger.warning("Could not notify LearningAgent: %s", exc)
 
     return {}
 
 
 def node_format_response(state: ChatState) -> Dict[str, Any]:
-    """Final formatting — adds session ID and proactive suggestion count."""
-    response   = state.get("response", "")
-    session_id = state.get("session_id", "")
-    proactive  = state.get("proactive_suggestions", {}) or {}
+    """Final formatting — clean response ready for the developer."""
+    response  = state.get("response", "")
+    proactive = state.get("proactive_suggestions", {}) or {}
 
     formatted = response.strip()
 
-    # Append proactive summary if any suggestions
+    # Append proactive summary only for critical blocking issues
     if proactive.get("has_critical"):
         n = proactive.get("total", 0)
-        formatted += f"\n\n---\n> ⚠️ **{n} suggestion(s) proactive(s)** — consulte `/api/chat/proactive`"
-
-    if session_id:
-        routing = (state.get("decision_plan") or {}).get("_routing", "")
-        formatted += f"\n\n---\n_session: `{session_id}`_"
-        if routing:
-            formatted += f" · _routing: {routing}_"
+        formatted += (
+            f"\n\n> ⚠️ **{n} issue(s) detected** — check the CI/CD panel for details."
+        )
 
     sources = sorted(
         k for k, v in (state.get("project_state_context") or {}).items()
@@ -849,6 +832,7 @@ def build_chat_graph():
     graph = StateGraph(ChatState)
 
     # Core orchestration nodes
+    graph.add_node("load_ai_settings",   node_load_ai_settings)
     graph.add_node("load_memory",        node_load_memory)
     graph.add_node("intent_router",      node_intent_router)
     graph.add_node("decision_agent",     node_decision_agent)
@@ -879,7 +863,8 @@ def build_chat_graph():
     graph.add_node("format_response",    node_format_response)
 
     # ── Entry ────────────────────────────────────────────────────────────────
-    graph.set_entry_point("load_memory")
+    graph.set_entry_point("load_ai_settings")
+    graph.add_edge("load_ai_settings", "load_memory")
     graph.add_edge("load_memory",   "intent_router")
     graph.add_edge("intent_router", "decision_agent")
 
@@ -1016,6 +1001,9 @@ async def ainvoke_chat(
     active_function: str = "",
     selected_text: str = "",
     visible_range: list | None = None,
+    active_module: str = "",
+    branch: str = "",
+    active_repository: str = "",
     **services: Any,
 ) -> Dict[str, Any]:
     """Async chat invocation for FastAPI and async LangGraph nodes."""
@@ -1030,6 +1018,9 @@ async def ainvoke_chat(
         active_function=active_function,
         selected_text=selected_text,
         visible_range=visible_range,
+        active_module=active_module,
+        branch=branch,
+        active_repository=active_repository,
         **services,
     )
 
@@ -1076,6 +1067,13 @@ async def stream_chat(
     session_id: str = "",
     user_id: str = "",
     target_file: str = "",
+    cursor_line: int = 0,
+    active_function: str = "",
+    selected_text: str = "",
+    visible_range: list | None = None,
+    active_module: str = "",
+    branch: str = "",
+    active_repository: str = "",
     **services: Any,
 ):
     """
@@ -1095,6 +1093,13 @@ async def stream_chat(
         session_id=session_id,
         user_id=user_id,
         target_file=target_file,
+        cursor_line=cursor_line,
+        active_function=active_function,
+        selected_text=selected_text,
+        visible_range=visible_range,
+        active_module=active_module,
+        branch=branch,
+        active_repository=active_repository,
         **services,
     )
 
@@ -1106,22 +1111,40 @@ async def stream_chat(
     final_response = ""
     final_context_sources: list = []
 
-    yield _sse({"type": "status", "content": "Démarrage..."})
+    yield _sse({"type": "status", "content": "Starting...", "elapsed_ms": 0})
 
     node_status = {
-        "load_memory": "Chargement de la mémoire...",
-        "intent_router": "Détection de l’intention...",
-        "decision_agent": "Planification multi-agent...",
-        "load_file_context": "Lecture du fichier...",
-        "project_summary": "Résumé du projet...",
-        "rag_retrieve": "Recherche dans le projet...",
-        "fast_answer": "Génération rapide...",
-        "answer_question": "Génération de la réponse...",
-        "load_project_patterns": "Détection des conventions projet...",
-        "generate_completion": "Génération du code...",
-        "generate_class": "Génération de la classe...",
-        "validate_generated": "Validation du code généré...",
-        "memory_save": "Sauvegarde de la conversation...",
+        "load_memory":          "Loading conversation memory...",
+        "intent_router":        "Detecting intent...",
+        "decision_agent":       "Planning multi-agent strategy...",
+        "load_file_context":    "Reading file context...",
+        "project_summary":      "Summarizing project...",
+        "rag_retrieve":         "Searching codebase (RAG)...",
+        "parallel_context":     "Loading context (parallel)...",
+        "fast_answer":          "Generating response...",
+        "answer_question":      "Generating response...",
+        "git_question":         "Analyzing git history...",
+        "ci_question":          "Analyzing CI/CD pipeline...",
+        "semantic_recall":      "Recalling semantic memory...",
+        "tool_calling_answer":  "Running tools...",
+        "load_project_patterns":"Detecting project conventions...",
+        "generate_completion":  "Generating code...",
+        "generate_class":       "Generating class...",
+        "validate_generated":   "Validating generated code...",
+        "memory_save":          "Saving conversation...",
+    }
+
+    # Human-readable label sent after decision_agent reveals the chosen path
+    _intent_status = {
+        "explain":         "Explaining code...",
+        "question":        "Searching context & reasoning...",
+        "security_review": "Running security analysis...",
+        "test_generation": "Preparing test generation...",
+        "git_question":    "Analyzing git...",
+        "ci_question":     "Analyzing CI/CD...",
+        "complete_fn":     "Analyzing code to complete...",
+        "new_class":       "Analyzing project conventions...",
+        "code_generation": "Preparing code generation...",
     }
 
     try:
@@ -1131,7 +1154,12 @@ async def stream_chat(
             data = event.get("data", {}) or {}
 
             if kind == "on_chain_start" and node_name in node_status:
-                yield _sse({"type": "status", "node": node_name, "content": node_status[node_name]})
+                yield _sse({
+                    "type":       "status",
+                    "node":       node_name,
+                    "content":    node_status[node_name],
+                    "elapsed_ms": round((time.time() - started_at) * 1000),
+                })
 
             elif kind == "on_chat_model_stream":
                 chunk = data.get("chunk")
@@ -1150,12 +1178,17 @@ async def stream_chat(
                 elif node_name == "decision_agent" and isinstance(output, dict):
                     final_intent = output.get("intent", final_intent)
                     final_context_level = output.get("context_level", final_context_level)
+                    elapsed = round((time.time() - started_at) * 1000)
                     yield _sse({
-                        "type": "plan",
-                        "intent": final_intent,
-                        "context_level": final_context_level,
+                        "type":            "plan",
+                        "intent":          final_intent,
+                        "context_level":   final_context_level,
                         "selected_agents": output.get("selected_agents", []),
+                        "elapsed_ms":      elapsed,
                     })
+                    # Immediately tell the client what path was chosen
+                    desc = _intent_status.get(final_intent, "Processing...")
+                    yield _sse({"type": "status", "content": desc, "elapsed_ms": elapsed})
 
                 elif node_name == "load_file_context" and isinstance(output, dict):
                     final_target_file = output.get("target_file", final_target_file)

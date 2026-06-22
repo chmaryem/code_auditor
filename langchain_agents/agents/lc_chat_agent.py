@@ -164,6 +164,29 @@ class LCChatAgent:
 
   
 
+    # ── Prompt builders ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _context_header(state: Dict[str, Any]) -> str:
+        """Build the shared context header injected into every prompt."""
+        parts = []
+        repo = state.get("active_repository", "")
+        branch = state.get("branch", "")
+        module = state.get("active_module", "")
+        target = state.get("target_file", "")
+        lang = state.get("target_lang", "")
+
+        if repo:
+            parts.append(f"Repository: {repo}")
+        if branch:
+            parts.append(f"Branch: {branch}")
+        if module and module not in ("chat", ""):
+            parts.append(f"Active module: {module}")
+        if target:
+            parts.append(f"File: {target}" + (f" ({lang})" if lang and lang != "unknown" else ""))
+
+        return "\n".join(parts) if parts else ""
+
     def _build_fast_prompt(self, state: Dict[str, Any]) -> str:
         file_code = state.get("file_code", "")
         target_file = state.get("target_file", "")
@@ -171,7 +194,6 @@ class LCChatAgent:
         deps = state.get("dependencies", [])[:8]
         dependents = state.get("dependents", [])[:8]
         question = state.get("user_message", "")
-
         intent_params = state.get("intent_params") or {}
         method_hint = intent_params.get("method_hint", "")
 
@@ -183,64 +205,64 @@ class LCChatAgent:
             pass
 
         file_excerpt = file_code[:4500] if file_code else ""
+        ctx_header = self._context_header(state)
 
-        method_focus = ""
-        if method_hint:
-            method_focus = (
-                f"The developer asks specifically about `{method_hint}`. "
-                f"Focus on that method if it exists in the file.\n"
-            )
+        method_focus = (
+            f"\nFocus on `{method_hint}` — explain its role, parameters, return value, "
+            f"side effects, and risks.\n"
+            if method_hint else ""
+        )
 
-        return f"""
-You are Code Auditor ChatAgent.
+        intent = state.get("intent", "question")
+        structure_guide = {
+            "explain":    "Purpose → Key logic → Risks → Concrete suggestions",
+            "code_analysis": "What it does → How it works → Risks → Improvements",
+            "bug_fix":    "Problem identified → Root cause → Fix → Verification",
+        }.get(intent, "Direct answer → Key points → Concrete next step")
 
-Fast mode:
-- Answer quickly.
-- Use ONLY the file code and lightweight dependency context below.
-- Do not invent RAG sources, CI status, Git status, or hidden files.
-- Be practical for a developer.
-- Answer in the same language as the developer.
-- Stop writing as soon as the answer is complete. Do not add sign-offs,
-  closing remarks, or filler like "Let me know if you have questions" or
-  "Best regards". Write the answer exactly once, never repeat it.
+        return f"""You are Code Auditor AI, an expert developer assistant embedded in a live coding environment.
 
-Required structure:
-1. Role
-2. Main flow
-3. Dependencies
-4. Risks
-5. Suggestions
+{f"## Context{chr(10)}{ctx_header}{chr(10)}" if ctx_header else ""}
+## Instructions
+- Use ONLY the file code and dependency context provided below.
+- Never invent imports, classes, methods, CI status, Git status, or files not shown.
+- Be concrete and direct — you are talking to a senior developer.
+- Cite the exact file path and function name when you reference code.
+- Respond in the same language as the developer.
+- Structure: {structure_guide}
+- Stop as soon as the answer is complete. No sign-offs, no repetition.{method_focus}
 
-Target file: {target_file}
-Language: {language}
-{method_focus}
+## File context
+**File:** `{target_file}` | **Language:** {language}
+**Dependencies used:** {deps}
+**Used by:** {dependents}
 
-Dependencies used by target:
-{deps}
-
-Files depending on target:
-{dependents}
-
-File code:
 ```{language}
 {file_excerpt}
 ```
 
-Developer question:
-{question}
-"""
+## Developer question
+{question}"""
 
     def _build_context_prompt(self, state: Dict[str, Any]) -> tuple[ChatPromptTemplate, Dict[str, Any]]:
         history = state.get("history", [])[-8:]
-        rag_docs = state.get("rag_docs", [])[:6]
+        # AI settings from PostgreSQL (injected by node_load_ai_settings)
+        max_ctx       = state.get("ai_max_context", 8000)
+        response_style = state.get("ai_response_style", "detailed")
+        ai_mode       = state.get("ai_mode", "balanced")
+        use_rag       = state.get("ai_use_rag", True)
+
+        rag_docs = state.get("rag_docs", [])[:6] if use_rag else []
         project_summary = state.get("project_summary", {})
         file_code = state.get("file_code", "")
         file_analysis = state.get("file_analysis", {})
         deps = state.get("dependencies", [])
         dependents = state.get("dependents", [])
+        intent = state.get("intent", "question")
 
+        # Truncate history entries at 1500 chars (was 800) for better follow-up context
         history_text = "\n".join(
-            f"{h.get('role', '?')}: {h.get('content', '')[:800]}"
+            f"{h.get('role', '?')}: {h.get('content', '')[:1500]}"
             for h in history
         )
 
@@ -261,78 +283,112 @@ Developer question:
         except Exception:
             pass
 
-        file_excerpt = file_code[:3500] if file_code else ""
+        file_excerpt = file_code[:max_ctx] if file_code else ""
 
         intent_params = state.get("intent_params") or {}
         method_hint = intent_params.get("method_hint", "")
         method_focus = (
-            f"\nFOCUS: The developer is asking specifically about the method "
-            f"`{method_hint}`. Locate it in the file excerpt and explain ONLY that "
-            f"method: role, parameters, return value, side effects, risks.\n"
-            if method_hint
-            else ""
+            f"\nFOCUS: Locate `{method_hint}` in the file and explain it specifically: "
+            f"role, parameters, return value, side effects, risks.\n"
+            if method_hint else ""
         )
+
+        # Dynamic context header
+        ctx_header = self._context_header(state)
+
+        # Style directive from user settings
+        _style_hints = {
+            "concise":       "Be extremely brief. Only essential points, no elaboration.",
+            "detailed":      "Be thorough. Cover all relevant aspects with examples.",
+            "professional":  "Use formal technical language. Structured sections.",
+            "step_by_step":  "Break down into numbered steps. One action per step.",
+        }
+        _mode_hints = {
+            "fast":    "Prioritise speed. Short, direct answers.",
+            "strict":  "Be conservative. Flag any uncertainty. No assumptions.",
+            "deep":    "Perform deep analysis. Consider edge cases and performance.",
+            "balanced":"Balance depth and brevity.",
+        }
+        style_directive = _style_hints.get(response_style, "")
+        mode_directive  = _mode_hints.get(ai_mode, "")
+
+        # Intent-specific response structure
+        response_structure = {
+            "explain":          "Purpose → Key logic → Dependencies → Risks → Suggestions",
+            "code_analysis":    "What it does → How it works → Risks → Improvements",
+            "bug_fix":          "Problem → Root cause (cite file:line) → Fix → Verification steps",
+            "question":         "Direct answer → Evidence from codebase → Next action",
+            "complete_fn":      "Implementation → Explanation → Usage example",
+            "new_class":        "Class structure → Key methods → Integration points",
+        }.get(intent, "Direct answer → Key points → Concrete next step")
+
+        # Build a rich project summary string
+        proj_files = project_summary.get("files", {})
+        proj_summary_text = (
+            f"Languages: {list(proj_files.keys())}, "
+            f"Files: {sum(proj_files.values())} total"
+            if proj_files else str(project_summary)[:400]
+        )
+
+        system_msg = (
+            "You are Code Auditor AI, an expert developer assistant embedded in a live coding environment.\n\n"
+            "## Identity\n"
+            "You are a senior developer with deep knowledge of this specific project.\n"
+            "You reason from real code and real data — never from assumptions.\n\n"
+            + (f"## AI Mode: {ai_mode}\n{mode_directive}\n\n" if mode_directive else "")
+            + "## Developer context\n"
+            f"{ctx_header}\n"
+            f"Project: {proj_summary_text}\n\n"
+            "## Response rules\n"
+            f"- Structure for this question type ({intent}): {response_structure}\n"
+            + (f"- Style: {style_directive}\n" if style_directive else "")
+            + "- Cite exact file paths and function names when referencing code.\n"
+            "- Distinguish CERTAIN (data provided) | PROBABLE (inferred) | TO VERIFY (assumption).\n"
+            "- Format code with language-tagged fences.\n"
+            "- Warn about risks proactively.\n"
+            "- Respond in the same language as the developer.\n\n"
+            "## Strict output rules\n"
+            "- ONLY use information from the context below — never invent files, imports, CI status, or Git state.\n"
+            "- If context is insufficient, say so explicitly and ask for the missing info.\n"
+            "- Stop as soon as the answer is complete. No sign-offs, no repetition, no filler.\n"
+            f"{method_focus}"
+        )
+
+        # Escape literal { } in system_msg so LangChain doesn't treat them as
+        # template variables (proj_summary_text can contain dict repr with braces).
+        system_msg_safe = system_msg.replace("{", "{{").replace("}", "}}")
 
         prompt = ChatPromptTemplate.from_messages(
             [
-                (
-                    "system",
-                    "You are Code Auditor Assistant, embedded in a live coding environment.\n\n"
-                    "PERSONA:\n"
-                    "- You are a senior developer who knows this specific project deeply\n"
-                    "- You are direct, concrete, and never repeat information the developer already knows\n"
-                    "- You format code properly with language-tagged code fences\n"
-                    "- You warn about risks proactively if you see them\n\n"
-                    "CONTEXT RULES:\n"
-                    "- ONLY use information from the project context provided below\n"
-                    "- If you don't have enough context, say so explicitly\n"
-                    "- Never invent imports, classes, methods, files, CI status, or Git status\n"
-                    "- When explaining code, structure: purpose → key logic → risks → suggestions\n\n"
-                    "OUTPUT RULES (strict):\n"
-                    "- Stop writing as soon as the answer is complete. Do not continue.\n"
-                    "- Never add sign-offs, closing remarks, or filler such as "
-                    "'Let me know if you have questions', 'Best regards', 'Have a great day', "
-                    "or any repetition of the same sentence.\n"
-                    "- Write the answer exactly once. Do not restate or summarize it afterward.\n\n"
-                    "CURRENT PROJECT CONTEXT:\n"
-                    "{project_summary}\n\n"
-                    "DEPENDENCY MAP for {target_file}:\n"
-                    "- Uses: {deps}\n"
-                    "- Used by: {dependents}\n\n"
-                    "If {target_file} is mentioned, you know its exact content — don't guess.\n"
-                    "{method_focus}",
-                ),
+                ("system", system_msg_safe),
                 (
                     "human",
-                    "Conversation history:\n"
+                    "## Conversation history\n"
                     "{history}\n\n"
-                    "Target file: {target_file} ({language})\n\n"
-                    "Cached analysis:\n"
-                    "{analysis}\n\n"
-                    "File content:\n"
-                    "```{language}\n"
-                    "{file_excerpt}\n"
-                    "```\n\n"
-                    "RAG knowledge:\n"
+                    "## File context\n"
+                    "**File:** `{target_file}` | **Language:** {language}\n"
+                    "**Dependencies used:** {deps}\n"
+                    "**Used by:** {dependents}\n\n"
+                    "**Cached analysis:**\n{analysis}\n\n"
+                    "```{language}\n{file_excerpt}\n```\n\n"
+                    "## Knowledge base (RAG)\n"
                     "{docs}\n\n"
-                    "Developer question: {question}\n\n"
-                    "Answer in the same language as the developer. Be specific to this codebase.",
+                    "## Developer question\n"
+                    "{question}",
                 ),
             ]
         )
 
         inputs = {
-            "project_summary": project_summary,
-            "history": history_text or "(none)",
-            "target_file": state.get("target_file", ""),
-            "language": state.get("target_lang", "unknown"),
-            "deps": deps[:10],
-            "dependents": dependents[:10],
-            "analysis": analysis_text or "(none)",
+            "history":      history_text or "(no prior conversation)",
+            "target_file":  state.get("target_file", ""),
+            "language":     state.get("target_lang", "unknown"),
+            "deps":         deps[:10],
+            "dependents":   dependents[:10],
+            "analysis":     analysis_text or "(no cached analysis)",
             "file_excerpt": file_excerpt,
-            "docs": docs_text or "(no RAG docs found)",
-            "question": state.get("user_message", ""),
-            "method_focus": method_focus,
+            "docs":         docs_text or "(no RAG documents retrieved)",
+            "question":     state.get("user_message", ""),
         }
         return prompt, inputs
 

@@ -240,38 +240,47 @@ class MCPSonarQubeService:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def get_quality_gate_status(self, project_key: str) -> Dict[str, Any]:
+    def get_quality_gate_status(
+        self,
+        project_key: str,
+        pull_request: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Retourne le statut du Quality Gate pour un projet.
+
+        Args:
+            project_key:  Clé du projet SonarCloud
+            pull_request: Numéro de PR (ex: "20") — si fourni, retourne le
+                          statut de la PR, pas de la branche main.
 
         Returns:
             {
                 "status": "OK" | "ERROR" | "WARN" | "NONE",
-                "conditions": [
-                    {"metric": "coverage", "status": "ERROR",
-                     "actualValue": "65.3", "errorThreshold": "70"}
-                ]
+                "conditions": [...]
             }
         """
         # Essai MCP (si connecté)
         if self._mcp_available and self._session:
             try:
-                # Tool MCP : get_quality_gate_status ou équivalent
                 for tool_name in ["get_quality_gate_status", "qualityGates_project_status"]:
                     if tool_name in self._available_tools:
+                        args: Dict[str, Any] = {"projectKey": project_key}
+                        if pull_request:
+                            args["pullRequest"] = pull_request
                         result = _loop_manager.run(
-                            self._call_tool(tool_name, {"projectKey": project_key})
+                            self._call_tool(tool_name, args)
                         )
                         if result:
                             return self._normalize_gate(result)
             except Exception as e:
                 logger.debug("MCP quality gate failed: %s", e)
 
-        # Fallback REST
-        data = self._rest_call(
-            "qualitygates/project_status",
-            {"projectKey": project_key}
-        )
+        # Fallback REST — passer pullRequest si disponible pour obtenir le
+        # statut de la PR plutôt que celui de la branche main
+        params: Dict[str, str] = {"projectKey": project_key}
+        if pull_request:
+            params["pullRequest"] = pull_request
+        data = self._rest_call("qualitygates/project_status", params)
         if data and "projectStatus" in data:
             ps = data["projectStatus"]
             return {

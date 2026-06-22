@@ -1,9 +1,3 @@
-"""
-database/repositories/analysis_repo.py — Durable analysis history.
-
-These repos persist results that were previously only in Redis cache.
-Redis stays as the fast-read cache; PostgreSQL is the source of truth.
-"""
 from __future__ import annotations
 
 from datetime import datetime, timezone

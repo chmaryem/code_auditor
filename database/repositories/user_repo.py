@@ -1,8 +1,4 @@
-"""
-database/repositories/user_repo.py — CRUD for User and Project entities.
-"""
 from __future__ import annotations
-
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,7 +39,6 @@ class UserRepo:
         name: Optional[str] = None,
         role: str = "Developer",
     ) -> User:
-        """Create user on first login or update last_login_at. Mirrors auth/store.upsert_user."""
         email = email.strip().lower()
         user = await self.get_by_email(email)
         now = _now()
@@ -64,15 +59,13 @@ class UserRepo:
             last_login_at=now,
         )
         self.db.add(user)
-        await self.db.flush()  # populate user.id before returning
+        await self.db.flush() 
         return user
 
     async def deactivate(self, user_id: str) -> None:
         await self.db.execute(
             update(User).where(User.id == user_id).values(is_active=False)
         )
-
-    # ── Project helpers (owned by user) ────────────────────────────────────
 
     async def get_or_create_project(
         self,
@@ -117,6 +110,41 @@ class UserRepo:
             select(Project).where(
                 Project.owner_id == owner_id,
                 Project.path_hash == path_hash,
+            )
+        )
+        return result.scalar_one_or_none()
+
+
+    async def set_active_repo_by_email(self, email: str, github_repo: str) -> None:
+        """Persist owner/repo selection for a user (looked up by email)."""
+        await self.db.execute(
+            update(User)
+            .where(User.email == email.strip().lower())
+            .values(active_github_repo=github_repo.strip() or None)
+        )
+
+    async def get_active_repo_by_email(self, email: str) -> Optional[str]:
+        """Return the stored owner/repo string for a user, or None."""
+        result = await self.db.execute(
+            select(User.active_github_repo).where(
+                User.email == email.strip().lower()
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def set_github_token_by_email(self, email: str, token: Optional[str]) -> None:
+        """Persist a GitHub OAuth access token for a user."""
+        await self.db.execute(
+            update(User)
+            .where(User.email == email.strip().lower())
+            .values(github_token=token)
+        )
+
+    async def get_github_token_by_email(self, email: str) -> Optional[str]:
+        """Return the stored GitHub OAuth token for a user, or None."""
+        result = await self.db.execute(
+            select(User.github_token).where(
+                User.email == email.strip().lower()
             )
         )
         return result.scalar_one_or_none()

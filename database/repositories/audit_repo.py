@@ -1,9 +1,4 @@
-"""
-database/repositories/audit_repo.py — Append-only audit log.
 
-Audit logs are never updated or deleted via the API.
-Archival/retention enforcement is done externally (cron job or DB policy).
-"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -19,7 +14,7 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class AuditLogRepo:
+class AuditLogRepo: 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 

@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 code_actions_router = APIRouter(prefix="/code-actions", tags=["CodeActions"])
 
+# Limit concurrent LLM calls to avoid provider rate limits (Groq: 30 RPM)
+_llm_semaphore = asyncio.Semaphore(3)
+
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
 

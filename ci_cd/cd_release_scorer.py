@@ -113,8 +113,8 @@ class CDReleaseScorer:
       7. Migration file detection
     """
 
-    def __init__(self) -> None:
-        self._token = (
+    def __init__(self, token: Optional[str] = None) -> None:
+        self._token = token or (
             os.environ.get("GITHUB_TOKEN")
             or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
         )
@@ -165,7 +165,7 @@ class CDReleaseScorer:
             )
 
         # 2 ── SonarCloud Quality Gate (20 pts) ───────────────────────────────
-        sonar_score, sonar_detail = self._score_sonar_gate(project_key)
+        sonar_score, sonar_detail = self._score_sonar_gate(project_key, pr_number)
         components["sonar_gate"] = sonar_score
         details["sonar"] = sonar_detail
         if sonar_score < WEIGHTS["sonar_gate"] * 0.5:
@@ -324,6 +324,7 @@ class CDReleaseScorer:
     def _score_sonar_gate(
         self,
         project_key: str,
+        pr_number: Optional[int] = None,
     ) -> tuple[float, Dict[str, Any]]:
         """Score based on SonarCloud Quality Gate status."""
         max_pts = WEIGHTS["sonar_gate"]
@@ -332,7 +333,7 @@ class CDReleaseScorer:
         try:
             from services.mcp_sonarqube_service import get_mcp_sonarqube
             sonar = get_mcp_sonarqube()
-            gate    = sonar.get_quality_gate_status(project_key)
+            gate    = sonar.get_quality_gate_status(project_key, pull_request=str(pr_number) if pr_number else None)
             metrics = sonar.get_project_metrics(project_key)
             status  = gate.get("status", "NONE")
             score   = {

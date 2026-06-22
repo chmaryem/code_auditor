@@ -1,17 +1,21 @@
 """
-services/persistent_chat_memory_service.py — Dual-write chat memory.
+services/persistent_chat_memory_service.py — Dual-layer chat memory.
 
-Write path (save_exchange):
-  1. Write to PostgreSQL  → durable, survives logout and server restart
-  2. Write to Redis cache → fast reads during active session (TTL: 1h)
+Architecture:
+  PostgreSQL = source de vérité durable (conversations + messages).
+  Redis      = cache chaud pour la session active (TTL 1 h).
 
-Read path (load_history):
-  1. Try Redis first     → fast, hot data
-  2. Fall back to PG     → cold start, after logout, Redis eviction
+Write path (save_exchange / save_exchange_sync):
+  1. PostgreSQL → durabilité garantie, survit au logout et au redémarrage
+  2. Redis      → lecture rapide pendant la session active
+
+Read path (load_history / list_sessions):
+  1. Redis first → fast path (cache chaud)
+  2. PG fallback → cold start, après logout, expiration TTL Redis
 
 Session lifecycle:
-  - Logout: Redis key expires/is removed; PostgreSQL row stays forever
-  - Login : Redis cache is rebuilt lazily on first read from PG
+  - Logout : clés Redis expirées/supprimées ; lignes PG intactes pour toujours
+  - Login  : cache Redis reconstruit paresseusement au premier read depuis PG
 """
 from __future__ import annotations
 
@@ -197,19 +201,162 @@ class PersistentChatMemoryService:
             for c in convs
         ]
 
+    # ── Sync API (background threads uniquement) ─────────────────────────────
+
+    def save_exchange_sync(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_response: str,
+        user_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        project_path: str = "",
+        intent: Optional[str] = None,
+    ) -> None:
+        """
+        Persiste un échange user↔assistant depuis un thread background.
+
+        Utilise SyncSessionLocal (psycopg2) — ne jamais appeler depuis un
+        contexte asyncio.  Résout l'email via auth.store pour retrouver
+        l'utilisateur PG correspondant au Redis user_id.
+
+        Ordre d'écriture :
+          1. PostgreSQL (durable) — le cache Redis est inutile si PG échoue
+          2. Redis (cache chaud)
+        """
+        from database.connection import SyncSessionLocal
+        from database.models import Conversation, Message, User
+        from datetime import datetime, timezone
+        from sqlalchemy import select, update as sa_update
+
+        def _now() -> datetime:
+            return datetime.now(timezone.utc)
+
+        # ── Résolution email depuis le store Redis auth ────────────────────
+        user_email = ""
+        try:
+            from auth.store import get_user as _get_auth_user
+            auth_user = _get_auth_user(user_id) or {}
+            user_email = auth_user.get("email", "")
+        except Exception as exc:
+            logger.debug("save_exchange_sync: cannot resolve email for user_id=%s: %s", user_id, exc)
+
+        if not user_email or user_email == "local@localhost":
+            logger.debug(
+                "save_exchange_sync: skipping PG write — no valid email "
+                "(user_id=%s, session=%s)", user_id, session_id,
+            )
+            # Écriture Redis uniquement pour ne pas perdre la session active
+            self._write_redis_cache(session_id, user_message, assistant_response, metadata, project_path)
+            return
+
+        title = _make_title(user_message)
+
+        # ── 1. PostgreSQL (source de vérité) ──────────────────────────────
+        try:
+            with SyncSessionLocal() as db:
+                # Upsert utilisateur PG
+                pg_user = db.execute(
+                    select(User).where(User.email == user_email)
+                ).scalar_one_or_none()
+                if not pg_user:
+                    pg_user = User(
+                        email=user_email,
+                        name=user_email.split("@")[0],
+                        role="Developer",
+                    )
+                    db.add(pg_user)
+                    db.flush()
+
+                # Get-or-create conversation
+                conv = db.execute(
+                    select(Conversation).where(Conversation.session_id == session_id)
+                ).scalar_one_or_none()
+                if not conv:
+                    conv = Conversation(
+                        session_id=session_id,
+                        user_id=pg_user.id,
+                        title=title,
+                        intent=intent,
+                        created_at=_now(),
+                        updated_at=_now(),
+                    )
+                    db.add(conv)
+                    db.flush()
+
+                # Append messages
+                db.add(Message(
+                    conversation_id=conv.id,
+                    role="user",
+                    content=user_message,
+                    metadata_=metadata,
+                    created_at=_now(),
+                ))
+                db.add(Message(
+                    conversation_id=conv.id,
+                    role="assistant",
+                    content=assistant_response,
+                    metadata_=metadata,
+                    created_at=_now(),
+                ))
+
+                # Bump conversation metadata
+                new_title = title if (not conv.title or conv.title == "New conversation") else conv.title
+                db.execute(
+                    sa_update(Conversation)
+                    .where(Conversation.id == conv.id)
+                    .values(
+                        turn_count=conv.turn_count + 2,
+                        updated_at=_now(),
+                        title=new_title,
+                        intent=intent or conv.intent,
+                    )
+                )
+                db.commit()
+        except Exception as exc:
+            logger.warning(
+                "save_exchange_sync: PG write failed (session=%s): %s",
+                session_id, exc,
+            )
+
+        # ── 2. Redis (cache chaud) ────────────────────────────────────────
+        self._write_redis_cache(session_id, user_message, assistant_response, metadata, project_path)
+
+    def _write_redis_cache(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_response: str,
+        metadata: Optional[Dict[str, Any]],
+        project_path: str,
+    ) -> None:
+        """Délégation vers ChatMemoryService pour le cache Redis."""
+        try:
+            self._redis.save_exchange(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_response=assistant_response,
+                metadata=metadata,
+                project_path=project_path,
+            )
+        except Exception as exc:
+            logger.debug("_write_redis_cache failed (session=%s): %s", session_id, exc)
+
+    # ── Invalidation ─────────────────────────────────────────────────────────
+
     def invalidate_redis_cache(self, session_id: str) -> None:
         """
-        Called on logout to remove the Redis cache for a session.
-        PostgreSQL data is NOT touched — history survives.
+        Supprime les clés Redis pour une session (appelé au logout).
+        Les données PostgreSQL ne sont PAS touchées — l'historique survit.
         """
         redis = self._get_redis()
         if redis:
             try:
                 redis.delete(self._redis_history_key(session_id))
                 redis.delete(f"ca:chat:{session_id}:meta")
-            except Exception as e:
-                logger.debug("invalidate_redis_cache error: %s", e)
+            except Exception as exc:
+                logger.debug("invalidate_redis_cache error: %s", exc)
 
 
-# Module-level singleton — injected into lc_chat_agent via dependency
+# Singleton module-level — partagé par chat_router et node_memory_save
 persistent_chat_memory = PersistentChatMemoryService()

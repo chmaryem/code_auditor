@@ -29,8 +29,11 @@ import threading
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.security import Principal, get_current_user
+from database.connection import get_db
+from database.repositories.user_repo import UserRepo
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +79,11 @@ class GitTestImpactRequest(BaseModel):
     project_path:  str          = Field(..., description="Absolute path to git project")
     changed_files: List[str]    = Field(default_factory=list, description="Files to analyze (empty = staged)")
     session_id:    str          = Field("", description="Optional session ID")
+
+class GitCommitReadinessRequest(BaseModel):
+    project_path:   str = Field(..., description="Absolute path to git project")
+    commit_message: str = Field("", description="Message to validate (empty = read COMMIT_EDITMSG)")
+    session_id:     str = Field("", description="Optional session ID")
 
 class GitCrossPRRequest(BaseModel):
     owner:      str = Field(..., description="GitHub owner")
@@ -127,6 +135,26 @@ class GitResponse(BaseModel):
     cross_pr_report:    Dict[str, Any]  = Field(default_factory=dict)
     pr_description:     Dict[str, Any]  = Field(default_factory=dict)
     errors:             List[str]       = Field(default_factory=list)
+
+
+# ── Git context status ────────────────────────────────────────────────────────
+
+@git_router.get("/status")
+async def get_git_status(
+    principal: Principal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the GitHub connection context for Smart Git (repo + token presence)."""
+    async with db.begin():
+        repo_str = await UserRepo(db).get_active_repo_by_email(principal.email)
+        token    = await UserRepo(db).get_github_token_by_email(principal.email)
+    owner, repo = (repo_str.split("/", 1) if repo_str and "/" in repo_str else ("", ""))
+    return {
+        "connected": bool(token),
+        "owner":     owner,
+        "repo":      repo,
+        "full_name": repo_str or "",
+    }
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
@@ -201,7 +229,11 @@ def _pg_save_git_report(
                     db.flush()
 
                 # 3. persist git report
-                db.add(GitReport(
+                import uuid as _uuid_mod
+                from datetime import datetime, timezone
+                report_id = _uuid_mod.uuid4().hex
+                git_row = GitReport(
+                    id          = report_id,
                     project_id  = project.id,
                     report_type = report_type,
                     branch      = branch or None,
@@ -211,8 +243,58 @@ def _pg_save_git_report(
                     total_score = total_score,
                     summary     = summary[:2000] if summary else None,
                     raw_data    = raw_data,
+                )
+                db.add(git_row)
+                db.flush()
+
+                # 4. emit history event
+                from database.models import HistoryEvent
+                _now = datetime.now(timezone.utc)
+                _type_labels = {
+                    "pr_review":    "PR Review",
+                    "branch":       "Branch Analysis",
+                    "commit_lint":  "Commit Lint",
+                    "secret_scan":  "Secret Scan",
+                    "test_impact":  "Test Impact",
+                }
+                _label = _type_labels.get(report_type, report_type.replace("_", " ").title())
+                _verdict_sev = {"APPROVED": "info", "BLOCKED": "error", "NEEDS_CHANGES": "warning"}
+                _severity = _verdict_sev.get(verdict, "info") if verdict else "info"
+                _title = f"{_label} — {github_slug or path_key.split('/')[-1]}"
+                _summary_text = summary[:200] if summary else f"Score {total_score}/100" if total_score else ""
+                db.add(HistoryEvent(
+                    id            = _uuid_mod.uuid4().hex,
+                    user_id       = pg_user.id,
+                    project_id    = project.id,
+                    event_type    = f"git_{report_type}",
+                    source_module = "smart_git",
+                    source_id     = report_id,
+                    title         = _title,
+                    summary       = _summary_text[:300],
+                    severity      = _severity,
+                    status        = "completed",
+                    metadata_     = {
+                        "report_type": report_type,
+                        "verdict":     verdict,
+                        "pr_number":   pr_number or None,
+                        "branch":      branch or None,
+                    },
+                    created_at    = _now,
                 ))
                 db.commit()
+
+                # 5. invalidate redis cache + notify WS clients
+                try:
+                    from services import history_cache_service as _hcs
+                    _hcs.invalidate(pg_user.id)
+                except Exception:
+                    pass
+                try:
+                    from api.ws_broadcast import broadcast_from_thread
+                    broadcast_from_thread({"type": "history_update", "module": "smart_git"})
+                except Exception:
+                    pass
+
         except Exception as _exc:
             logger.debug("git_router: PG save failed (%s): %s", report_type, _exc)
 
@@ -713,6 +795,66 @@ async def git_test_impact(req: GitTestImpactRequest, user: Principal = Depends(g
     )
 
     return _to_response(result, round(time.time() - t0, 2))
+
+
+# ── F5: Commit Readiness (aggregate) ──────────────────────────────────────────
+
+@git_router.post("/commit-readiness", response_model=GitResponse, summary="Aggregate commit readiness")
+async def git_commit_readiness(req: GitCommitReadinessRequest, user: Principal = Depends(get_current_user)):
+    """
+    Agrège les cinq checks locaux (secrets, conflicts, lint, test impact, session)
+    en un verdict unique : score 0-100 + verdict READY/WARN/BLOCKED + blockers.
+
+    Appel DIRECT des modules smart_git (pas le LangGraph) → rapide, déterministe,
+    0 token LLM. Le résultat est exposé dans `readiness_report`.
+    """
+    project_path = Path(req.project_path)
+    if not project_path.exists():
+        raise HTTPException(404, f"Projet introuvable : {project_path}")
+
+    t0 = time.time()
+    try:
+        # Appel synchrone (git CLI + regex) déporté hors de l'event loop.
+        from smart_git.git_commit_readiness import evaluate_commit_readiness
+
+        def _run() -> Dict[str, Any]:
+            return evaluate_commit_readiness(
+                project_path,
+                commit_message=req.commit_message,
+            ).to_dict()
+
+        readiness = await asyncio.to_thread(_run)
+    except Exception as e:
+        logger.exception("git/commit-readiness error")
+        raise HTTPException(500, f"commit-readiness error: {e}")
+
+    verdict = str(readiness.get("verdict", ""))
+    score   = readiness.get("score")
+    summary = (
+        f"{verdict} · score {score}/100 · "
+        f"{len(readiness.get('blockers', []))} blocker(s)"
+    )
+
+    _pg_save_git_report(
+        user_email  = user.email,
+        report_type = "commit_readiness",
+        raw_data    = {"readiness_report": readiness},
+        local_path  = str(project_path),
+        branch      = readiness.get("branch", ""),
+        verdict     = verdict,
+        total_score = score if isinstance(score, int) else None,
+        summary     = summary,
+    )
+
+    return GitResponse(
+        response         = summary,
+        intent           = "commit_readiness",
+        confidence       = 1.0,
+        safe_mode        = True,
+        elapsed_seconds  = round(time.time() - t0, 2),
+        readiness_report = readiness,
+        errors           = [readiness["error"]] if readiness.get("error") else [],
+    )
 
 
 # ── F6: Cross-PR Conflicts ────────────────────────────────────────────────────

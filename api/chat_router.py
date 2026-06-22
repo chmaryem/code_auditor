@@ -41,16 +41,20 @@ chat_router = APIRouter(prefix="/chat", tags=["ChatAgent"])
 
 class ChatRequest(BaseModel):
     """Q&A / explain request."""
-    message:         str = Field(..., description="Developer question or request")
-    project_path:    str = Field(".", description="Project root (absolute or relative)")
-    session_id:      str = Field("", description="Session ID for conversation continuity")
-    target_file:     str = Field("", description="Optional file to focus on (path or filename)")
+    message:           str = Field(..., description="Developer question or request")
+    project_path:      str = Field(".", description="Project root (absolute or relative)")
+    session_id:        str = Field("", description="Session ID for conversation continuity")
+    target_file:       str = Field("", description="Optional file to focus on (path or filename)")
     # IDE cursor context (sent by VS Code extension)
-    cursor_line:     int = Field(0,  description="Line number under cursor (0 = unknown)")
-    active_function: str = Field("", description="Function/method name under cursor")
-    selected_text:   str = Field("", description="Currently selected code (empty if none)")
-    visible_range:   list[int] = Field(default_factory=lambda: [0, 0],
-                                       description="[start_line, end_line] of visible editor area")
+    cursor_line:       int = Field(0,  description="Line number under cursor (0 = unknown)")
+    active_function:   str = Field("", description="Function/method name under cursor")
+    selected_text:     str = Field("", description="Currently selected code (empty if none)")
+    visible_range:     list[int] = Field(default_factory=lambda: [0, 0],
+                                         description="[start_line, end_line] of visible editor area")
+    # Dashboard context (sent by React webview)
+    active_module:     str = Field("", description="Active dashboard module: cicd|git|chat|analyze|tests")
+    branch:            str = Field("", description="Current git branch")
+    active_repository: str = Field("", description="Name of the active repository")
 
 
 class CompletionRequest(BaseModel):
@@ -124,6 +128,9 @@ async def _run_chat(
     active_function: str = "",
     selected_text: str = "",
     visible_range: list | None = None,
+    active_module: str = "",
+    branch: str = "",
+    active_repository: str = "",
 ) -> ChatResponse:
     """Run ainvoke_chat() and map the result to ChatResponse."""
     from langchain_agents.graphs.chat_graph import ainvoke_chat
@@ -140,6 +147,9 @@ async def _run_chat(
             active_function=active_function,
             selected_text=selected_text,
             visible_range=visible_range or [0, 0],
+            active_module=active_module,
+            branch=branch,
+            active_repository=active_repository,
         )
     except Exception as e:
         logger.exception("ainvoke_chat failed: %s", e)
@@ -185,15 +195,18 @@ def _safe_write_generated_file(project_path: str, suggested_file: str, code: str
 async def chat(req: ChatRequest, user: Principal = Depends(get_current_user)):
     """Project-aware Q&A and code explanation with IDE cursor context."""
     return await _run_chat(
-        message         = req.message,
-        project_path    = req.project_path,
-        session_id      = req.session_id,
-        user_id         = user.id,
-        target_file     = req.target_file,
-        cursor_line     = req.cursor_line,
-        active_function = req.active_function,
-        selected_text   = req.selected_text,
-        visible_range   = req.visible_range,
+        message           = req.message,
+        project_path      = req.project_path,
+        session_id        = req.session_id,
+        user_id           = user.id,
+        target_file       = req.target_file,
+        cursor_line       = req.cursor_line,
+        active_function   = req.active_function,
+        selected_text     = req.selected_text,
+        visible_range     = req.visible_range,
+        active_module     = req.active_module,
+        branch            = req.branch,
+        active_repository = req.active_repository,
     )
 
 
@@ -213,11 +226,18 @@ async def chat_stream(req: ChatRequest, user: Principal = Depends(get_current_us
     async def event_generator():
         try:
             async for chunk in stream_chat(
-                message=req.message,
-                project_path=req.project_path,
-                session_id=req.session_id,
-                user_id=user.id,
-                target_file=req.target_file,
+                message           = req.message,
+                project_path      = req.project_path,
+                session_id        = req.session_id,
+                user_id           = user.id,
+                target_file       = req.target_file,
+                cursor_line       = req.cursor_line,
+                active_function   = req.active_function,
+                selected_text     = req.selected_text,
+                visible_range     = req.visible_range,
+                active_module     = req.active_module,
+                branch            = req.branch,
+                active_repository = req.active_repository,
             ):
                 yield chunk
         except asyncio.CancelledError:
@@ -290,14 +310,54 @@ async def generate_class(req: GenerateClassRequest, user: Principal = Depends(ge
     response_model=SessionHistoryResponse,
     summary="Get conversation history",
 )
-async def get_history(session_id: str):
-    """Retrieve the conversation history for a session."""
+async def get_history(
+    session_id: str,
+    user: Principal = Depends(get_current_user),
+):
+    """
+    Retourne l'historique d'une session.
+
+    Stratégie de lecture :
+      1. Redis (cache chaud, TTL 1 h)
+      2. PostgreSQL en fallback (source de vérité durable)
+
+    La vérification de propriété se fait côté PG : si la conversation
+    n'appartient pas à l'utilisateur connecté, elle n'est pas retournée.
+    """
+    from services.chat_memory_service import chat_memory_service
+    from database.connection import AsyncSessionLocal
+    from database.repositories.conversation_repo import ConversationRepo
+    from database.repositories.user_repo import UserRepo
+
+    # ── 1. Cache Redis (fast path) ────────────────────────────────────────
+    history: List[Dict[str, Any]] = []
     try:
-        from services.chat_memory_service import chat_memory_service
         history = await asyncio.to_thread(chat_memory_service.load_history, session_id)
-    except Exception as e:
-        logger.warning("load_history failed: %s", e)
-        history = []
+    except Exception as exc:
+        logger.debug("get_history: Redis read failed: %s", exc)
+
+    # ── 2. Fallback PostgreSQL si Redis vide ──────────────────────────────
+    if not history:
+        try:
+            async with AsyncSessionLocal() as db:
+                user_repo   = UserRepo(db)
+                conv_repo   = ConversationRepo(db)
+
+                pg_user = await user_repo.get_by_email(user.email)
+                if pg_user:
+                    conv = await conv_repo.get_by_session_id(session_id)
+                    if conv and conv.user_id == pg_user.id:
+                        messages = await conv_repo.load_messages(conv.id, limit=100)
+                        history = [
+                            {
+                                "role":     m.role,
+                                "content":  m.content,
+                                "metadata": m.metadata_ or {},
+                            }
+                            for m in messages
+                        ]
+        except Exception as exc:
+            logger.warning("get_history: PG fallback failed (session=%s): %s", session_id, exc)
 
     turns = [
         HistoryEntry(
@@ -319,32 +379,98 @@ async def get_history(session_id: str):
     "/history/{session_id}",
     summary="Clear conversation history",
 )
-async def clear_history(session_id: str):
-    """Clear the conversation history for a session and remove it from the sidebar index."""
+async def clear_history(
+    session_id: str,
+    user: Principal = Depends(get_current_user),
+):
+    """
+    Supprime l'historique Redis d'une session et l'invalide dans l'index.
+    Les lignes PostgreSQL sont conservées (soft-delete côté cache uniquement).
+    L'endpoint vérifie que la session appartient à l'utilisateur connecté.
+    """
+    from services.chat_memory_service import chat_memory_service
+    from services.persistent_chat_memory_service import persistent_chat_memory
+    from database.connection import AsyncSessionLocal
+    from database.repositories.conversation_repo import ConversationRepo
+    from database.repositories.user_repo import UserRepo
+
+    # Vérification de propriété via PostgreSQL
     try:
-        from services.chat_memory_service import chat_memory_service
+        async with AsyncSessionLocal() as db:
+            pg_user = await UserRepo(db).get_by_email(user.email)
+            if pg_user:
+                conv = await ConversationRepo(db).get_by_session_id(session_id)
+                if conv and conv.user_id != pg_user.id:
+                    return {"status": "forbidden", "session_id": session_id}
+    except Exception as exc:
+        logger.debug("clear_history: ownership check failed: %s", exc)
+
+    # Suppression Redis (source PG intacte)
+    try:
         await asyncio.to_thread(chat_memory_service.clear_session, session_id)
+        persistent_chat_memory.invalidate_redis_cache(session_id)
         return {"status": "cleared", "session_id": session_id}
-    except Exception as e:
-        logger.warning("clear_session failed: %s", e)
-        return {"status": "error", "detail": str(e)}
+    except Exception as exc:
+        logger.warning("clear_history failed (session=%s): %s", session_id, exc)
+        return {"status": "error", "detail": str(exc)}
 
 
 @chat_router.get(
     "/sessions",
     response_model=SessionListResponse,
-    summary="List past conversations for a project",
+    summary="List past conversations for the authenticated user",
 )
-async def list_sessions(project_path: str = ".", limit: int = 50):
-    """List past chat sessions for a project, most recent first — powers the history sidebar."""
+async def list_sessions(
+    project_path: str = ".",
+    limit: int = 50,
+    user: Principal = Depends(get_current_user),
+):
+    """
+    Liste les conversations de l'utilisateur connecté, les plus récentes en premier.
+
+    Stratégie :
+      1. PostgreSQL (source de vérité, scopé par user_id) — résultats fiables
+         même après un logout/login ou une expiration Redis.
+      2. Enrichissement Redis pour les sessions dont le cache est encore chaud.
+
+    Le project_path est utilisé comme filtre optionnel.
+    """
+    from database.connection import AsyncSessionLocal
+    from database.repositories.conversation_repo import ConversationRepo
+    from database.repositories.user_repo import UserRepo
+
+    sessions: List[Dict[str, Any]] = []
+
     try:
-        from services.chat_memory_service import chat_memory_service
-        sessions = await asyncio.to_thread(
-            chat_memory_service.list_sessions, project_path, limit
-        )
-    except Exception as e:
-        logger.warning("list_sessions failed: %s", e)
-        sessions = []
+        async with AsyncSessionLocal() as db:
+            pg_user = await UserRepo(db).get_by_email(user.email)
+            if pg_user:
+                convs = await ConversationRepo(db).list_for_user(
+                    user_id=pg_user.id,
+                    limit=limit,
+                )
+                sessions = [
+                    {
+                        "session_id": c.session_id,
+                        "title":      c.title or "New conversation",
+                        "updated_at": int(c.updated_at.timestamp()),
+                        "turn_count": c.turn_count,
+                    }
+                    for c in convs
+                ]
+    except Exception as exc:
+        logger.warning("list_sessions: PG read failed (user=%s): %s", user.email, exc)
+
+    # Fallback Redis si PG vide (ex. base non migrée ou premier démarrage)
+    if not sessions:
+        try:
+            from services.chat_memory_service import chat_memory_service
+            redis_sessions = await asyncio.to_thread(
+                chat_memory_service.list_sessions, project_path, limit
+            )
+            sessions = redis_sessions
+        except Exception as exc:
+            logger.debug("list_sessions: Redis fallback also failed: %s", exc)
 
     return SessionListResponse(
         sessions=[SessionSummary(**s) for s in sessions]

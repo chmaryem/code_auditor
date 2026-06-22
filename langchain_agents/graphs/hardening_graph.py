@@ -335,6 +335,125 @@ def node_plan(state: HardeningState) -> Dict[str, Any]:
 # Node: fix
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _extract_fix_from_code_block(
+    raw_text: str,
+    source_code: str,
+    language: str,
+    issue: Dict[str, Any],
+    file_path: str,
+) -> "Dict[str, Any] | None":
+    """
+    Last-resort fix extractor for weak models (llama, scout) that produce
+    a narrative response with a single fenced code block instead of using
+    the ---FIX START--- / ---FIX END--- markers.
+
+    Strategy:
+      1. Find all fenced ```<lang> ... ``` blocks in the response.
+      2. Keep only blocks that look like a function/method fix (not a full file).
+      3. Try to locate the matching current_code in source_code:
+         a. Match by function name extracted from the fixed block.
+         b. Fall back to the targeted issue line number (±5 lines context).
+      4. Return a fix dict compatible with node_verify / node_decide.
+
+    Returns None if no usable code block is found.
+    """
+    import re
+
+    if not raw_text or not source_code:
+        return None
+
+    lang_tag = language.lower()
+    # Match fenced code blocks for this language (or generic ```)
+    pattern = re.compile(
+        rf"```(?:{re.escape(lang_tag)}|python3|py)?\s*\n(.*?)```",
+        re.DOTALL | re.IGNORECASE,
+    )
+    blocks = [m.group(1).strip() for m in pattern.finditer(raw_text) if m.group(1).strip()]
+
+    if not blocks:
+        return None
+
+    # Prefer the LAST code block — models often echo context first then provide the fix last
+    for candidate in reversed(blocks):
+        # Skip trivially small or obviously non-code blocks
+        if len(candidate) < 20 or candidate.count("\n") < 1:
+            continue
+
+        # Skip blocks that look like full-file rewrites (too large relative to source)
+        if len(candidate) > len(source_code) * 0.8 and len(source_code) > 200:
+            continue
+
+        # ── Try to find matching current_code by function name ─────────────────
+        func_match = re.search(
+            r"^\s*def\s+(\w+)\s*\(", candidate, re.MULTILINE
+        )
+        current_code: "str | None" = None
+
+        if func_match:
+            fn_name = func_match.group(1)
+            # Find the function in source_code
+            src_fn = re.search(
+                rf"^\s*def\s+{re.escape(fn_name)}\s*\(",
+                source_code, re.MULTILINE,
+            )
+            if src_fn:
+                # Extract the full function body from source
+                start = src_fn.start()
+                # Walk forward to find end of function (next def at same indent or EOF)
+                indent_m = re.match(r"(\s*)", source_code[start:])
+                base_indent = len(indent_m.group(1)) if indent_m else 0
+                next_fn = re.search(
+                    rf"^[ \t]{{{base_indent}}}(?:def |class |\S)",
+                    source_code[src_fn.end():],
+                    re.MULTILINE,
+                )
+                if next_fn:
+                    end = src_fn.end() + next_fn.start()
+                else:
+                    end = len(source_code)
+                current_code = source_code[start:end].rstrip()
+
+        # ── Fallback: use issue line number context (±10 lines) ────────────────
+        if not current_code:
+            target_line = issue.get("line")
+            if target_line and isinstance(target_line, int):
+                src_lines = source_code.splitlines()
+                lo = max(0, target_line - 6)
+                hi = min(len(src_lines), target_line + 5)
+                current_code = "\n".join(src_lines[lo:hi])
+
+        if not current_code or not current_code.strip():
+            continue
+
+        # Don't offer a fix if the candidate is identical to what's already there
+        if candidate.strip() == current_code.strip():
+            continue
+
+        explanation = ""
+        # Try to extract an explanation from the surrounding text
+        exp_match = re.search(
+            r"(?:fix|solution|change|replace|update)[:\s]+([^\n.]{10,150})",
+            raw_text, re.IGNORECASE,
+        )
+        if exp_match:
+            explanation = exp_match.group(1).strip()
+
+        return {
+            "title":        f"Fix: {issue.get('message', 'issue')[:80]}",
+            "file_path":    file_path,
+            "file":         Path(file_path).name,
+            "line":         issue.get("line"),
+            "current_code": current_code,
+            "fixed_code":   candidate,
+            "explanation":  explanation or "Code-block fix extracted from model response.",
+            "fix_preview":  f"- {current_code[:200]}\n+ {candidate[:200]}",
+            "language":     language,
+            "apply_mode":   "replace_snippet",
+        }
+
+    return None
+
+
 def node_fix(state: HardeningState) -> Dict[str, Any]:
     """
     Generate a targeted fix for current_issue.
@@ -422,6 +541,7 @@ def node_fix(state: HardeningState) -> Dict[str, Any]:
     # ── LLM fix with FULL KB intelligence ─────────────────────────────────────
     t0 = time.time()
     current_fix = None
+    raw_text = ""
     try:
         result   = lc_analysis_agent.analyze(
             code=source_code,
@@ -444,6 +564,18 @@ def node_fix(state: HardeningState) -> Dict[str, Any]:
 
     except Exception as e:
         logger.exception("node_fix LLM failed: %s", e)
+
+    # ── Fallback: code-block extraction for weak models (llama, scout…) ───────
+    # Groq/llama models frequently ignore ---FIX START--- markers and instead
+    # produce one fenced ```python block containing the corrected function/method.
+    # When all primary parsers return nothing, try to extract that block and
+    # identify the exact lines it replaces in source_code.
+    if not current_fix and raw_text:
+        current_fix = _extract_fix_from_code_block(
+            raw_text, source_code, language, issue, file_path
+        )
+        if current_fix:
+            print(f"    {_YL}code-block fallback triggered — weak model output{_R}")
 
     elapsed = time.time() - t0
     has_fix = bool(current_fix and current_fix.get("fixed_code", "").strip())

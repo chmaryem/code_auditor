@@ -152,6 +152,11 @@ class ChatState(TypedDict, total=False):
     target_file: Optional[str]
     target_lang: str
 
+    # ── Dashboard context (sent by the React webview) ─────────────────────────
+    active_module: str        # current dashboard module: cicd | git | chat | analyze | tests
+    branch: str               # current git branch
+    active_repository: str    # name of the active repository (from dashboard)
+
     # ── IDE Cursor context (VS Code extension → API) ─────────────────────────
     cursor_line: int             # 0 = unknown
     active_function: str         # name of function/method under cursor
@@ -207,6 +212,15 @@ class ChatState(TypedDict, total=False):
     code_blocks: List[Dict[str, Any]]
     suggested_files: List[str]
     stats: Dict[str, Any]
+
+    # ── AI Settings (loaded from PostgreSQL per user, defaults used if absent) ──
+    ai_temperature: float        # 0.0–1.0, default 0.3
+    ai_mode: str                 # "fast" | "balanced" | "deep" | "strict"
+    ai_response_style: str       # "concise" | "detailed" | "professional" | "step_by_step"
+    ai_use_rag: bool             # enable/disable RAG retrieval
+    ai_use_memory: bool          # enable/disable conversation memory
+    ai_max_context: int          # max chars fed to LLM (default 8000)
+    ai_streaming: bool           # SSE streaming toggle
 
     # ── Injected services ───────────────────────────────────────────────────
     _rag_system: Any

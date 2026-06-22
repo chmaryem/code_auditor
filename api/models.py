@@ -142,6 +142,22 @@ class GenerateTestsResponse(BaseModel):
     cached: bool = Field(False, description="True si le résultat vient du cache Redis")
 
 
+# ── Run Tests (existing file, no LLM) ────────────────────────────────────────
+
+class RunTestsRequest(BaseModel):
+    test_file: str = Field(..., description="Chemin absolu du fichier de test à exécuter")
+    project_path: str = Field("", description="Racine du projet (répertoire de travail)")
+    language: str = Field("python", description="Langage : python | javascript | typescript | java")
+
+
+class RunTestsResponse(BaseModel):
+    test_file: str = ""
+    run_success: bool = False
+    run_error_summary: Optional[str] = None
+    duration_seconds: float = 0.0
+    error: str = ""
+
+
 # ── WebSocket Events ─────────────────────────────────────────────────────────
 # These are the events broadcast via /ws to the VS Code plugin.
 # The plugin receives a JSON object with a "type" discriminator field.

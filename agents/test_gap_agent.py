@@ -162,20 +162,20 @@ class TestGapAgent:
         """Construit une phrase explicative courte pour l'affichage."""
         parts = []
         if status.missing:
-            parts.append(f"aucun test pour {status.source_file.name}")
+            parts.append(f"no tests for {status.source_file.name}")
         else:
             missing = len(status.untested_entities)
             total = missing + len(status.tested_entities)
             if missing > 0:
-                parts.append(f"couverture {total - missing}/{total}")
+                parts.append(f"coverage {total - missing}/{total}")
             else:
-                parts.append("couverture complète")
+                parts.append("full coverage")
 
         if status.untested_entities:
             ents = ", ".join(status.untested_entities[:3])
             if len(status.untested_entities) > 3:
                 ents += f" +{len(status.untested_entities) - 3}"
-            parts.append(f"sans test : {ents}")
+            parts.append(f"missing: {ents}")
 
         return " — ".join(parts)
 
