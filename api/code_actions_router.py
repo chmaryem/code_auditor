@@ -1,16 +1,3 @@
-"""
-api/code_actions_router.py — Code Actions API for VS Code plugin.
-
-Endpoints:
-  POST /api/code-actions             — Generate VS Code CodeActions for a selection
-  POST /api/code-actions/quick-fix   — Quick fix for a specific diagnostic
-  POST /api/code-actions/refactor    — Targeted refactoring suggestions
-
-These endpoints power:
-  - vscode.CodeActionProvider (the lightbulb menu)
-  - Right-click → Refactor menu
-  - Diagnostic quick fixes in Problems panel
-"""
 from __future__ import annotations
 
 import asyncio

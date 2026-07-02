@@ -1474,10 +1474,25 @@ def _attach_fixes_to_issues(issues: list, fixes: list) -> list:
 # weak model echoing the output template — never a real finding. Matched
 # case-insensitively against an issue title/message or a fix's code.
 _PARSER_ARTIFACTS = (
-    "structured_output", "structured output", "---decision",
+    # Structured output delimiters
+    "structured_output", "structured output", "<structured", "</structured",
+    # LLM chain-of-thought section headers (with --- / # prefix — never in real titles)
+    "---decision", "---analysis", "---fix", "# issues", "## issues",
+    "fix start", "fix end",
+    # Markdown bold labels used in fallback templates
     "**location**", "**problem**", "**severity**", "**current code**",
-    "**fixed code**", "fix start", "```", "<structured", "</structured",
+    "**fixed code**", "**fix**", "**issue**",
+    # Code fence artifacts
+    "```",
 )
+
+# Exact-match titles that are always LLM section headers, never real issue titles.
+_ARTIFACT_EXACT_TITLES = frozenset({
+    "decision", "analysis", "existing code", "issues", "fixes",
+    "fix start", "fix end", "structured output", "structured_output",
+    "location", "problem", "severity", "current code", "fixed code",
+    "summary", "context", "recommendation", "explanation",
+})
 
 # Phrases the model uses when it found NOTHING — these must not surface as issues.
 _NO_ISSUE_PHRASES = (
@@ -1522,13 +1537,25 @@ def _sanitize_issues(issues_raw: list) -> list:
     """
     clean = []
     for issue in issues_raw or []:
-        title = str(issue.get("title", "")).strip()
+        title   = str(issue.get("title",   "")).strip()
         message = str(issue.get("message", "")).strip()
+
+        # Exact-match check: single-word / short section-header titles
+        if title.lower() in _ARTIFACT_EXACT_TITLES:
+            continue
+
+        # Strip leading markdown heading chars before exact-match check
+        bare = title.lstrip("#- *").strip().lower()
+        if bare in _ARTIFACT_EXACT_TITLES:
+            continue
+
         if _is_artifact(title, message):
             continue
+
         low = f"{title} {message}".lower()
         if any(p in low for p in _NO_ISSUE_PHRASES):
             continue
+
         clean.append(issue)
     return clean
 

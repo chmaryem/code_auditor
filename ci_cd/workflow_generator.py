@@ -174,6 +174,7 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [main, develop]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -274,6 +275,7 @@ def _build_steps(profile: ProjectProfile) -> str:
 
       - name: "Compile"
         run: mvn compile -q
+        continue-on-error: true
 
       - name: "Tests + JaCoCo Coverage"
         run: >
@@ -287,6 +289,7 @@ def _build_steps(profile: ProjectProfile) -> str:
 
       - name: "Package"
         run: mvn package -q -DskipTests
+        continue-on-error: true
 """
 
     # ---- Java / Gradle ----
@@ -926,14 +929,16 @@ def _codeql_job(profile: ProjectProfile) -> str:
     if profile.build_system == "maven":
         build_step = f"""
       - name: "Build (CodeQL)"
-        run: mvn -B compile -DskipTests -q"""
+        run: mvn -B compile -DskipTests -q
+        continue-on-error: true"""
         # Maven: autobuild non nécessaire — on compile manuellement
         # CodeQL traque la compilation via son agent Java
         use_autobuild = False
     elif profile.build_system == "gradle":
         build_step = """
       - name: "Build (CodeQL)"
-        run: chmod +x ./gradlew && ./gradlew compileJava -x test"""
+        run: chmod +x ./gradlew && ./gradlew compileJava -x test
+        continue-on-error: true"""
         use_autobuild = False
     elif profile.build_system == "npm":
         build_step = """

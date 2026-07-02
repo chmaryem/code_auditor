@@ -76,22 +76,29 @@ def node_fetch_deployment(state: CDState) -> CDState:
         sha = state.get("head_sha", "")
         version = f"sha-{sha[:7]}" if sha else "latest"
 
-    # Record deployment in tracker
+    # Record deployment in tracker — skipped in dry_run (preview) mode: no
+    # real deploy happened, so nothing should land in the Redis deploy
+    # history. Leaving deploy_id empty also naturally short-circuits the
+    # mark_success/mark_failure calls in monitor_health/index_result below,
+    # since those are already guarded by `if deploy_id:`.
     deploy_id = ""
-    try:
-        from langchain_agents.tools.cd_tools import tool_record_deploy
-        result = tool_record_deploy.invoke({
-            "repo":        repo,
-            "environment": environment,
-            "commit_sha":  state.get("head_sha", ""),
-            "version":     version,
-            "branch":      state.get("pr_branch", "main"),
-            "deploy_url":  deploy_url,
-            "run_id":      run_id,
-        })
-        deploy_id = result.get("deploy_id", "")
-    except Exception as e:
-        logger.error("[CDGraph] tool_record_deploy failed: %s", e)
+    if not state.get("dry_run"):
+        try:
+            from langchain_agents.tools.cd_tools import tool_record_deploy
+            result = tool_record_deploy.invoke({
+                "repo":        repo,
+                "environment": environment,
+                "commit_sha":  state.get("head_sha", ""),
+                "version":     version,
+                "branch":      state.get("pr_branch", "main"),
+                "deploy_url":  deploy_url,
+                "run_id":      run_id,
+            })
+            deploy_id = result.get("deploy_id", "")
+        except Exception as e:
+            logger.error("[CDGraph] tool_record_deploy failed: %s", e)
+    else:
+        logger.info("[CDGraph] dry_run=True — skipping deploy record persistence")
 
     logger.info(
         "[CDGraph] fetch_deployment — env=%s ver=%s url=%s deploy_id=%s",
@@ -397,22 +404,28 @@ def node_post_deploy_report(state: CDState) -> CDState:
         sections.append(f"\n{rollback_body}")
 
     comment_posted = False
-    if sections and pr_number and owner and repo_name:
+    body = ""
+    if sections:
         body = "\n\n---\n".join(sections)
         body = f"# 🚀 Code Auditor — CD Intelligence Report\n\n{body}"
-        try:
-            from langchain_agents.tools.ci_tools import tool_post_pr_comment
-            comment_posted = tool_post_pr_comment.invoke({
-                "owner":     owner,
-                "repo":      repo_name,
-                "pr_number": pr_number,
-                "body":      body[:65000],
-            })
-            logger.info("[CDGraph] PR comment posted: %s", comment_posted)
-        except Exception as e:
-            logger.error("[CDGraph] post_deploy_report PR comment failed: %s", e)
 
-    return {**state, "comment_posted": comment_posted}
+        # dry_run (dashboard preview) → build the report for display but never
+        # post it. Avoids spamming a PR with a comment for a "deployment" that
+        # didn't actually happen.
+        if not state.get("dry_run") and pr_number and owner and repo_name:
+            try:
+                from langchain_agents.tools.ci_tools import tool_post_pr_comment
+                comment_posted = tool_post_pr_comment.invoke({
+                    "owner":     owner,
+                    "repo":      repo_name,
+                    "pr_number": pr_number,
+                    "body":      body[:65000],
+                })
+                logger.info("[CDGraph] PR comment posted: %s", comment_posted)
+            except Exception as e:
+                logger.error("[CDGraph] post_deploy_report PR comment failed: %s", e)
+
+    return {**state, "comment_posted": comment_posted, "report_markdown": body}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -520,11 +533,19 @@ def invoke_cd_run(
     run_conclusion: str = "",
     run_duration_seconds: int = 0,
     logs:        str = "",
+    dry_run:     bool = False,
 ) -> Dict[str, Any]:
     """
     Invokes the CDGraph for a completed deploy workflow run.
 
     Args match invoke_ci_run() for drop-in compatibility with CIPoller.
+
+    dry_run: when True, runs the full graph (readiness score, health check,
+    failure analysis, rollback advice) without any side effect — no Redis
+    deploy record, no PR comment. Used by the dashboard's on-demand preview,
+    since the automatic trigger path (CIPoller reacting to a real
+    publish/deploy job) is never reachable from workflow_dispatch-triggered
+    runs (see node_fetch_deployment / node_post_deploy_report).
     """
     global _cd_graph
     if _cd_graph is None:
@@ -568,8 +589,10 @@ def invoke_cd_run(
         "rollback_risk_reasons":       [],
         "rollback_comment_body":       "",
         "comment_posted":              False,
+        "report_markdown":             "",
         "indexed":                     False,
         "notification_level":          "OK",
+        "dry_run":                     dry_run,
     }
 
     try:

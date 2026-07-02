@@ -1,15 +1,3 @@
-"""
-api/git_router.py — FastAPI router for SmartGitGraph.
-
-Endpoints:
-  POST /git/status              → git session snapshot + risks
-  POST /git/branch              → branch readiness vs base
-  POST /git/commit-msg          → generate conventional commit message
-  POST /git/conflicts           → dry-run conflict resolution
-  POST /git/pr/review           → PR review via GitHub API
-  POST /git/pr/readiness        → merge readiness check
-  POST /git/pr/apply-suggestion → commit a suggested fix to the PR branch
-"""
 from __future__ import annotations
 
 import asyncio
@@ -116,6 +104,9 @@ class ApplySuggestionRequest(BaseModel):
     fixed_code:   str = Field(..., description="Replacement code")
     hint_line:    int = Field(0,   description="Line number hint for fuzzy search anchoring (0 = no hint)")
 
+class GitHookRequest(BaseModel):
+    project_path: str = Field(..., description="Absolute path to git project")
+
 class GitResponse(BaseModel):
     response:           str             = ""
     intent:             str             = ""
@@ -144,10 +135,22 @@ async def get_git_status(
     principal: Principal = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the GitHub connection context for Smart Git (repo + token presence)."""
-    async with db.begin():
-        repo_str = await UserRepo(db).get_active_repo_by_email(principal.email)
-        token    = await UserRepo(db).get_github_token_by_email(principal.email)
+    """
+    Return the GitHub connection context for Smart Git (repo + token presence).
+
+    Resilient to DB outages: if PostgreSQL is unreachable, fall back to the
+    .env PAT (connected=true) so Smart Git keeps working instead of 500-ing.
+    """
+    repo_str = None
+    token    = ""
+    try:
+        async with db.begin():
+            repo_str = await UserRepo(db).get_active_repo_by_email(principal.email)
+            token    = await UserRepo(db).get_github_token_by_email(principal.email)
+    except Exception as exc:
+        import os as _os
+        logger.warning("git/status: DB unreachable, falling back to .env PAT: %s", exc)
+        token = _os.environ.get("GITHUB_TOKEN") or _os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
     owner, repo = (repo_str.split("/", 1) if repo_str and "/" in repo_str else ("", ""))
     return {
         "connected": bool(token),
@@ -391,8 +394,11 @@ async def git_branch(req: GitBranchRequest, user: Principal = Depends(get_curren
 @git_router.post("/commit-msg", response_model=GitResponse, summary="Generate commit message")
 async def git_commit_msg(req: GitCommitMsgRequest):
     """
-    Génère un message de commit Conventional Commits basé sur les diffs
-    actuels. SmartGitGraph → node_diff (intent=commit_message).
+    Génère un message de commit Conventional Commits basé sur les diffs stagés.
+
+    Appel DIRECT de generate_commit_message() (même fonction que le hook Git
+    prepare-commit-msg) plutôt que le LangGraph complet → plus rapide, identique
+    au comportement du hook. Additif : ne touche ni le graph ni le dashboard.
     """
     project_path = Path(req.project_path)
     if not project_path.exists():
@@ -400,16 +406,21 @@ async def git_commit_msg(req: GitCommitMsgRequest):
 
     t0 = time.time()
     try:
-        result = await _invoke(
-            message="generate commit message",
-            project_path=str(project_path),
-            session_id=req.session_id,
+        from smart_git.git_commit_msg import generate_commit_message
+
+        message = await asyncio.to_thread(generate_commit_message, project_path)
+        return GitResponse(
+            response        = message,
+            intent          = "commit_message",
+            confidence      = 1.0,
+            safe_mode       = True,
+            elapsed_seconds = round(time.time() - t0, 2),
+            commit_message  = message,
+            errors          = [] if message else ["no staged changes or generation failed"],
         )
     except Exception as e:
         logger.exception("git/commit-msg error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
-
-    return _to_response(result, round(time.time() - t0, 2))
+        raise HTTPException(500, f"commit-msg error: {e}")
 
 
 @git_router.post("/conflicts", response_model=GitResponse, summary="Dry-run conflict resolution")
@@ -726,11 +737,33 @@ async def git_secret_scan(req: GitSecretScanRequest, user: Principal = Depends(g
 
 # ── F3: Commit Lint ───────────────────────────────────────────────────────────
 
+def _commit_lint_to_dict(report) -> Dict[str, Any]:
+    """Sérialise un CommitLintReport en dict aligné avec le client extension."""
+    return {
+        "is_valid":          report.is_valid,
+        "score":             report.score,
+        "original_message":  report.original_message,
+        "suggested_message": report.suggested_message,
+        "violations": [
+            {
+                "rule":       v.rule,
+                "severity":   v.severity.lower(),   # error|warn → l'UI attend lowercase
+                "message":    v.message,
+                "suggestion": v.suggestion,
+            }
+            for v in report.violations
+        ],
+        "success": report.success,
+        "error":   report.error,
+    }
+
+
 @git_router.post("/commit-lint", response_model=GitResponse, summary="Validate commit message")
 async def git_commit_lint(req: GitCommitLintRequest, user: Principal = Depends(get_current_user)):
     """
     Valide un message de commit selon la spécification Conventional Commits.
-    SmartGitGraph → node_commit_lint.
+
+    Appel DIRECT du linter (100 % local, 0 LLM) — pas le LangGraph.
     """
     project_path = Path(req.project_path)
     if not project_path.exists():
@@ -738,36 +771,72 @@ async def git_commit_lint(req: GitCommitLintRequest, user: Principal = Depends(g
 
     t0 = time.time()
     try:
-        result = await _invoke(
-            message=f"lint: {req.commit_message or 'from COMMIT_EDITMSG'}",
-            project_path=str(project_path),
-            commit_message=req.commit_message,
-            session_id=req.session_id,
-        )
+        from smart_git.git_commit_linter import lint_commit_message, lint_staged_commit
+
+        def _run() -> Dict[str, Any]:
+            if req.commit_message.strip():
+                rep = lint_commit_message(req.commit_message)
+            else:
+                rep = lint_staged_commit(project_path)
+            return _commit_lint_to_dict(rep)
+
+        lint = await asyncio.to_thread(_run)
     except Exception as e:
         logger.exception("git/commit-lint error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"commit-lint error: {e}")
 
-    _valid = (result.get("commit_lint_report") or {}).get("valid")
     _pg_save_git_report(
         user_email  = user.email,
         report_type = "commit_lint",
-        raw_data    = result,
+        raw_data    = {"commit_lint_report": lint},
         local_path  = str(project_path),
-        verdict     = "VALID" if _valid is True else ("INVALID" if _valid is False else ""),
-        summary     = result.get("response", "")[:2000],
+        verdict     = "VALID" if lint.get("is_valid") else "INVALID",
+        total_score = lint.get("score"),
+        summary     = f"score {lint.get('score')}/100 · {len(lint.get('violations', []))} issue(s)",
     )
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response           = f"score {lint.get('score')}/100",
+        intent             = "commit_lint",
+        confidence         = 1.0,
+        safe_mode          = True,
+        elapsed_seconds    = round(time.time() - t0, 2),
+        commit_lint_report = lint,
+        errors             = [lint["error"]] if lint.get("error") else [],
+    )
 
 
 # ── F4: Test Impact ───────────────────────────────────────────────────────────
+
+def _test_impact_to_dict(report) -> Dict[str, Any]:
+    """Sérialise un TestImpactReport en dict aligné avec le client extension."""
+    return {
+        "impacts": [
+            {
+                "source_file":      i.source_file,
+                "test_files":       i.test_files,
+                "missing_tests":    i.missing_tests,
+                "discovery_method": i.discovery_method,
+            }
+            for i in report.impacts
+        ],
+        "total_files":     report.total_files,
+        "covered_files":   report.covered_files,
+        "uncovered_files": report.uncovered_files,
+        "all_test_files":  report.all_test_files,
+        "coverage_ratio":  report.coverage_ratio,
+        "has_gaps":        report.has_gaps,
+        "success":         report.success,
+        "error":           report.error,
+    }
+
 
 @git_router.post("/test-impact", response_model=GitResponse, summary="Test impact analysis")
 async def git_test_impact(req: GitTestImpactRequest, user: Principal = Depends(get_current_user)):
     """
     Trouve les fichiers de test impactés par les modifications (staged ou liste explicite).
-    SmartGitGraph → node_test_impact.
+
+    Appel DIRECT de l'analyseur (100 % local, 0 LLM) — pas le LangGraph.
     """
     project_path = Path(req.project_path)
     if not project_path.exists():
@@ -775,26 +844,43 @@ async def git_test_impact(req: GitTestImpactRequest, user: Principal = Depends(g
 
     t0 = time.time()
     try:
-        result = await _invoke(
-            message="test impact analysis",
-            project_path=str(project_path),
-            changed_files=req.changed_files,
-            session_id=req.session_id,
+        from smart_git.git_test_impact import (
+            analyze_test_impact_staged,
+            analyze_test_impact_files,
         )
+
+        def _run() -> Dict[str, Any]:
+            if req.changed_files:
+                rep = analyze_test_impact_files(req.changed_files, project_path)
+            else:
+                rep = analyze_test_impact_staged(project_path)
+            return _test_impact_to_dict(rep)
+
+        impact = await asyncio.to_thread(_run)
     except Exception as e:
         logger.exception("git/test-impact error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"test-impact error: {e}")
 
+    _pct = round(impact.get("coverage_ratio", 1.0) * 100)
     _pg_save_git_report(
         user_email  = user.email,
         report_type = "test_impact",
-        raw_data    = result,
+        raw_data    = {"test_impact_report": impact},
         local_path  = str(project_path),
-        verdict     = (result.get("test_impact_report") or {}).get("verdict", ""),
-        summary     = result.get("response", "")[:2000],
+        verdict     = "GAPS" if impact.get("has_gaps") else "COVERED",
+        total_score = _pct,
+        summary     = f"{_pct}% covered · {impact.get('uncovered_files', 0)} gap(s)",
     )
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response           = f"{_pct}% covered",
+        intent             = "test_impact",
+        confidence         = 1.0,
+        safe_mode          = True,
+        elapsed_seconds    = round(time.time() - t0, 2),
+        test_impact_report = impact,
+        errors             = [impact["error"]] if impact.get("error") else [],
+    )
 
 
 # ── F5: Commit Readiness (aggregate) ──────────────────────────────────────────
@@ -1209,3 +1295,75 @@ async def git_pr_resolve_diff(
         for f in data.get("files", [])
         if isinstance(f, dict)
     ]
+
+
+# ── Git Hook Management ───────────────────────────────────────────────────────
+
+@git_router.get("/hook/status", summary="Check if Code Auditor git hook is installed")
+async def git_hook_status(project_path: str = Query(..., description="Absolute path to git project")):
+    """
+    Vérifie si le hook pre-commit Code Auditor est installé dans le projet.
+    Retourne {"installed": bool} — utilisé par le tab Git pour afficher le statut.
+    """
+    hook_file = Path(project_path) / ".git" / "hooks" / "pre-commit"
+    msg_hook  = Path(project_path) / ".git" / "hooks" / "prepare-commit-msg"
+    try:
+        installed = (
+            hook_file.exists() and
+            "Code Auditor" in hook_file.read_text(encoding="utf-8", errors="replace")
+        )
+    except Exception:
+        installed = False
+    return {
+        "installed":               installed,
+        "has_prepare_commit_msg":  msg_hook.exists(),
+        "hook_path":               str(hook_file),
+    }
+
+
+@git_router.post("/hook/install", summary="Install Code Auditor pre-commit hook")
+async def git_hook_install(req: GitHookRequest):
+    """
+    Installe le hook pre-commit Code Auditor (strict=True) dans le projet.
+    Crée .git/hooks/pre-commit + .git/hooks/prepare-commit-msg.
+    """
+    project_path = Path(req.project_path)
+    if not project_path.exists():
+        raise HTTPException(404, f"Projet introuvable : {project_path}")
+    if not (project_path / ".git").exists():
+        raise HTTPException(400, f"Pas un dépôt Git : {project_path}")
+
+    try:
+        from smart_git.git_hook import install_hook
+        await asyncio.to_thread(install_hook, project_path, True)
+        return {
+            "success": True,
+            "message": "Git hooks installed (strict mode ON)",
+            "project": str(project_path),
+        }
+    except Exception as exc:
+        logger.exception("git/hook/install error")
+        raise HTTPException(500, f"Hook installation failed: {exc}")
+
+
+@git_router.post("/hook/uninstall", summary="Uninstall Code Auditor pre-commit hook")
+async def git_hook_uninstall(req: GitHookRequest):
+    """
+    Désinstalle le hook pre-commit Code Auditor du projet.
+    Supprime .git/hooks/pre-commit et .git/hooks/prepare-commit-msg si installés par Code Auditor.
+    """
+    project_path = Path(req.project_path)
+    if not project_path.exists():
+        raise HTTPException(404, f"Projet introuvable : {project_path}")
+
+    try:
+        from smart_git.git_hook import uninstall_hook
+        await asyncio.to_thread(uninstall_hook, project_path)
+        return {
+            "success": True,
+            "message": "Git hooks uninstalled",
+            "project": str(project_path),
+        }
+    except Exception as exc:
+        logger.exception("git/hook/uninstall error")
+        raise HTTPException(500, f"Hook uninstallation failed: {exc}")

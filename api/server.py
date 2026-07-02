@@ -351,6 +351,7 @@ from api.user_router        import user_router, github_callback_router  # noqa: 
 from api.history_router          import history_router                   # noqa: E402
 from api.settings_router         import settings_router                  # noqa: E402
 from api.extension_chat_router   import extension_chat_router            # noqa: E402
+from api.issue_actions_router    import issue_actions_router              # noqa: E402
 
 # Authentication endpoints — always public (login lives here).
 app.include_router(auth_router,             prefix="/api")
@@ -370,6 +371,7 @@ app.include_router(user_router,        prefix="/api", dependencies=_auth)
 app.include_router(history_router,     prefix="/api", dependencies=_auth)
 app.include_router(settings_router,         prefix="/api", dependencies=_auth)
 app.include_router(extension_chat_router,   prefix="/api", dependencies=_auth)
+app.include_router(issue_actions_router,    prefix="/api", dependencies=_auth)
 app.include_router(mcp_router,              dependencies=_auth)
 
 
@@ -908,6 +910,38 @@ async def kb_reject(req: KBRuleAction):
     from langchain_agents.agents.lc_learning_agent import lc_learning_agent
     lc_learning_agent.reject_pending(req.language, req.pattern)
     return {"status": "rejected", "language": req.language, "pattern": req.pattern}
+
+
+@app.get("/api/kb/pending", dependencies=[Depends(get_current_user)])
+async def kb_list_pending():
+    """List all KB rules staged for human approval (pending/ directories)."""
+    rules = []
+    kb_root = config.KNOWLEDGE_BASE_DIR
+    if not kb_root.exists():
+        return {"rules": []}
+    for lang_dir in sorted(kb_root.iterdir()):
+        if not lang_dir.is_dir():
+            continue
+        pending_dir = lang_dir / "pending"
+        if not pending_dir.exists():
+            continue
+        for rule_file in sorted(pending_dir.glob("*.md")):
+            try:
+                content = rule_file.read_text(encoding="utf-8")
+            except Exception:
+                content = ""
+            severity = "MEDIUM"
+            for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+                if s in content.upper():
+                    severity = s
+                    break
+            rules.append({
+                "language": lang_dir.name,
+                "pattern":  rule_file.stem,
+                "severity": severity,
+                "preview":  content[:300],
+            })
+    return {"rules": rules}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

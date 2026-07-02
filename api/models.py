@@ -1,16 +1,7 @@
-"""
-api/models.py — Modèles Pydantic pour l'API FastAPI.
-
-Tous les types request/response sont centralisés ici.
-Le serveur (server.py) et l'orchestrateur importent ces types.
-"""
 from __future__ import annotations
-
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
-
-# ── Health ────────────────────────────────────────────────────────────────────
 
 class HealthResponse(BaseModel):
     status: str = "ok"
@@ -19,9 +10,6 @@ class HealthResponse(BaseModel):
         default_factory=dict,
         description="État des services: redis, chromadb, llm + uptime",
     )
-
-
-# ── Analyze File ──────────────────────────────────────────────────────────────
 
 class AnalyzeFileRequest(BaseModel):
     file_path: str = Field(..., description="Chemin absolu du fichier à analyser")
@@ -65,8 +53,7 @@ class AnalysisResultResponse(BaseModel):
     raw_analysis: str = Field("", description="Texte brut de l'analyse LLM")
 
 
-# ── Analyze Project ───────────────────────────────────────────────────────────
-
+#
 class AnalyzeProjectRequest(BaseModel):
     project_path: str = Field(..., description="Chemin racine du projet")
     max_files: int = Field(10, description="Nombre max de fichiers à analyser")
@@ -83,7 +70,6 @@ class ProjectAnalysisResponse(BaseModel):
     file_results: Dict[str, AnalysisResultResponse] = Field(default_factory=dict)
 
 
-# ── Watch Mode ────────────────────────────────────────────────────────────────
 
 class WatchStartRequest(BaseModel):
     project_path: str = Field(..., description="Chemin du projet à surveiller")
@@ -95,8 +81,6 @@ class WatchStatusResponse(BaseModel):
     files_processed: int = 0
     stats: Dict[str, Any] = Field(default_factory=dict)
 
-
-# ── Git ───────────────────────────────────────────────────────────────────────
 
 class GitStatusRequest(BaseModel):
     project_path: str = Field(..., description="Chemin du projet Git")

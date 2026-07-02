@@ -1,12 +1,9 @@
-"""
-auth/service.py — Orchestration layer tying together store, security and email.
-
-Raises `AuthError(status_code, detail)` for any user-facing failure; the router
-maps these to HTTP responses.
-"""
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
+import secrets
 
 from auth import security, store
 from config import config as _cfg
@@ -23,8 +20,6 @@ class AuthError(Exception):
         self.detail = detail
 
 
-# ── Token helpers ─────────────────────────────────────────────────────────────
-
 def _issue_tokens(user: dict) -> TokenOut:
     access = security.create_access_token(user)
     refresh, jti = security.create_refresh_token(user)
@@ -37,16 +32,7 @@ def _issue_tokens(user: dict) -> TokenOut:
     )
 
 
-# ── Public operations ─────────────────────────────────────────────────────────
-
 def request_code(email: str) -> tuple[RequestCodeOut, str | None]:
-    """Validate + store the OTP and return (response, code_to_email).
-
-    The router emails `code_to_email` in a background task so the HTTP request
-    returns immediately (no blocking on the SMTP round-trip). In dev mode
-    (SMTP unconfigured) the code is surfaced in the response instead and
-    code_to_email is None.
-    """
     if not settings.is_email_domain_allowed(email):
         allowed = ", ".join(settings.allowed_email_domains)
         raise AuthError(403, f"Please use your work email ({allowed}).")
@@ -69,7 +55,6 @@ def request_code(email: str) -> tuple[RequestCodeOut, str | None]:
             code,
         )
 
-    # Dev fallback: SMTP not configured → surface the code so the flow stays testable.
     logger.warning("DEV OTP for %s: %s", email, code)
     return (
         RequestCodeOut(
@@ -146,4 +131,81 @@ def redeem_pairing_token(pairing_token: str) -> TokenOut:
     user = store.get_user(user_id)
     if not user or not user.get("is_active"):
         raise AuthError(401, "Account not found or inactive.")
+    return _issue_tokens(user)
+
+
+# ── VS Code OAuth-like PKCE flow ──────────────────────────────────────────────
+
+def _verify_pkce(verifier: str, challenge: str) -> bool:
+    """RFC 7636 S256: BASE64URL(SHA256(verifier)) must equal the stored challenge."""
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return computed == challenge
+
+
+def initiate_vscode_login(state: str, code_challenge: str, code_challenge_method: str) -> None:
+    """Validate and persist the PKCE state sent by the extension."""
+    if not state or len(state) > 128:
+        raise AuthError(400, "Invalid state parameter.")
+    if code_challenge_method != "S256":
+        raise AuthError(400, "Only S256 code_challenge_method is supported.")
+    if not code_challenge or len(code_challenge) < 32:
+        raise AuthError(400, "Invalid code_challenge.")
+    store.store_vscode_state(state, code_challenge)
+
+
+def verify_vscode_otp(email: str, code: str, state: str) -> str:
+    """Verify OTP, generate a single-use auth_code, return it (caller handles redirect).
+
+    Order matters:
+      1. Peek state (non-destructive) so OTP failures leave state intact for retry.
+      2. Verify OTP hash directly — avoids the verify_code() helper which issues a
+         full JWT pair that would be immediately discarded.
+      3. Only after OTP passes, atomically consume the state (pop = GETDEL).
+    """
+    # Step 1: check state exists without consuming it (OTP failure must allow retry).
+    if not store.get_vscode_state(state):
+        raise AuthError(400, "State is invalid or has expired. Please restart the sign-in flow.")
+
+    # Step 2: verify OTP hash directly (no JWT issuance).
+    otp = store.get_otp(email)
+    if not otp:
+        raise AuthError(400, "Code expired or never requested. Please request a new one.")
+    if security.hash_otp(code) != otp.get("code_hash"):
+        attempts = int(otp.get("attempts", 0)) + 1
+        if attempts >= settings.otp_max_attempts:
+            store.clear_otp(email)
+            raise AuthError(429, "Too many invalid attempts. Please request a new code.")
+        store.update_otp_attempts(email, otp, attempts)
+        left = settings.otp_max_attempts - attempts
+        raise AuthError(400, f"Invalid code. {left} attempt(s) left.")
+
+    # Step 3: OTP valid — consume OTP and state atomically.
+    store.clear_otp(email)
+    state_data = store.pop_vscode_state(state)
+    if not state_data:
+        # Extremely rare: concurrent request consumed state between peek and pop.
+        raise AuthError(400, "State already used. Please restart the sign-in flow.")
+
+    user = store.upsert_user(email)
+    auth_code = secrets.token_urlsafe(32)
+    store.store_vscode_code(auth_code, user["id"], state_data["pkce_challenge"])
+    # Fallback for dev-mode: extension polls this key when deep link doesn't fire.
+    store.store_vscode_pending(state, auth_code)
+    return auth_code
+
+
+def exchange_vscode_token(code: str, pkce_verifier: str) -> TokenOut:
+    """Exchange single-use auth_code + PKCE verifier for a JWT pair."""
+    code_data = store.pop_vscode_code(code)
+    if not code_data:
+        raise AuthError(400, "Authorization code is invalid or has expired.")
+
+    if not _verify_pkce(pkce_verifier, code_data["pkce_challenge"]):
+        raise AuthError(400, "PKCE verification failed. Code verifier does not match.")
+
+    user = store.get_user(code_data["user_id"])
+    if not user or not user.get("is_active"):
+        raise AuthError(401, "Account not found or inactive.")
+
     return _issue_tokens(user)

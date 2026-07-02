@@ -749,3 +749,72 @@ class ExtensionChatMessage(Base):
     session: Mapped["ExtensionChatSession"] = relationship(
         "ExtensionChatSession", back_populates="messages"
     )
+
+
+# ── Issue actions & patch snapshots ───────────────────────────────────────────
+
+class IssueActionEvent(Base):
+    """
+    Append-only log of every developer action on a VS Code issue
+    (apply, verify, undo, ignore, false_positive, rescan).
+    Source of truth for the issue History panel.
+    """
+
+    __tablename__ = "issue_action_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    issue_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    patch_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    file_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    action: Mapped[str] = mapped_column(String(30), nullable=False)
+    previous_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    next_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    file_version_before_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    patch_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    metadata_: Mapped[Optional[Dict[str, Any]]] = mapped_column("metadata", JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, index=True,
+    )
+
+    __table_args__ = (
+        Index("ix_issue_action_events_user_issue", "user_id", "issue_id"),
+        Index("ix_issue_action_events_created", "user_id", "created_at"),
+    )
+
+
+class PatchSnapshot(Base):
+    """
+    Full file content captured before and after a patch is applied.
+    Enables safe undo: restore content_before without touching other changes.
+    Created BEFORE apply — content_after filled in after WorkspaceEdit succeeds.
+    """
+
+    __tablename__ = "patch_snapshots"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    issue_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    patch_id: Mapped[str] = mapped_column(String(32), nullable=False, unique=True, index=True)
+    file_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    content_before: Mapped[str] = mapped_column(Text, nullable=False)
+    content_after: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    content_hash_before: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    content_hash_after: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reverted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, index=True,
+    )
+
+    __table_args__ = (
+        Index("ix_patch_snapshots_issue", "user_id", "issue_id"),
+    )

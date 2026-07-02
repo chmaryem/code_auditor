@@ -30,6 +30,7 @@ def node_fetch_run(state: CIState) -> CIState:
     """Récupère les logs du run GitHub Actions."""
     from langchain_agents.tools.ci_tools import (
         tool_fetch_run_logs,
+        tool_fetch_job_logs,
         tool_fetch_workflow_runs,
         tool_classify_run,
     )
@@ -37,11 +38,26 @@ def node_fetch_run(state: CIState) -> CIState:
     run_id = state.get("run_id", "")
     owner = state.get("owner", "")
     repo_name = state.get("repo", "").split("/")[-1] if "/" in state.get("repo", "") else state.get("repo", "")
+    job_id = state.get("job_id", "")
 
     # Récupérer les logs (retourne maintenant un dict avec stage_failed)
     logs = ""
     detected_stage = ""
-    if run_id and owner and repo_name:
+    if job_id and owner and repo_name:
+        # Analyse ciblée : le dashboard a demandé l'analyse d'une issue
+        # précise → on récupère UNIQUEMENT les logs de ce job, pas ceux de
+        # tout le run. stage_failed vient de l'override explicite du state
+        # (nom réel du job, transmis par le frontend), pas d'une détection.
+        try:
+            result = tool_fetch_job_logs.invoke({
+                "owner": owner,
+                "repo": repo_name,
+                "job_id": str(job_id),
+            })
+            logs = result.get("logs", "")
+        except Exception as e:
+            logger.debug("fetch_job_logs failed: %s", e)
+    elif run_id and owner and repo_name:
         try:
             result = tool_fetch_run_logs.invoke({
                 "owner": owner,
@@ -655,6 +671,7 @@ def invoke_ci_run(
     head_sha: str = "",
     pr_branch: str = "",
     stage_failed: str = "",
+    job_id: str = "",
     run_conclusion: str = "",
     run_duration_seconds: int = 0,
 ) -> Dict[str, Any]:
@@ -670,6 +687,9 @@ def invoke_ci_run(
         head_sha: SHA du commit HEAD
         pr_branch: Branche source de la PR (fallback pour détecter pr_number)
         stage_failed: Nom du stage qui a échoué (optionnel)
+        job_id: ID numérique du job GitHub Actions à analyser spécifiquement
+                (optionnel — analyse ciblée sur une issue précise du dashboard,
+                au lieu de deviner le stage depuis tout le run)
         run_conclusion: "success" | "failure" | "cancelled" (optionnel)
         run_duration_seconds: Durée du run
 
@@ -689,6 +709,7 @@ def invoke_ci_run(
         "head_sha": head_sha or "",
         "pr_branch": pr_branch or "",   # fallback lookup
         "stage_failed": stage_failed or "",
+        "job_id": job_id or "",
         "run_conclusion": run_conclusion or "",
         "run_duration_seconds": run_duration_seconds,
         # Defaults

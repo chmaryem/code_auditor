@@ -1,10 +1,3 @@
-"""
-auth/store.py — Redis-backed storage for the auth module.
-
-Uses a DEDICATED direct redis-py connection (not the shared MCP Redis transport),
-so auth requests never contend with the project indexer / cache and stay fast.
-It talks to the SAME Redis server; every key lives under the `ca:auth:` namespace.
-"""
 from __future__ import annotations
 
 import json
@@ -181,6 +174,78 @@ def pop_pairing(token: str) -> Optional[str]:
         if uid:
             _r().delete(key)
         return uid
+
+
+# ── VS Code OAuth-like PKCE flow ──────────────────────────────────────────────
+
+def _vscode_state_key(state: str) -> str:
+    return f"{_NS}vscode_state:{state}"
+
+
+def _vscode_code_key(code: str) -> str:
+    return f"{_NS}vscode_code:{code}"
+
+
+def store_vscode_state(state: str, pkce_challenge: str, ttl_sec: int = 300) -> None:
+    """Store PKCE state sent by VS Code extension (5-min TTL)."""
+    payload = json.dumps({"pkce_challenge": pkce_challenge, "created_at": time.time()})
+    _r().set(_vscode_state_key(state), payload, ex=ttl_sec)
+
+
+def get_vscode_state(state: str) -> Optional[dict]:
+    """Non-destructive read — used to check existence before OTP verification."""
+    return _get_json(_vscode_state_key(state))
+
+
+def pop_vscode_state(state: str) -> Optional[dict]:
+    """Single-use: retrieve and delete the PKCE state entry."""
+    key = _vscode_state_key(state)
+    try:
+        raw = _r().getdel(key)
+    except redis.ResponseError:
+        raw = _r().get(key)
+        if raw:
+            _r().delete(key)
+    return json.loads(raw) if raw else None
+
+
+def _vscode_pending_key(state: str) -> str:
+    return f"{_NS}vscode_pending:{state}"
+
+
+def store_vscode_pending(state: str, auth_code: str, ttl_sec: int = 120) -> None:
+    """State→code mapping — polled by the extension as fallback when the deep link fails."""
+    _r().set(_vscode_pending_key(state), auth_code, ex=ttl_sec)
+
+
+def pop_vscode_pending(state: str) -> Optional[str]:
+    """Single-use poll: retrieve and delete the pending auth code."""
+    key = _vscode_pending_key(state)
+    try:
+        return _r().getdel(key)
+    except redis.ResponseError:
+        code = _r().get(key)
+        if code:
+            _r().delete(key)
+        return code
+
+
+def store_vscode_code(auth_code: str, user_id: str, pkce_challenge: str, ttl_sec: int = 120) -> None:
+    """Store the single-use auth code after OTP verification (2-min TTL)."""
+    payload = json.dumps({"user_id": user_id, "pkce_challenge": pkce_challenge})
+    _r().set(_vscode_code_key(auth_code), payload, ex=ttl_sec)
+
+
+def pop_vscode_code(auth_code: str) -> Optional[dict]:
+    """Single-use: retrieve and delete the auth code entry."""
+    key = _vscode_code_key(auth_code)
+    try:
+        raw = _r().getdel(key)
+    except redis.ResponseError:
+        raw = _r().get(key)
+        if raw:
+            _r().delete(key)
+    return json.loads(raw) if raw else None
 
 
 # ── Refresh-token allow-list (revocable sessions) ─────────────────────────────

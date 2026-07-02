@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -27,6 +28,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _fkey(file_path) -> str:
+    """
+    Stable dict key for a file path, case-insensitive on Windows.
+
+    On Windows the watcher and the REST API can report the same file with a
+    different drive-letter case (``c:\\`` vs ``C:\\``). Without normalization
+    these become two distinct keys, so the in-flight cancellation in
+    ``_pending_tasks`` fails to dedup and the file gets analysed concurrently.
+    ``os.path.normcase`` lower-cases on Windows and is a no-op on POSIX.
+    """
+    return os.path.normcase(str(file_path))
 
 # Délai de coalesce : on attend ce temps après le dernier événement reçu
 # avant de lancer le batch d'analyses.
@@ -406,7 +420,7 @@ class Orchestrator:
             logger.warning("Event loop non démarrée — événement ignoré : %s", file_path)
             return
 
-        file_key = str(file_path)
+        file_key = _fkey(file_path)
 
         # ── Cancellation : annuler l'analyse en cours pour ce fichier ─────
         if file_key in self._pending_tasks:
@@ -519,7 +533,7 @@ class Orchestrator:
                 priority, seq, task = await asyncio.wait_for(
                     self._queue.get(), timeout=1.0
                 )
-                file_key = str(task["file_path"])
+                file_key = _fkey(task["file_path"])
                 batch[file_key] = task
             except asyncio.TimeoutError:
                 continue
@@ -532,7 +546,7 @@ class Orchestrator:
             while not self._queue.empty():
                 try:
                     p, s, extra_task = self._queue.get_nowait()
-                    extra_key = str(extra_task["file_path"])
+                    extra_key = _fkey(extra_task["file_path"])
                     batch[extra_key] = extra_task  # Le dernier gagne
                 except asyncio.QueueEmpty:
                     break
@@ -603,7 +617,7 @@ class Orchestrator:
         )
 
         start = time.time()
-        file_key = str(file_path)
+        file_key = _fkey(file_path)
 
         print(f"\n{'─'*70}")
         print(f" {file_path.name}")

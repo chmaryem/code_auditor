@@ -1,14 +1,3 @@
-"""
-api/ci_router.py — FastAPI router for CIGraph + CDGraph.
-
-Endpoints:
-  POST /ci/analyze          → analyze a specific CI run (CIGraph)
-  POST /ci/poll/start       → start background CI polling
-  POST /ci/poll/stop        → stop CI polling
-  GET  /ci/poll/status      → polling status
-  POST /cd/score            → Release Readiness Score (CDGraph)
-  GET  /cd/status           → current deploy status for an environment
-"""
 from __future__ import annotations
 
 import asyncio
@@ -45,8 +34,23 @@ def _gh(token: str, method: str, url: str, data: dict | None = None):
     }
     body = _json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return _json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode()
+            # 204 No Content (e.g. workflow_dispatch) or empty body → success, no JSON
+            if not raw.strip():
+                return {}
+            return _json.loads(raw)
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise urllib.error.HTTPError(
+            url=e.url, code=e.code, msg=f"{e.msg} | body={err_body[:400]}",
+            hdrs=e.headers, fp=None,
+        )
 
 # Shared polling state
 _ci_poller_thread: Optional[threading.Thread] = None
@@ -61,15 +65,20 @@ class CIAnalyzeRequest(BaseModel):
     pr_number:   Optional[int] = Field(None, description="PR number to comment on")
     branch:      str = Field("",  description="Branch filter for run auto-detection")
     project_key: str = Field("",  description="SonarCloud project key (optional)")
+    job_id:      str = Field("",  description="Target a specific GitHub Actions job's logs instead of the whole run (optional)")
+    stage_failed: str = Field("", description="Real job/stage name for the LLM prompt — overrides auto-detection (optional)")
 
 class CIAnalyzeResponse(BaseModel):
-    outcome:            str  = ""
-    failure_type:       str  = ""
-    stage_failed:       str  = ""
-    root_cause:         str  = ""
+    outcome:            str   = ""
+    failure_type:       str   = ""
+    stage_failed:       str   = ""
+    root_cause:         str   = ""
+    suggested_fix:      str   = ""
+    analysis_source:    str   = ""    # "redis_cache" | "llm_analysis" | "none"
+    confidence:         float = 0.0
     pr_number:          Optional[int] = None
-    comment_posted:     bool = False
-    notification_level: str  = ""
+    comment_posted:     bool  = False
+    notification_level: str   = ""
     elapsed_seconds:    float = 0.0
 
 class CIPollStartRequest(BaseModel):
@@ -94,6 +103,7 @@ class CDScoreResponse(BaseModel):
     blocking_reasons: List[str]        = Field(default_factory=list)
     warnings:         List[str]        = Field(default_factory=list)
     elapsed_seconds:  float            = 0.0
+    details:          Dict[str, Any]   = Field(default_factory=dict)
 
 class CDStatusRequest(BaseModel):
     repo:        str = Field(..., description="owner/repo")
@@ -236,8 +246,11 @@ async def ci_analyze(req: CIAnalyzeRequest, user: Principal = Depends(get_curren
     Utilise le token OAuth GitHub du développeur connecté (pas GITHUB_TOKEN env var).
     """
     import json as _json
+    import os as _os
+    from dotenv import load_dotenv as _load_dotenv
     from database.repositories.user_repo import UserRepo
 
+    _load_dotenv(override=False)
     parts     = req.repo.split("/")
     owner     = parts[0]
     repo_name = parts[-1]
@@ -246,6 +259,8 @@ async def ci_analyze(req: CIAnalyzeRequest, user: Principal = Depends(get_curren
     async with db.begin():
         token = await UserRepo(db).get_github_token_by_email(user.email)
 
+    if not token:
+        token = _os.environ.get("GITHUB_TOKEN") or _os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
     if not token:
         raise HTTPException(403, "GitHub account not connected. Connect via /api/auth/github/start.")
 
@@ -292,6 +307,8 @@ async def ci_analyze(req: CIAnalyzeRequest, user: Principal = Depends(get_curren
             project_key=req.project_key,
             pr_number=req.pr_number,
             pr_branch=req.branch,
+            stage_failed=req.stage_failed,
+            job_id=req.job_id,
             run_conclusion="",
         )
     except Exception as e:
@@ -317,6 +334,9 @@ async def ci_analyze(req: CIAnalyzeRequest, user: Principal = Depends(get_curren
         failure_type       = result.get("failure_type", ""),
         stage_failed       = result.get("stage_failed", "") or "",
         root_cause         = result.get("root_cause", "") or "",
+        suggested_fix      = result.get("suggested_fix", "") or "",
+        analysis_source    = result.get("source", "none"),
+        confidence         = float(result.get("confidence", 0.0)),
         pr_number          = result.get("pr_number"),
         comment_posted     = bool(result.get("comment_posted")),
         notification_level = result.get("notification_level", ""),
@@ -412,12 +432,19 @@ async def ci_declare(
     """
     import base64 as _b64
     import json as _json
+    import os as _os
+    from dotenv import load_dotenv as _load_dotenv
 
     from database.repositories.user_repo import UserRepo
 
+    _load_dotenv(override=True)
     async with db.begin():
-        token = await UserRepo(db).get_github_token_by_email(user.email)
+        oauth_token = await UserRepo(db).get_github_token_by_email(user.email)
 
+    # PAT from .env always takes priority for ci/declare — writing to .github/workflows/
+    # requires the 'workflow' scope which OAuth tokens may lack.
+    _env_token = _os.environ.get("GITHUB_TOKEN") or _os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    token = _env_token or oauth_token
     if not token:
         raise HTTPException(403, "GitHub account not connected. Connect via /api/auth/github/start.")
 
@@ -468,7 +495,7 @@ async def ci_declare(
                 payload)
             return True
         except Exception as e:
-            logger.warning("Push failed %s: %s", path, e)
+            logger.warning("Push failed %s: %s | branch=%s sha=%s", path, e, branch, existing_sha)
             return False
 
     # ── 1. Détection du profil projet ─────────────────────────────────────────
@@ -522,6 +549,9 @@ async def ci_declare(
                 lang_hint = profile.language.lower()
                 if lang_hint not in ("unknown",) and lang_hint not in existing.lower():
                     errors.append(f"Language '{profile.language}' not found in existing ci.yml")
+                # Toujours s'assurer que workflow_dispatch est présent (requis pour déclencher manuellement)
+                if "workflow_dispatch" not in existing:
+                    errors.append("workflow_dispatch trigger missing — cannot trigger manually")
                 if not ok or errors:
                     coherence_notes.extend(errors)
                     needs_push = True
@@ -625,11 +655,25 @@ async def ci_declare(
 
 # ── CI: Run status (polling temps réel) ───────────────────────────────────────
 
-class CIJobStatus(BaseModel):
+class CIJobStep(BaseModel):
     name:       str
-    status:     str   # queued | in_progress | completed
-    conclusion: Optional[str] = None  # success | failure | skipped | cancelled
-    step_id:    str   # mapped to PipelineStepId
+    status:     str            # queued | in_progress | completed
+    conclusion: Optional[str] = None
+    number:     int = 0
+
+class CIJobStatus(BaseModel):
+    id:          str = ""  # numeric GitHub Actions job id — used to target this
+                            # exact job's logs for a scoped root-cause analysis
+    name:        str
+    status:      str   # queued | in_progress | completed
+    conclusion:  Optional[str] = None  # success | failure | skipped | cancelled
+    step_id:     str   # mapped to PipelineStepId
+    html_url:    str   = ""
+    started_at:  Optional[str] = None
+    completed_at: Optional[str] = None
+    duration_s:  float = 0.0
+    steps:       List[CIJobStep] = Field(default_factory=list)
+    failed_step: str   = ""   # name of the first step that failed (if any)
 
 class CIRunStatusResponse(BaseModel):
     run_id:     str
@@ -644,45 +688,55 @@ async def ci_run_status(
     repo:   str,
     run_id: str,
     user: Principal = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
     """
     Lit l'état en temps réel d'un run GitHub Actions.
-    Retourne le statut global du run + chaque job mappé à un PipelineStepId.
-    Le frontend poll cet endpoint toutes les 5s pendant que le run tourne.
+    Retourne le statut global du run + chaque job mappé à un PipelineStepId,
+    avec le détail de chaque step du job (et le step qui a échoué le cas échéant).
+
+    N'interroge PAS la DB (Supabase distant trop lent pour un poll 5s) :
+    utilise directement le PAT du .env, qui a déjà le scope requis.
     """
-    import json as _json
+    import os as _os
+    from datetime import datetime
+    from dotenv import load_dotenv as _load_dotenv
 
-    from database.repositories.user_repo import UserRepo
-
-    async with db.begin():
-        token = await UserRepo(db).get_github_token_by_email(user.email)
-
+    _load_dotenv(override=True)
+    token = _os.environ.get("GITHUB_TOKEN") or _os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
     if not token:
-        raise HTTPException(403, "GitHub account not connected.")
+        raise HTTPException(403, "GITHUB_TOKEN manquant dans .env")
 
     parts     = repo.split("/", 1)
     owner     = parts[0]
     repo_name = parts[1] if len(parts) > 1 else parts[0]
 
-    # Map GitHub job name → PipelineStepId
+    # Map GitHub job name → PipelineStepId.
+    # Ordre IMPORTANT : tester les libellés spécifiques avant les génériques.
     def _job_to_step(job_name: str) -> str:
         n = job_name.lower()
-        if "build" in n or "test" in n:           return "build"
-        if "sonar" in n or "quality" in n:        return "sonar"
-        if "codeql" in n or "dep" in n:           return "security"
-        if "trivy" in n or "docker" in n:         return "docker"
-        if "publish" in n or "push" in n:         return "docker"
-        if "deploy" in n or "ssh" in n:           return "deploy"
+        if "sonar" in n or "quality gate" in n:               return "sonar"
+        if "trivy" in n or "container scan" in n:             return "security"
+        if "codeql" in n or "dependency" in n or "owasp" in n \
+           or "dep-scan" in n or "dep scan" in n:             return "security"
+        if "publish" in n or "docker hub" in n or "push" in n:return "docker"
+        if "deploy" in n or "ssh" in n:                       return "deploy"
+        if "build" in n or "test" in n:                       return "build"
         return "build"
 
+    def _duration(started: Optional[str], completed: Optional[str]) -> float:
+        if not started or not completed:
+            return 0.0
+        try:
+            fmt = "%Y-%m-%dT%H:%M:%SZ"
+            return round((datetime.strptime(completed, fmt) - datetime.strptime(started, fmt)).total_seconds(), 1)
+        except Exception:
+            return 0.0
+
     def _fetch_run_and_jobs() -> dict:
-        # Run global
         run_data = _gh(token, "GET",
             f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs/{run_id}")
-        # Jobs du run
         jobs_data = _gh(token, "GET",
-            f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs/{run_id}/jobs")
+            f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs/{run_id}/jobs?per_page=100")
         return {"run": run_data, "jobs": jobs_data.get("jobs", [])}
 
     try:
@@ -693,20 +747,127 @@ async def ci_run_status(
     run  = raw["run"]
     jobs = raw["jobs"]
 
+    job_models: List[CIJobStatus] = []
+    for j in jobs:
+        steps_raw = j.get("steps", []) or []
+        steps = [
+            CIJobStep(
+                name       = s.get("name", ""),
+                status     = s.get("status", "queued"),
+                conclusion = s.get("conclusion"),
+                number     = s.get("number", 0),
+            )
+            for s in steps_raw
+        ]
+        # Premier step en échec (ignore les skipped) — utile pour le diagnostic
+        failed_step = next(
+            (s.name for s in steps if s.conclusion == "failure"),
+            "",
+        )
+        job_models.append(CIJobStatus(
+            id           = str(j.get("id", "")),
+            name         = j.get("name", ""),
+            status       = j.get("status", "queued"),
+            conclusion   = j.get("conclusion"),
+            step_id      = _job_to_step(j.get("name", "")),
+            html_url     = j.get("html_url", "") or "",
+            started_at   = j.get("started_at"),
+            completed_at = j.get("completed_at"),
+            duration_s   = _duration(j.get("started_at"), j.get("completed_at")),
+            steps        = steps,
+            failed_step  = failed_step,
+        ))
+
     return CIRunStatusResponse(
         run_id     = run_id,
         status     = run.get("status", "queued"),
         conclusion = run.get("conclusion"),
         run_url    = run.get("html_url", ""),
-        jobs       = [
-            CIJobStatus(
-                name       = j.get("name", ""),
-                status     = j.get("status", "queued"),
-                conclusion = j.get("conclusion"),
-                step_id    = _job_to_step(j.get("name", "")),
-            )
-            for j in jobs
-        ],
+        jobs       = job_models,
+    )
+
+
+# ── CI: job logs (pull complete logs for diagnosis) ──────────────────────────
+
+class CIJobLogsResponse(BaseModel):
+    job_id:  str
+    job_name: str = ""
+    logs:    str            # full plain-text logs
+    tail:    str = ""       # last ~4000 chars (where failures usually surface)
+    truncated: bool = False
+
+
+@ci_router.get("/ci/job-logs", response_model=CIJobLogsResponse, summary="Pull complete logs for a job")
+async def ci_job_logs(
+    repo:   str,
+    job_id: str,
+    job_name: str = "",
+    user: Principal = Depends(get_current_user),
+):
+    """
+    Télécharge les logs complets d'un job GitHub Actions.
+
+    GitHub renvoie un 302 vers une URL signée Azure Blob. urllib réinjecte
+    le header Authorization sur le redirect → casse la signature (403).
+    On capture donc le 302 et on fetch l'URL signée SANS header Auth.
+
+    Utilise le PAT du .env (pas la DB) pour rester rapide.
+    """
+    import os as _os
+    from dotenv import load_dotenv as _load_dotenv
+
+    _load_dotenv(override=True)
+    token = _os.environ.get("GITHUB_TOKEN") or _os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    if not token:
+        raise HTTPException(403, "GITHUB_TOKEN manquant dans .env")
+
+    parts     = repo.split("/", 1)
+    owner     = parts[0]
+    repo_name = parts[1] if len(parts) > 1 else parts[0]
+
+    def _fetch_logs() -> str:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect)
+        url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/jobs/{job_id}/logs"
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"token {token}")
+        req.add_header("Accept", "application/vnd.github.v3+json")
+
+        signed_url = None
+        try:
+            with opener.open(req, timeout=20) as resp:
+                # Some setups return the body directly (200)
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 307, 308):
+                signed_url = e.headers.get("Location")
+            else:
+                raise
+
+        if not signed_url:
+            raise RuntimeError("No signed log URL returned by GitHub")
+
+        # Fetch signed URL WITHOUT Authorization header (Azure Blob rejects it)
+        with urllib.request.urlopen(signed_url, timeout=30) as r:
+            return r.read().decode("utf-8", errors="replace")
+
+    try:
+        logs = await asyncio.to_thread(_fetch_logs)
+    except Exception as e:
+        raise HTTPException(502, f"GitHub job logs error: {e}")
+
+    MAX = 200_000
+    truncated = len(logs) > MAX
+    body = logs[-MAX:] if truncated else logs
+    return CIJobLogsResponse(
+        job_id    = job_id,
+        job_name  = job_name,
+        logs      = body,
+        tail      = logs[-4000:],
+        truncated = truncated,
     )
 
 
@@ -731,11 +892,16 @@ async def list_open_prs(
     Each developer uses their own OAuth token — not a shared GITHUB_TOKEN.
     """
     import json as _json
+    import os as _os
+    from dotenv import load_dotenv as _load_dotenv
     from database.repositories.user_repo import UserRepo
 
+    _load_dotenv(override=False)
     async with db.begin():
         token = await UserRepo(db).get_github_token_by_email(user.email)
 
+    if not token:
+        token = _os.environ.get("GITHUB_TOKEN") or _os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
     if not token:
         raise HTTPException(403, "GitHub account not connected. Connect via /api/auth/github/start.")
 
@@ -789,8 +955,11 @@ async def cd_score(
     Uses the authenticated user's GitHub OAuth token — any developer
     can run the analysis against their own connected account.
     """
+    import os as _os
+    from dotenv import load_dotenv as _load_dotenv
     from database.repositories.user_repo import UserRepo
 
+    _load_dotenv(override=False)
     parts     = req.repo.split("/")
     owner     = parts[0]
 
@@ -798,6 +967,8 @@ async def cd_score(
     async with db.begin():
         gh_token = await UserRepo(db).get_github_token_by_email(user.email)
 
+    if not gh_token:
+        gh_token = _os.environ.get("GITHUB_TOKEN") or _os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
     if not gh_token:
         raise HTTPException(403, "GitHub account not connected. Connect via /api/auth/github/start.")
 
@@ -845,6 +1016,144 @@ async def cd_score(
         blocking_reasons = report.blocking_reasons,
         warnings         = report.warnings,
         elapsed_seconds  = elapsed,
+        details          = report.details,
+    )
+
+
+# ── CD Analyze (on-demand CDGraph preview) ────────────────────────────────────
+#
+# workflow_dispatch (how the dashboard always triggers pipelines) never
+# satisfies the publish/deploy jobs' `event_name == 'push'` condition in the
+# generated YAML — so those jobs never run from a dashboard-triggered pipeline,
+# and CIPoller (the only thing that would invoke_cd_run automatically) never
+# gets a real trigger either. This endpoint invokes the full CDGraph (release
+# readiness + environment check + health check + failure analysis + rollback
+# advice) directly and on demand, in dry_run mode: no Redis persistence, no
+# PR comment — a preview only, since no real deployment has happened.
+
+class CDAnalyzeRequest(BaseModel):
+    repo:        str           = Field(..., description="owner/repo")
+    sha:         str           = Field("",  description="Commit SHA (HEAD if empty)")
+    pr_number:   Optional[int] = Field(None)
+    branch:      str           = Field("",  description="Branch to match PRs against (optional)")
+    project_key: str           = Field("")
+    environment: str           = Field("production")
+    run_id:      str           = Field("",  description="GitHub Actions run ID to preview (drives run_conclusion)")
+
+
+class CDAnalyzeResponse(BaseModel):
+    readiness_score:            float           = 0.0
+    readiness_verdict:          str             = ""
+    readiness_blocking_reasons: List[str]        = Field(default_factory=list)
+    readiness_warnings:         List[str]        = Field(default_factory=list)
+    readiness_components:       Dict[str, float] = Field(default_factory=dict)
+    env_state:                  Dict[str, Any]   = Field(default_factory=dict)
+    last_ok_deploy:             Dict[str, Any]   = Field(default_factory=dict)
+    monitor_grade:              str              = ""
+    monitor_availability:       float            = 0.0
+    monitor_avg_latency_ms:     float            = 0.0
+    monitor_issues:             List[str]        = Field(default_factory=list)
+    deploy_failure_reason:      str              = ""
+    deploy_suggested_fix:       str              = ""
+    rollback_available:         bool             = False
+    rollback_command:           str              = ""
+    rollback_risk:              str              = ""
+    rollback_risk_reasons:      List[str]        = Field(default_factory=list)
+    report_markdown:            str              = ""
+    notification_level:         str              = ""
+    dry_run:                    bool             = True
+    elapsed_seconds:            float            = 0.0
+
+
+@ci_router.post("/cd/analyze", response_model=CDAnalyzeResponse,
+                 summary="Run the full CDGraph (readiness + health + rollback) as a preview")
+async def cd_analyze(
+    req: CDAnalyzeRequest,
+    user: Principal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Invoke le CDGraph LangGraph complet (9 nœuds) à la demande, en mode
+    aperçu (dry_run=True) : aucune écriture dans Redis (CDDeployTracker),
+    aucun commentaire posté sur la PR — le résultat est affiché uniquement
+    dans le dashboard.
+    """
+    import os as _os
+    from dotenv import load_dotenv as _load_dotenv
+    from database.repositories.user_repo import UserRepo
+
+    _load_dotenv(override=False)
+    parts     = req.repo.split("/")
+    owner     = parts[0]
+    repo_name = parts[-1] if len(parts) > 1 else parts[0]
+
+    async with db.begin():
+        gh_token = await UserRepo(db).get_github_token_by_email(user.email)
+    if not gh_token:
+        gh_token = _os.environ.get("GITHUB_TOKEN") or _os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    if not gh_token:
+        raise HTTPException(403, "GitHub account not connected. Connect via /api/auth/github/start.")
+
+    # Best-effort: fetch the real run's conclusion so monitor_health routes
+    # correctly (failure → analyze_failure/suggest_rollback, success → report).
+    # Falls back to "success" (happy path) if no run_id or the call fails —
+    # this is a preview, not a hard requirement.
+    def _fetch_conclusion() -> str:
+        if not req.run_id:
+            return ""
+        try:
+            data = _gh(gh_token, "GET",
+                f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs/{req.run_id}")
+            return data.get("conclusion") or ""
+        except Exception as e:
+            logger.debug("cd/analyze: run conclusion fetch failed: %s", e)
+            return ""
+
+    run_conclusion = await asyncio.to_thread(_fetch_conclusion)
+
+    t0 = time.time()
+    try:
+        from langchain_agents.graphs.cd_graph import invoke_cd_run
+        result = await asyncio.to_thread(
+            invoke_cd_run,
+            run_id=req.run_id,
+            repo=req.repo,
+            owner=owner,
+            project_key=req.project_key,
+            pr_number=req.pr_number,
+            head_sha=req.sha,
+            pr_branch=req.branch,
+            run_conclusion=run_conclusion or "success",
+            dry_run=True,
+        )
+    except Exception as e:
+        logger.exception("cd/analyze error")
+        raise HTTPException(500, f"CDGraph error: {e}")
+
+    elapsed = round(time.time() - t0, 2)
+
+    return CDAnalyzeResponse(
+        readiness_score=result.get("readiness_score", 0.0),
+        readiness_verdict=result.get("readiness_verdict", ""),
+        readiness_blocking_reasons=result.get("readiness_blocking_reasons", []),
+        readiness_warnings=result.get("readiness_warnings", []),
+        readiness_components=result.get("readiness_components", {}),
+        env_state=result.get("env_state", {}),
+        last_ok_deploy=result.get("last_ok_deploy", {}),
+        monitor_grade=result.get("monitor_grade", ""),
+        monitor_availability=result.get("monitor_availability", 0.0),
+        monitor_avg_latency_ms=result.get("monitor_avg_latency_ms", 0.0),
+        monitor_issues=result.get("monitor_issues", []),
+        deploy_failure_reason=result.get("deploy_failure_reason", ""),
+        deploy_suggested_fix=result.get("deploy_suggested_fix", ""),
+        rollback_available=result.get("rollback_available", False),
+        rollback_command=result.get("rollback_command", ""),
+        rollback_risk=result.get("rollback_risk", ""),
+        rollback_risk_reasons=result.get("rollback_risk_reasons", []),
+        report_markdown=result.get("report_markdown", ""),
+        notification_level=result.get("notification_level", ""),
+        dry_run=True,
+        elapsed_seconds=elapsed,
     )
 
 

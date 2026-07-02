@@ -1,19 +1,4 @@
-"""
-test_generation_cache.py — Cache Redis pour les résultats de génération de tests.
 
-Stratégie :
-  - Clé   : ca:tg:{sha256_content[:16]}:{mode}  (hash Redis)
-  - Champs : test_code, framework, validated, rag_docs_used, incremental,
-             generated_at, expires_at
-  - TTL    : contrôlé via le champ expires_at (timestamp Unix)
-             car MCP Redis ne supporte pas EXPIRE sur les hash keys.
-  - Fallback : si Redis indisponible, le cache est silencieusement désactivé
-               (la génération continue normalement).
-
-Pourquoi le hash du CONTENU et non le chemin ?
-  - Si le fichier change → nouveau hash → nouveau test généré.
-  - Si le fichier est identique (renommé, déplacé) → cache réutilisé.
-"""
 from __future__ import annotations
 
 import hashlib

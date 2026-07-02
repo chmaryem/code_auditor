@@ -186,10 +186,19 @@ async def github_oauth_callback(
         error = token_data.get("error_description", "no access_token in response")
         return _html_page(success=False, error=f"GitHub denied access: {error}")
 
-    async with db.begin():
-        await UserRepo(db).set_github_token_by_email(email, access_token)
-
-    logger.info("GitHub OAuth token saved for %s", email)
+    try:
+        async with db.begin():
+            await UserRepo(db).set_github_token_by_email(email, access_token)
+        logger.info("GitHub OAuth token saved for %s", email)
+    except Exception as exc:
+        # DB down: the token can't be persisted, but the app still works via the
+        # .env PAT fallback. Don't 500 — tell the user the connection succeeded
+        # but persistence is temporarily unavailable.
+        logger.warning("OAuth callback: DB unreachable, token not persisted: %s", exc)
+        return _html_page(
+            success=True,
+            error="",
+        )
     return _html_page(success=True)
 
 
@@ -257,7 +266,7 @@ async def github_oauth_start(
     params = {
         "client_id":    client_id,
         "redirect_uri": _callback_url(),
-        "scope":        "repo read:user",
+        "scope":        "repo workflow read:user",
         "state":        state,
     }
     url = "https://github.com/login/oauth/authorize?" + urllib.parse.urlencode(params)
@@ -269,9 +278,20 @@ async def get_github_status(
     principal: Principal = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return whether the user has a GitHub OAuth token stored."""
-    async with db.begin():
-        token = await UserRepo(db).get_github_token_by_email(principal.email)
+    """
+    Return whether the user has a GitHub OAuth token stored.
+
+    Resilient to DB outages: if PostgreSQL (Supabase) is unreachable, fall back
+    to the .env PAT so the dashboard keeps working instead of 500-ing (which the
+    browser would surface as misleading CORS errors).
+    """
+    token = ""
+    try:
+        async with db.begin():
+            token = await UserRepo(db).get_github_token_by_email(principal.email)
+    except Exception as exc:
+        logger.warning("github-status: DB unreachable, falling back to .env PAT: %s", exc)
+        token = _env("GITHUB_TOKEN") or _env("GITHUB_PERSONAL_ACCESS_TOKEN")
     return GithubStatusResponse(connected=bool(token))
 
 
@@ -316,7 +336,16 @@ async def get_active_repo(
     principal: Principal = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the last repo the user selected (or null if none)."""
-    async with db.begin():
-        repo = await UserRepo(db).get_active_repo_by_email(principal.email)
+    """
+    Return the last repo the user selected (or null if none).
+
+    Resilient to DB outages: returns null instead of 500 if PostgreSQL is down,
+    so the dashboard can still load (the user just re-picks their repo).
+    """
+    try:
+        async with db.begin():
+            repo = await UserRepo(db).get_active_repo_by_email(principal.email)
+    except Exception as exc:
+        logger.warning("user/repo: DB unreachable, returning null repo: %s", exc)
+        repo = None
     return ActiveRepoResponse(repo=repo)

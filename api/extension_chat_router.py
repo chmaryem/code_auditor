@@ -1,15 +1,3 @@
-"""
-api/extension_chat_router.py — VS Code extension chat history endpoints.
-
-These endpoints are intentionally separate from /api/history/conversations
-(which belongs to the dashboard + Redis-coupled Conversation model).
-
-Endpoints:
-  POST   /extension/chat/sync                  → upsert session + replace messages
-  GET    /extension/chat/sessions              → list user's sessions (most recent first)
-  GET    /extension/chat/sessions/{session_id} → get session + messages
-  DELETE /extension/chat/sessions/{session_id} → delete session
-"""
 from __future__ import annotations
 
 import logging

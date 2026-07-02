@@ -1,8 +1,3 @@
-"""
-auth/schemas.py — Pydantic request/response models for the auth API.
-
-Email is validated with a regex (no `email-validator` dependency).
-"""
 from __future__ import annotations
 
 import re
@@ -77,5 +72,35 @@ class PairingTokenOut(BaseModel):
 class RequestCodeOut(BaseModel):
     detail: str
     resend_in: int
-    # Populated ONLY when SMTP is not configured (dev fallback) so the flow stays testable.
     dev_code: str | None = None
+
+
+# ── VS Code OAuth-like PKCE flow ──────────────────────────────────────────────
+
+class VscodeVerifyIn(BaseModel):
+    """Form submission from the browser login page."""
+    email: str
+    code: str
+    state: str
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: str) -> str:
+        return _validate_email(v)
+
+    @field_validator("code")
+    @classmethod
+    def _code(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v.isdigit():
+            raise ValueError("Code must be numeric.")
+        return v
+
+
+class VscodeTokenIn(BaseModel):
+    """Token exchange — extension posts this after receiving the vscode:// callback."""
+    code: str
+    state: str
+    pkce_verifier: str
+    device_id: str | None = None
+    device_name: str | None = None

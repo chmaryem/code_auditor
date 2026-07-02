@@ -1,22 +1,3 @@
-"""
-api/chat_router.py — FastAPI router for ChatAgent.
-
-Endpoints:
-  POST /chat                 — Q&A / explain
-  POST /chat/stream          — Q&A / explain streaming via SSE
-  POST /chat/complete        — Complete a function body
-  POST /chat/generate        — Generate a new class/file
-  GET  /chat/history/{id}    — Load session conversation history
-  DELETE /chat/history/{id}  — Clear session history
-
-Usage:
-    from api.chat_router import chat_router
-    app.include_router(chat_router, prefix="/api")
-
-Final URL examples:
-    POST /api/chat
-    POST /api/chat/stream
-"""
 from __future__ import annotations
 
 import asyncio

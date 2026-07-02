@@ -196,6 +196,73 @@ def tool_fetch_run_logs(owner: str, repo: str, run_id: str) -> Dict[str, Any]:
 
 
 @tool
+def tool_fetch_job_logs(owner: str, repo: str, job_id: str) -> Dict[str, Any]:
+    """
+    Récupère les logs d'UN job GitHub Actions précis (pas tout le run).
+
+    Contrairement à tool_fetch_run_logs (qui télécharge le ZIP complet du run
+    et devine le stage en échec par ordre alphabétique des fichiers), cet
+    outil cible exactement le job que l'utilisateur a demandé d'analyser —
+    utilisé quand un job_id explicite est fourni (analyse ciblée par issue).
+
+    Même logique que /ci/job-logs côté API : GitHub renvoie un 302 vers une
+    URL signée Azure Blob ; il faut suivre la redirection SANS réinjecter le
+    header Authorization (sinon 403).
+
+    Args:
+        owner: Propriétaire du repo
+        repo: Nom du repo
+        job_id: ID numérique du job GitHub Actions (PAS le run_id)
+
+    Returns:
+        {"logs": str, "total_chars": int}
+    """
+    import urllib.request
+    import urllib.error
+
+    token = (
+        os.environ.get("GITHUB_TOKEN")
+        or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    )
+    if not token:
+        return {"logs": "[ERROR] GITHUB_TOKEN manquant", "total_chars": 0}
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    def _fetch() -> str:
+        opener = urllib.request.build_opener(_NoRedirect)
+        url = f"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{job_id}/logs"
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"token {token}")
+        req.add_header("Accept", "application/vnd.github.v3+json")
+
+        signed_url = None
+        try:
+            with opener.open(req, timeout=20) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 307, 308):
+                signed_url = e.headers.get("Location")
+            else:
+                raise
+
+        if not signed_url:
+            raise RuntimeError("No signed log URL returned by GitHub")
+
+        with urllib.request.urlopen(signed_url, timeout=30) as r:
+            return r.read().decode("utf-8", errors="replace")
+
+    try:
+        logs = _fetch()
+        return {"logs": logs[-10000:], "total_chars": len(logs)}
+    except Exception as e:
+        logger.error("tool_fetch_job_logs %s/%s job=%s: %s", owner, repo, job_id, e)
+        return {"logs": f"[ERROR] {e}", "total_chars": 0}
+
+
+@tool
 def tool_fetch_workflow_runs(
     owner: str,
     repo: str,

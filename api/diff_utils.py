@@ -1,12 +1,3 @@
-"""
-api/diff_utils.py — Utilitaire de calcul de diff pour les fixes WS.
-
-Calcule des hunks de diff entre le code original et le code corrigé
-en utilisant uniquement difflib (stdlib Python — zéro dépendance externe).
-
-Ces hunks permettent au plugin VS Code de savoir EXACTEMENT quelles lignes
-ont changé sans recevoir le fichier entier en payload WebSocket.
-"""
 from __future__ import annotations
 
 import difflib

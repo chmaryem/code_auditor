@@ -21,8 +21,6 @@ try:
 
     import org.springframework.beans.factory.annotation.Autowired;
     import org.springframework.stereotype.Service;
-    import tn.esprit.sampleprojet.User;
-    import javax.sql.DataSource;
     import java.sql.*;
     import java.sql.Connection;
     import java.sql.PreparedStatement;
@@ -34,25 +32,24 @@ try:
     import java.util.Date;
     import java.util.Date; // Explicitly imported for Date objects
     import java.util.List;
+    import javax.sql.DataSource;
+    import tn.esprit.sampleprojet.User;
 
     @Service
     public class UserService {
 
-        DataSource dataSource;
-
+    private final DataSource dataSource;
 
     @Autowired
     public UserService(DataSource dataSource) {
         this.dataSource = dataSource;
-        // Consider externalizing sensitive data, 
-        // in this case, the admin password
     }
-
-    private static final String ADMIN_PASSWORD = "admin123!";
-
         public User findByUsername(String username) throws SQLException {
     // All fields required for a complete User object (as per User constructor) should be retrieved.
     String query = "SELECT id, username, password_hash, email, role, created_at, last_login, is_active FROM users WHERE username = ?";
+    // Parameterized query to prevent SQL injection
+    PreparedStatement statement = connection.prepareStatement(query);
+    statement.setString(1, username);
             try (Connection conn = dataSource.getConnection();
                  PreparedStatement stmt = conn.prepareStatement(query)) {
                 try (ResultSet rs = stmt.executeQuery()) {
@@ -69,7 +66,7 @@ try:
     Date createdAt = (createdAtTimestamp != null) ? new Date(createdAtTimestamp.getTime()) : null;
     Date lastLogin = (lastLoginTimestamp != null) ? new Date(lastLoginTimestamp.getTime()) : null;
 
-    return new User(id, retrievedUsername, passwordHash, email, role, createdAt, lastLogin, isActive);
+    return mapUser(new User(id, retrievedUsername, passwordHash, email, role, createdAt, lastLogin, isActive));
                     }
                 }
             }
@@ -94,7 +91,7 @@ try:
 
         public User createUser(String username, String email, String password, String role) throws SQLException {
             String hashedPassword = hashPassword(password);
-            String insertQuery = "INSERT INTO users (username, email, password_hash, r'''
+            String insertQuery = "INSERT INTO users (username, emai'''
     # Quick syntax check
     braces = code.count('{') == code.count('}')
     no_markers = '<<<<<<' not in code

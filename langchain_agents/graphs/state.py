@@ -71,6 +71,11 @@ class CIState(TypedDict, total=False):
     pr_branch: str
     logs: str
     stage_failed: Optional[str]
+    # Numeric GitHub Actions job id — when set, node_fetch_run fetches logs for
+    # exactly this job (tool_fetch_job_logs) instead of guessing the failed
+    # stage from the whole run's zip archive. Populated when the dashboard's
+    # "Analyze root cause" is clicked on a specific issue/job.
+    job_id: str
     run_conclusion: str
     run_duration_seconds: int
     outcome: str
@@ -130,6 +135,16 @@ class CDState(TypedDict, total=False):
     comment_posted: bool
     indexed: bool
     notification_level: str
+    # Rendered PR-comment markdown, always populated even when dry_run=True
+    # and nothing is actually posted — lets the dashboard preview it.
+    report_markdown: str
+    # When True: no Redis persistence (CDDeployTracker) and no PR comment is
+    # posted. Used for on-demand dashboard previews of the CDGraph, since
+    # workflow_dispatch (how the dashboard always triggers pipelines) never
+    # satisfies the publish/deploy jobs' `event_name == 'push'` condition —
+    # meaning the graph's real trigger path (CIPoller reacting to an actual
+    # publish/deploy job) is otherwise unreachable from the dashboard.
+    dry_run: bool
 
 
 class ChatState(TypedDict, total=False):

@@ -1,9 +1,3 @@
-"""
-auth/security.py — JWT issuance/decoding, OTP helpers, and the FastAPI guard.
-
-Stateless access tokens (decode-only on every request). Refresh tokens carry a
-`jti` tracked in Redis (see store) so sessions can be revoked.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -20,9 +14,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from config import config as _cfg
 settings = _cfg.auth
 
-
-# ── Principal (request identity) ──────────────────────────────────────────────
-
 @dataclass
 class Principal:
     id: str
@@ -34,7 +25,6 @@ class TokenError(Exception):
     """Raised when a JWT is invalid, expired, or of the wrong type."""
 
 
-# ── OTP ───────────────────────────────────────────────────────────────────────
 
 def generate_otp() -> str:
     return "".join(secrets.choice("0123456789") for _ in range(settings.otp_length))
@@ -44,8 +34,6 @@ def hash_otp(code: str) -> str:
     # Peppered with the JWT secret so a Redis dump alone cannot reveal codes.
     return hashlib.sha256(f"{settings.jwt_secret}:{code}".encode("utf-8")).hexdigest()
 
-
-# ── JWT ───────────────────────────────────────────────────────────────────────
 
 def _encode(user: dict, token_type: str, ttl_sec: int, jti: str) -> str:
     now = datetime.now(timezone.utc)
@@ -90,9 +78,6 @@ def _principal_from_claims(claims: dict) -> Principal:
         email=str(claims.get("email", "")),
         role=str(claims.get("role", "Developer")),
     )
-
-
-# ── FastAPI dependency ────────────────────────────────────────────────────────
 
 _bearer = HTTPBearer(auto_error=False)
 

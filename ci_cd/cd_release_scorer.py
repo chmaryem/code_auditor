@@ -152,9 +152,23 @@ class CDReleaseScorer:
         warnings:   List[str]        = []
         details:    Dict[str, Any]   = {}
 
+        # 0 ── Fetch run jobs once — reused for CI-build scoring below AND to
+        #      tell apart "tool ran clean" from "tool's job crashed" for
+        #      sonar/security, which must not score the same. ─────────────────
+        run_jobs: List[Dict[str, Any]] = []
+        if run_id:
+            try:
+                run_jobs = self._fetch_run_jobs(owner, repo_name, run_id)
+            except Exception as e:
+                logger.debug("[CDScorer] run jobs fetch error: %s", e)
+
+        sonar_job_crashed  = self._job_conclusion_for(run_jobs, ("sonar", "quality")) == "failure"
+        codeql_job_crashed = self._job_conclusion_for(run_jobs, ("codeql",)) == "failure"
+        trivy_job_crashed  = self._job_conclusion_for(run_jobs, ("trivy", "container scan")) == "failure"
+
         # 1 ── CI Build (25 pts) ──────────────────────────────────────────────
         ci_score, ci_detail = self._score_ci_build(
-            owner, repo_name, commit_sha, run_id
+            owner, repo_name, commit_sha, run_id, run_jobs=run_jobs or None
         )
         components["ci_build"] = ci_score
         details["ci"] = ci_detail
@@ -165,10 +179,16 @@ class CDReleaseScorer:
             )
 
         # 2 ── SonarCloud Quality Gate (20 pts) ───────────────────────────────
-        sonar_score, sonar_detail = self._score_sonar_gate(project_key, pr_number)
+        sonar_score, sonar_detail = self._score_sonar_gate(
+            project_key, pr_number, job_crashed=sonar_job_crashed
+        )
         components["sonar_gate"] = sonar_score
         details["sonar"] = sonar_detail
-        if sonar_score < WEIGHTS["sonar_gate"] * 0.5:
+        if sonar_detail.get("status") == "UNKNOWN":
+            warnings.append(sonar_detail.get(
+                "note", "SonarCloud analysis did not complete — quality gate not verified"
+            ))
+        elif sonar_score < WEIGHTS["sonar_gate"] * 0.5:
             blocking.append(
                 f"SonarCloud Quality Gate FAILED "
                 f"(score {sonar_score:.0f}/{WEIGHTS['sonar_gate']})"
@@ -178,11 +198,16 @@ class CDReleaseScorer:
 
         # 3 ── Security Scans (20 pts) ─────────────────────────────────────────
         sec_score, sec_detail = self._score_security(
-            owner, repo_name, commit_sha, run_id
+            owner, repo_name, commit_sha, run_id,
+            codeql_job_crashed=codeql_job_crashed, trivy_job_crashed=trivy_job_crashed,
         )
         components["security_scans"] = sec_score
         details["security"] = sec_detail
-        if sec_score < WEIGHTS["security_scans"] * 0.3:
+        if sec_detail.get("unknown"):
+            warnings.append(sec_detail.get(
+                "note", "Security scan incomplete — vulnerabilities not verified"
+            ))
+        elif sec_score < WEIGHTS["security_scans"] * 0.3:
             blocking.append(
                 f"Critical security vulnerabilities detected "
                 f"(score {sec_score:.0f}/{WEIGHTS['security_scans']})"
@@ -215,7 +240,9 @@ class CDReleaseScorer:
         cov_score, cov_detail = self._score_coverage(sonar_detail)
         components["test_coverage"] = cov_score
         details["coverage"] = cov_detail
-        if cov_score < WEIGHTS["test_coverage"] * 0.5:
+        if cov_detail.get("coverage") == "N/A":
+            warnings.append("Test coverage unknown — SonarCloud analysis did not complete")
+        elif cov_score < WEIGHTS["test_coverage"] * 0.5:
             warnings.append(
                 f"Test coverage is low: {cov_detail.get('coverage', 'N/A')}%"
             )
@@ -283,15 +310,97 @@ class CDReleaseScorer:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read().decode())
 
+    def _fetch_run_jobs(self, owner: str, repo: str, run_id: str) -> List[Dict[str, Any]]:
+        """Fetches the run's jobs once — reused by CI-build scoring and by the
+        crash-detection checks below (avoids duplicate GitHub API calls)."""
+        data = self._gh_get(
+            f"https://api.github.com/repos/{owner}/{repo}"
+            f"/actions/runs/{run_id}/jobs?per_page=100"
+        )
+        return data.get("jobs", [])
+
+    @staticmethod
+    def _job_conclusion_for(jobs: List[Dict[str, Any]], keywords: tuple[str, ...]) -> Optional[str]:
+        """Returns the conclusion of the first job whose name matches one of the
+        keywords, or None if no such job ran in this workflow at all. Used to tell
+        apart 'the tool ran and found nothing' from 'the job crashed before it
+        could produce a result' — the two must not score the same."""
+        for j in jobs:
+            name = j.get("name", "").lower()
+            if any(k in name for k in keywords):
+                return j.get("conclusion")
+        return None
+
     def _score_ci_build(
         self,
         owner: str,
         repo: str,
         commit_sha: str,
         run_id: str,
+        run_jobs: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[float, Dict[str, Any]]:
-        """Score based on GitHub commit status checks."""
+        """
+        Score the CI build from the ACTUAL GitHub Actions run.
+
+        IMPORTANT: workflow_dispatch runs do NOT appear as commit check-runs,
+        so /commits/{sha}/check-runs returns stale/empty data and produces a
+        bogus "CI build failed". We therefore read the run's own jobs via
+        /actions/runs/{run_id}/jobs — the single source of truth, identical to
+        what the dashboard polling (ci_run_status) shows.
+
+        The CI-build score reflects the BUILD/TEST jobs only; sonar/security/
+        docker are scored by their own components, so we must not double-count
+        a failed sonar job as a build failure.
+        """
         max_pts = WEIGHTS["ci_build"]
+
+        def _is_build_job(name: str) -> bool:
+            n = name.lower()
+            # Exclude the non-build jobs (scored elsewhere) to avoid mislabeling
+            if any(k in n for k in ("sonar", "quality", "codeql", "trivy",
+                                    "dependency", "owasp", "publish", "deploy",
+                                    "docker hub")):
+                return False
+            return ("build" in n) or ("test" in n)
+
+        # Preferred path: read the real run's jobs.
+        if run_id:
+            try:
+                jobs = run_jobs
+                if jobs is None:
+                    data = self._gh_get(
+                        f"https://api.github.com/repos/{owner}/{repo}"
+                        f"/actions/runs/{run_id}/jobs?per_page=100"
+                    )
+                    jobs = data.get("jobs", [])
+                build_jobs = [j for j in jobs if _is_build_job(j.get("name", ""))]
+                # Fall back to all jobs only if no build job matched
+                scope = build_jobs or jobs
+                if scope:
+                    passed  = sum(1 for j in scope if j.get("conclusion") == "success")
+                    failed  = sum(1 for j in scope if j.get("conclusion") == "failure")
+                    pending = sum(1 for j in scope if j.get("status") != "completed")
+                    total   = len(scope)
+
+                    if failed > 0:
+                        score = max_pts * max(0, (passed - failed) / total)
+                    elif pending > 0:
+                        score = max_pts * 0.6
+                    else:
+                        score = max_pts * (passed / total) if total else max_pts * 0.5
+
+                    return round(score, 2), {
+                        "source": "actions_run_jobs",
+                        "run_id": run_id,
+                        "scope":  "build_jobs" if build_jobs else "all_jobs",
+                        "total":  total, "passed": passed,
+                        "failed": failed, "pending": pending,
+                        "build_job_names": [j.get("name", "") for j in scope],
+                    }
+            except Exception as e:
+                logger.debug("[CDScorer] run-jobs CI score error: %s", e)
+
+        # Fallback: commit check-runs (only reliable for push/PR-triggered runs).
         try:
             data = self._gh_get(
                 f"https://api.github.com/repos/{owner}/{repo}"
@@ -299,7 +408,7 @@ class CDReleaseScorer:
             )
             runs = data.get("check_runs", [])
             if not runs:
-                return max_pts * 0.5, {"note": "no check runs found", "count": 0}
+                return max_pts * 0.5, {"note": "no run_id and no check runs", "count": 0}
 
             passed  = sum(1 for r in runs if r.get("conclusion") == "success")
             failed  = sum(1 for r in runs if r.get("conclusion") == "failure")
@@ -314,6 +423,7 @@ class CDReleaseScorer:
                 score = max_pts * (passed / total) if total else max_pts * 0.5
 
             return round(score, 2), {
+                "source": "commit_check_runs",
                 "total": total, "passed": passed,
                 "failed": failed, "pending": pending
             }
@@ -325,9 +435,20 @@ class CDReleaseScorer:
         self,
         project_key: str,
         pr_number: Optional[int] = None,
+        job_crashed: bool = False,
     ) -> tuple[float, Dict[str, Any]]:
         """Score based on SonarCloud Quality Gate status."""
         max_pts = WEIGHTS["sonar_gate"]
+        if job_crashed:
+            # The sonar-scan job itself failed before producing a gate result.
+            # This is NOT the same as "gate passed" — must not score full marks,
+            # and must not be reported as a measured 0%/clean result either.
+            return max_pts * 0.5, {
+                "status": "UNKNOWN",
+                "note": "SonarCloud analysis did not complete (job crashed) — "
+                        "quality gate not verified, manual review required",
+                "coverage": "N/A", "bugs": 0, "vulns": 0,
+            }
         if not project_key:
             return max_pts * 0.7, {"note": "no project_key configured"}
         try:
@@ -358,9 +479,26 @@ class CDReleaseScorer:
         repo: str,
         commit_sha: str,
         run_id: str,
+        codeql_job_crashed: bool = False,
+        trivy_job_crashed: bool = False,
     ) -> tuple[float, Dict[str, Any]]:
         """Score based on CodeQL alerts and Trivy CVEs."""
         max_pts = WEIGHTS["security_scans"]
+
+        if codeql_job_crashed or trivy_job_crashed:
+            # A crashed scan job means "not verified", not "0 vulnerabilities
+            # found" — fetching alerts/artifacts here would legitimately come
+            # back empty and silently score as clean, which is the bug we're
+            # fixing. Short-circuit to an explicit UNKNOWN state instead.
+            crashed = [n for n, f in (("CodeQL", codeql_job_crashed), ("Trivy", trivy_job_crashed)) if f]
+            return max_pts * 0.5, {
+                "unknown": True,
+                "note": f"Security scan incomplete ({' + '.join(crashed)} job crashed) — "
+                        f"vulnerabilities not verified, manual review required",
+                "codeql_critical": 0, "codeql_high": 0,
+                "trivy_critical": 0, "trivy_high": 0,
+            }
+
         codeql_critical = 0
         codeql_high     = 0
         trivy_critical  = 0
@@ -438,9 +576,13 @@ class CDReleaseScorer:
     ) -> tuple[float, Dict[str, Any]]:
         """Score based on test coverage from SonarCloud metrics."""
         max_pts = WEIGHTS["test_coverage"]
+        cov_raw = sonar_detail.get("coverage", "N/A")
+        if cov_raw == "N/A" or sonar_detail.get("status") == "UNKNOWN":
+            # Coverage genuinely unknown (Sonar didn't run / didn't report it) —
+            # neutral score, NOT the same as a measured 0%.
+            return max_pts * 0.5, {"coverage": "N/A"}
         try:
-            cov_raw = sonar_detail.get("coverage", "0")
-            cov     = float(str(cov_raw).replace("%", "")) if cov_raw != "N/A" else 0.0
+            cov = float(str(cov_raw).replace("%", ""))
             if cov >= 80:
                 score = max_pts
             elif cov >= 70:

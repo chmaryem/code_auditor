@@ -27,8 +27,10 @@ is preserved from v2.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -351,6 +353,36 @@ def _analyze_dependent_live(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Signal file — extension feedback loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_block_signal(project_path: Path, reason: str,
+                         score: float = 0, critical: int = 0) -> None:
+    """Write .git/codeaudit_block.json so the VS Code extension shows a BLOCKED banner."""
+    try:
+        sig = project_path / ".git" / "codeaudit_block.json"
+        sig.write_text(json.dumps({
+            "blocked":   True,
+            "reason":    reason,
+            "score":     round(score),
+            "critical":  critical,
+            "timestamp": datetime.now().isoformat(),
+        }), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _clear_block_signal(project_path: Path) -> None:
+    """Remove the block signal file so the extension clears its BLOCKED banner."""
+    try:
+        sig = project_path / ".git" / "codeaudit_block.json"
+        if sig.exists():
+            sig.unlink()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Hook principal
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -363,6 +395,27 @@ def run_pre_commit_hook(project_path: Path) -> int:
         print(f"  {_DM}Pas un dépôt Git — analyse ignorée.{_R}\n")
         return 0
 
+    # ── F0 : Compiled/cache artifacts check (WARNING) ─────────────────────────
+    _ARTIFACT_PATTERNS = {
+        ".pyc", ".pyo", ".class", ".o", ".obj", ".dll", ".so",
+        ".pyd", ".exe", ".cache",
+    }
+    _ARTIFACT_DIRS = {"__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", ".tox"}
+    staged_all = get_staged_files(project_path)
+    artifact_files = [
+        f["path"] for f in staged_all
+        if (Path(f["path"]).suffix.lower() in _ARTIFACT_PATTERNS
+            or any(part in _ARTIFACT_DIRS for part in Path(f["path"]).parts))
+    ]
+    if artifact_files:
+        print(f"  {_YL}⚠  [F0] {len(artifact_files)} fichier(s) compilé(s)/cache stagé(s) :{_R}")
+        for p in artifact_files[:5]:
+            print(f"    {_DM}• {p}{_R}")
+        if len(artifact_files) > 5:
+            print(f"    {_DM}  … et {len(artifact_files) - 5} autre(s){_R}")
+        print(f"  {_DM}  Ajoutez ces extensions à votre .gitignore pour les exclure.{_R}")
+        print()
+
     # ── F1 : Secret Scan (HARD BLOCK) ─────────────────────────────────────────
     try:
         from smart_git.git_secret_scanner import scan_staged_secrets, render_secret_scan_report
@@ -372,6 +425,7 @@ def run_pre_commit_hook(project_path: Path) -> int:
             print(f"  {_YL}⚠  Secret scan erreur (ignoré) : {secret_report.error}{_R}")
         elif secret_report.has_secrets:
             render_secret_scan_report(secret_report)
+            _write_block_signal(project_path, "secrets detected in staged files")
             return 1  # HARD BLOCK — aucun secret ne doit être commité
         else:
             print(f"  {_GR}✓  [F1] Aucun secret détecté.{_R}")
@@ -401,15 +455,15 @@ def run_pre_commit_hook(project_path: Path) -> int:
 
     print()
 
-    staged = get_staged_files(project_path)
     code_files = [
-        f for f in staged
+        f for f in staged_all
         if f["status"] != "D"
         and Path(f["path"]).suffix.lower() in WATCHED_EXTENSIONS
     ]
 
     if not code_files:
         print(f"  {_GR}✓  Aucun fichier de code dans ce commit.{_R}\n")
+        _clear_block_signal(project_path)
         return 0
 
     # Locate cache DB
@@ -499,10 +553,11 @@ def run_pre_commit_hook(project_path: Path) -> int:
         staged_score   = staged_score,
         dep_score_raw  = dep_score_raw,
         final_score    = final_score,
-        score_before   = score_before,        # FIX 4
+        score_before   = score_before,
         staged_reports = staged_reports,
         dep_reports    = dep_reports,
         code_files     = code_files,
+        project_path   = project_path,
     )
 
 
@@ -514,10 +569,11 @@ def _render_and_decide(
     staged_score:   float,
     dep_score_raw:  float,
     final_score:    float,
-    score_before:   float,       # FIX 4
+    score_before:   float,
     staged_reports: list,
     dep_reports:    list,
     code_files:     list,
+    project_path:   Path,
 ) -> int:
 
     nb_staged     = len(staged_reports)
@@ -593,28 +649,47 @@ def _render_and_decide(
         print(f"  {'─' * W}")
         print()
 
-    # Stale warning (FIX 2)
+    # Stale gate — STRICT_MODE : impossible de garantir la qualité sans analyse récente
     if nb_stale > 0:
-        print(f"  {_YL}⚠  {nb_stale} fichier(s) avec cache obsolète "
-              f"(modifié depuis la dernière analyse Watch).{_R}")
-        print(f"  {_DM}  Lancez 'python main.py watch <projet>' "
-              f"et sauvegardez ces fichiers.{_R}")
-        print()
+        if STRICT_MODE:
+            print(f"  {_RD}{_B}✗  COMMIT BLOQUÉ — {nb_stale} fichier(s) sans analyse Watch récente{_R}")
+            print(f"  {_RD}  La qualité ne peut pas être garantie tant que le cache est obsolète.{_R}")
+            print(f"  {_YL}  → Lancez Watch puis sauvegardez ces fichiers, puis recommittez.{_R}")
+            stale_names = [r["path"].split("/")[-1] for r in staged_reports if r.get("stale")]
+            for n in stale_names[:5]:
+                print(f"    {_DM}• {n}{_R}")
+            print(f"  {_DM}  Pour forcer : git commit --no-verify{_R}\n")
+            _write_block_signal(
+                project_path,
+                f"{nb_stale} fichier(s) sans analyse Watch",
+                score=0,
+                critical=0,
+            )
+            return 1
+        else:
+            print(f"  {_YL}⚠  {nb_stale} fichier(s) avec cache obsolète "
+                  f"(modifié depuis la dernière analyse Watch).{_R}")
+            print(f"  {_DM}  Lancez 'python main.py watch <projet>' "
+                  f"et sauvegardez ces fichiers.{_R}")
+            print()
 
     # ── Décision ─────────────────────────────────────────────────────────────
     if final_score == 0:
         print(f"  {_GR}{_B}✓  COMMIT AUTORISÉ — aucun problème détecté.{_R}\n")
+        _clear_block_signal(project_path)
         return 0
 
     if final_score < WARN_THRESHOLD:
         print(f"  {_GR}✓  COMMIT AUTORISÉ{_R} — "
               f"{_DM}problèmes mineurs (score {final_score:.0f} < {WARN_THRESHOLD}).{_R}\n")
+        _clear_block_signal(project_path)
         return 0
 
     if final_score < BLOCK_THRESHOLD:
         print(f"  {_YL}{_B}⚠  COMMIT AVEC AVERTISSEMENT{_R} — score {final_score:.0f}")
         print(f"  {_YL}Des problèmes HIGH ont été détectés dans les fichiers "
               f"stagés ou leurs dépendants.{_R}\n")
+        _clear_block_signal(project_path)
         return 0
 
     staged_crits = sum(r["bugs_critical"] for r in staged_reports if r["analyzed"])
@@ -629,9 +704,16 @@ def _render_and_decide(
             print(f"  {_RD}  • {dep_crits} CRITICAL dans les dépendants : "
                   f"{', '.join(affected[:4])}{_R}")
         print(f"  {_DM}  Pour forcer : git commit --no-verify{_R}\n")
+        _write_block_signal(
+            project_path,
+            f"score {final_score:.0f} ≥ {BLOCK_THRESHOLD} (STRICT MODE)",
+            final_score,
+            staged_crits + dep_crits,
+        )
         return 1
 
     print(f"  {_YL}{_B}⚠  COMMIT AVEC ALERTE{_R} — score {final_score:.0f} (mode non-strict)\n")
+    _clear_block_signal(project_path)
     return 0
 
 

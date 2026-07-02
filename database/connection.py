@@ -1,14 +1,3 @@
-"""
-database/connection.py — SQLAlchemy 2.x async engine + session factory.
-
-Usage in FastAPI endpoints:
-    from database import get_db
-    from sqlalchemy.ext.asyncio import AsyncSession
-
-    @router.get("/...")
-    async def handler(db: AsyncSession = Depends(get_db)):
-        ...
-"""
 from __future__ import annotations
 
 import logging
@@ -28,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 _db = _cfg.database
 
-# ── Engine ────────────────────────────────────────────────────────────────────
 
 engine = create_async_engine(
     _db.url,
@@ -39,8 +27,6 @@ engine = create_async_engine(
     echo=_db.echo,
     future=True,
 )
-
-# ── Session factories ─────────────────────────────────────────────────────────
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
@@ -68,13 +54,9 @@ SyncSessionLocal = sessionmaker(
 )
 
 
-# ── Base class for all ORM models ─────────────────────────────────────────────
-
 class Base(DeclarativeBase):
     pass
 
-
-# ── FastAPI dependency ────────────────────────────────────────────────────────
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
@@ -88,7 +70,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
-# ── Startup helper ────────────────────────────────────────────────────────────
 
 async def init_db() -> None:
     """Create all tables that do not exist yet (safe to call on every startup)."""

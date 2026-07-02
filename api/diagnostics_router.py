@@ -1,17 +1,3 @@
-"""
-api/diagnostics_router.py — Diagnostics API for VS Code plugin.
-
-Endpoints:
-  GET  /api/diagnostics              — diagnostics for one file (from cache)
-  POST /api/diagnostics/batch        — diagnostics for multiple files at once
-  GET  /api/diagnostics/patterns     — recurring patterns from PatternMemory
-  POST /api/feedback                 — inline completion / analysis feedback
-
-These endpoints are designed so the VS Code extension can:
-  1. Load diagnostics for the active file WITHOUT triggering a full re-analysis
-  2. Show inline squiggles + Problems panel items immediately from cache
-  3. Collect accept/reject feedback to improve inline completions over time
-"""
 from __future__ import annotations
 
 import logging
