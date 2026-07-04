@@ -1,0 +1,54 @@
+{
+  "branch_report": {
+    "base": "main",
+    "branch": "feature/x",
+    "commits": [
+      {
+        "author": "T",
+        "date": "<DATE>",
+        "hash": "<SHA>",
+        "message": "go"
+      }
+    ],
+    "conflict_risks": [],
+    "files": [
+      {
+        "analysis_text": "",
+        "bugs_critical": 0,
+        "bugs_high": 0,
+        "bugs_low": 0,
+        "bugs_medium": 0,
+        "from_cache": false,
+        "path": "app.py",
+        "score": 0.0,
+        "status": "M"
+      }
+    ],
+    "files_clean_count": 1,
+    "files_with_issues_count": 0,
+    "merge_base_hash": "<SHA>",
+    "recommendation": "Branche prête à merger. Score de risque : 0. Aucun problème critique détecté.",
+    "success": true,
+    "total_critical": 0,
+    "total_high": 0,
+    "total_score": 0.0,
+    "verdict": "MERGE_OK"
+  },
+  "changes": {},
+  "commit_lint_report": {},
+  "commit_message": "",
+  "confidence": 0.9,
+  "conflict_report": {},
+  "cross_pr_report": {},
+  "elapsed_seconds": 0,
+  "errors": [],
+  "intent": "branch_readiness",
+  "pr_description": {},
+  "pr_report": {},
+  "readiness_report": {},
+  "response": "## Branch Readiness — `feature/x` → `main`\n\n- Verdict : **MERGE_OK**\n- Score total : **0.0**\n- Critical : **0**\n- High : **0**\n- Conflits potentiels : **0**\n\n### Recommandation\nBranche prête à merger. Score de risque : 0. Aucun problème critique détecté.\n\n### Fichiers principaux\n- `app.py` — severity `None` score `0.0`",
+  "safe_mode": true,
+  "secret_scan_report": {},
+  "session_snapshot": {},
+  "test_impact_report": {}
+}

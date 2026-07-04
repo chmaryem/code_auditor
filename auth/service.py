@@ -8,7 +8,7 @@ import secrets
 from auth import security, store
 from config import config as _cfg
 settings = _cfg.auth
-from auth.schemas import PairingTokenOut, RequestCodeOut, TokenOut, UserOut
+from auth.schemas import PairingStatusOut, PairingTokenOut, RequestCodeOut, TokenOut, UserOut
 
 logger = logging.getLogger("auth")
 
@@ -122,6 +122,10 @@ def get_me(principal: security.Principal) -> UserOut:
 def issue_pairing_token(principal: security.Principal) -> PairingTokenOut:
     token = store.create_pairing(principal.id)
     return PairingTokenOut(pairing_token=token, expires_in=settings.pairing_ttl_sec)
+
+
+def pairing_status(pairing_token: str) -> PairingStatusOut:
+    return PairingStatusOut(status=store.pairing_status(pairing_token))
 
 
 def redeem_pairing_token(pairing_token: str) -> TokenOut:

@@ -69,6 +69,10 @@ class PairingTokenOut(BaseModel):
     expires_in: int
 
 
+class PairingStatusOut(BaseModel):
+    status: str  # "pending" | "redeemed" | "expired"
+
+
 class RequestCodeOut(BaseModel):
     detail: str
     resend_in: int

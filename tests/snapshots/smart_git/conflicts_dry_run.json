@@ -1,0 +1,26 @@
+{
+  "branch_report": {},
+  "changes": {},
+  "commit_lint_report": {},
+  "commit_message": "",
+  "confidence": 0.9,
+  "conflict_report": {
+    "conflict_files": [],
+    "dry_run": true,
+    "has_conflicts": false,
+    "message": "No conflict files detected",
+    "success": true
+  },
+  "cross_pr_report": {},
+  "elapsed_seconds": 0,
+  "errors": [],
+  "intent": "conflict_resolution_dry_run",
+  "pr_description": {},
+  "pr_report": {},
+  "readiness_report": {},
+  "response": "## Conflict Resolution\n\n✅ Aucun fichier en conflit détecté.",
+  "safe_mode": true,
+  "secret_scan_report": {},
+  "session_snapshot": {},
+  "test_impact_report": {}
+}

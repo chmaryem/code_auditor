@@ -1,0 +1,24 @@
+{
+  "branch_report": {},
+  "changes": {},
+  "commit_lint_report": {},
+  "commit_message": "",
+  "confidence": 0.9,
+  "conflict_report": {},
+  "cross_pr_report": {
+    "conflicts": [],
+    "error": "owner et repo sont requis pour la détection cross-PR.",
+    "total_open_prs": 0
+  },
+  "elapsed_seconds": 0,
+  "errors": [],
+  "intent": "cross_pr_conflicts",
+  "pr_description": {},
+  "pr_report": {},
+  "readiness_report": {},
+  "response": "## Cross-PR Conflicts\n\nErreur : `owner et repo sont requis pour la détection cross-PR.`",
+  "safe_mode": true,
+  "secret_scan_report": {},
+  "session_snapshot": {},
+  "test_impact_report": {}
+}

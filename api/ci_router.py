@@ -1499,6 +1499,61 @@ async def ci_open_pr(req: OpenPRRequest):
     )
 
 
+# ── Merge PR (real GitHub merge → satisfies event_name=='push' on main) ───────
+#
+# The dashboard always triggers pipelines via workflow_dispatch, which never
+# satisfies the generated publish/deploy jobs' `github.ref == 'refs/heads/main'
+# && github.event_name == 'push'` condition. A real merge into main is the
+# only way to make that gate true, so `publish` (and `deploy`, once enabled)
+# can actually run for real instead of being structurally skipped.
+
+class MergePRRequest(BaseModel):
+    repo:      str = Field(..., description="owner/repo")
+    pr_number: int = Field(..., description="Pull request number to merge")
+
+class MergePRResponse(BaseModel):
+    merged:      bool
+    sha:         str = ""
+    message:     str = ""
+    actions_url: str = ""
+
+
+@ci_router.post("/ci/merge-pr", response_model=MergePRResponse,
+                 summary="Merge a pull request into its base branch (real GitHub merge)")
+async def ci_merge_pr(
+    req: MergePRRequest,
+    user: Principal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    import os as _os
+    from dotenv import load_dotenv as _load_dotenv
+    from database.repositories.user_repo import UserRepo
+
+    _load_dotenv(override=False)
+    owner, repo_name = req.repo.split("/", 1)
+
+    async with db.begin():
+        gh_token = await UserRepo(db).get_github_token_by_email(user.email)
+    if not gh_token:
+        gh_token = _os.environ.get("GITHUB_TOKEN") or _os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    if not gh_token:
+        raise HTTPException(403, "GitHub account not connected. Connect via /api/auth/github/start.")
+
+    try:
+        result = _gh(gh_token, "PUT",
+            f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{req.pr_number}/merge",
+            {"merge_method": "squash"})
+    except urllib.error.HTTPError as e:
+        raise HTTPException(e.code or 500, f"Merge failed: {e}")
+
+    return MergePRResponse(
+        merged      = result.get("merged", False),
+        sha         = result.get("sha", ""),
+        message     = result.get("message", ""),
+        actions_url = f"https://github.com/{owner}/{repo_name}/actions?query=branch%3Amain",
+    )
+
+
 def _default_pr_body(files: "List[OpenPRFile]", branch: str) -> str:
     file_list = "\n".join(f"- `{f.path}`" for f in files)
     return f"""## CI/CD Pipeline — Code Auditor

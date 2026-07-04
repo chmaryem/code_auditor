@@ -47,7 +47,7 @@ try:
         public User findByUsername(String username) throws SQLException {
     // All fields required for a complete User object (as per User constructor) should be retrieved.
     String query = "SELECT id, username, password_hash, email, role, created_at, last_login, is_active FROM users WHERE username = ?";
-    // Parameterized query to prevent SQL injection
+    // Using PreparedStatement to prevent SQL Injection
     PreparedStatement statement = connection.prepareStatement(query);
     statement.setString(1, username);
             try (Connection conn = dataSource.getConnection();
@@ -91,7 +91,7 @@ try:
 
         public User createUser(String username, String email, String password, String role) throws SQLException {
             String hashedPassword = hashPassword(password);
-            String insertQuery = "INSERT INTO users (username, emai'''
+            String insertQuery = "INSERT INTO users (username, '''
     # Quick syntax check
     braces = code.count('{') == code.count('}')
     no_markers = '<<<<<<' not in code

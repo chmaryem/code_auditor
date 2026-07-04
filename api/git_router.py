@@ -161,10 +161,12 @@ async def get_git_status(
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
-
-async def _invoke(message: str, **kwargs) -> Dict[str, Any]:
-    from langchain_agents.graphs.smart_git_graph import ainvoke_smart_git
-    return await ainvoke_smart_git(message=message, **kwargs)
+# NOTE (Phase 0 multi-agent refactor): the Smart Git FastAPI endpoints no longer
+# go through the LangGraph. Each endpoint calls its underlying smart_git tool
+# directly and formats the response itself. The former `_invoke` graph shim and
+# the `_to_response` mapper were removed once all 8 endpoints were migrated.
+# The LangGraph (smart_git_graph.py) is still used by the ChatAgent and the CLI
+# (main.py), so it is retained until those consumers are migrated separately.
 
 
 def _pg_save_git_report(
@@ -304,36 +306,18 @@ def _pg_save_git_report(
     threading.Thread(target=_write, daemon=True).start()
 
 
-def _to_response(result: Dict[str, Any], elapsed: float) -> GitResponse:
-    return GitResponse(
-        response            = result.get("response", ""),
-        intent              = result.get("intent", ""),
-        confidence          = float(result.get("confidence", 0.0)),
-        safe_mode           = bool(result.get("safe_mode", True)),
-        elapsed_seconds     = elapsed,
-        session_snapshot    = result.get("session_snapshot") or {},
-        branch_report       = result.get("branch_report") or {},
-        commit_message      = result.get("commit_message", ""),
-        changes             = result.get("changes") or {},
-        conflict_report     = result.get("conflict_report") or {},
-        pr_report           = result.get("pr_report") or {},
-        readiness_report    = result.get("readiness_report") or {},
-        secret_scan_report  = result.get("secret_scan_report") or {},
-        commit_lint_report  = result.get("commit_lint_report") or {},
-        test_impact_report  = result.get("test_impact_report") or {},
-        cross_pr_report     = result.get("cross_pr_report") or {},
-        pr_description      = result.get("pr_description") or {},
-        errors              = result.get("errors") or [],
-    )
-
-
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @git_router.post("/status", response_model=GitResponse, summary="Git session status")
 async def git_status(req: GitSessionRequest):
     """
     Retourne le snapshot de session Git (bugs accumulés, score de risque,
-    fichiers non commités). Utilise SmartGitGraph → node_session.
+    fichiers non commités).
+
+    Phase 0 (refactor multi-agents) : appel DIRECT du tool de session + du
+    formateur, sans passer par le LangGraph. L'endpoint connaît déjà son intent
+    (`git_status`) — inutile de le re-deviner via le routeur regex `decide`.
+    Sortie garantie identique au graphe — cf. tests/smart_git_snapshot.py.
     """
     project_path = Path(req.project_path)
     if not project_path.exists():
@@ -341,23 +325,38 @@ async def git_status(req: GitSessionRequest):
 
     t0 = time.time()
     try:
-        result = await _invoke(
-            message="git status",
-            project_path=str(project_path),
-            session_id=req.session_id,
+        from langchain_agents.agents.lc_git_session_agent import git_session_agent
+        from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
+
+        snapshot = await asyncio.to_thread(
+            git_session_agent.get_status, str(project_path.resolve())
+        )
+        response = git_synthesis_agent.synthesize(
+            {"intent": "git_status", "session_snapshot": snapshot}
         )
     except Exception as e:
         logger.exception("git/status error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"SmartGit status error: {e}")
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response         = response,
+        intent           = "git_status",
+        confidence       = 0.5,
+        safe_mode        = True,
+        elapsed_seconds  = round(time.time() - t0, 2),
+        session_snapshot = snapshot or {},
+    )
 
 
 @git_router.post("/branch", response_model=GitResponse, summary="Branch readiness")
 async def git_branch(req: GitBranchRequest, user: Principal = Depends(get_current_user)):
     """
     Analyse une branche feature vs sa base et retourne un verdict de merge
-    (criticality, uncommitted bugs, divergence). SmartGitGraph → node_branch.
+    (criticality, uncommitted bugs, divergence).
+
+    Phase 0 (refactor multi-agents) : appel DIRECT du tool d'analyse de branche
+    + formateur, sans passer par le LangGraph. Sortie identique au graphe —
+    cf. tests/smart_git_snapshot.py.
     """
     project_path = Path(req.project_path)
     if not project_path.exists():
@@ -365,30 +364,42 @@ async def git_branch(req: GitBranchRequest, user: Principal = Depends(get_curren
 
     t0 = time.time()
     try:
-        result = await _invoke(
-            message=f"is branch {req.branch} ready to merge into {req.base}",
-            project_path=str(project_path),
-            branch=req.branch,
-            base=req.base,
-            session_id=req.session_id,
+        from langchain_agents.agents.lc_git_branch_agent import git_branch_agent
+        from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
+
+        report = await asyncio.to_thread(
+            git_branch_agent.analyze_branch,
+            project_path=str(project_path.resolve()),
+            branch=req.branch or "HEAD",
+            base=req.base or "main",
+        )
+        response = git_synthesis_agent.synthesize(
+            {"intent": "branch_readiness", "branch_report": report}
         )
     except Exception as e:
         logger.exception("git/branch error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"SmartGit branch error: {e}")
 
     _pg_save_git_report(
         user_email  = user.email,
         report_type = "branch",
-        raw_data    = result,
+        raw_data    = {"branch_report": report, "response": response},
         local_path  = str(project_path),
         branch      = req.branch,
         base_branch = req.base,
-        verdict     = (result.get("branch_report") or {}).get("verdict", ""),
-        total_score = (result.get("branch_report") or {}).get("total_score"),
-        summary     = result.get("response", "")[:2000],
+        verdict     = (report or {}).get("verdict", ""),
+        total_score = (report or {}).get("total_score"),
+        summary     = response[:2000],
     )
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response        = response,
+        intent          = "branch_readiness",
+        confidence      = 0.9,
+        safe_mode       = True,
+        elapsed_seconds = round(time.time() - t0, 2),
+        branch_report   = report or {},
+    )
 
 
 @git_router.post("/commit-msg", response_model=GitResponse, summary="Generate commit message")
@@ -435,16 +446,27 @@ async def git_conflicts(req: GitConflictRequest):
 
     t0 = time.time()
     try:
-        result = await _invoke(
-            message="resolve conflicts dry run",
-            project_path=str(project_path),
-            session_id=req.session_id,
+        from langchain_agents.agents.lc_git_conflict_agent import git_conflict_agent
+        from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
+
+        report = await asyncio.to_thread(
+            git_conflict_agent.dry_run_resolution, str(project_path.resolve())
+        )
+        response = git_synthesis_agent.synthesize(
+            {"intent": "conflict_resolution_dry_run", "conflict_report": report}
         )
     except Exception as e:
         logger.exception("git/conflicts error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"SmartGit conflicts error: {e}")
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response        = response,
+        intent          = "conflict_resolution_dry_run",
+        confidence      = 0.9,
+        safe_mode       = True,
+        elapsed_seconds = round(time.time() - t0, 2),
+        conflict_report = report or {},
+    )
 
 
 @git_router.post("/pr/review", response_model=GitResponse, summary="PR review")
@@ -455,29 +477,39 @@ async def git_pr_review(req: GitPRRequest, user: Principal = Depends(get_current
     """
     t0 = time.time()
     try:
-        result = await _invoke(
-            message=f"review PR #{req.pr_number}",
-            owner=req.owner,
-            repo=req.repo,
-            pr_number=req.pr_number,
-            session_id=req.session_id,
+        from langchain_agents.agents.lc_git_pr_agent import git_pr_agent
+        from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
+
+        if not req.owner or not req.repo or not req.pr_number:
+            report = {"success": False, "error": "Missing owner/repo/pr_number"}
+        else:
+            report = await git_pr_agent.review_pr(req.owner, req.repo, req.pr_number)
+        response = git_synthesis_agent.synthesize(
+            {"intent": "pr_review", "pr_report": report}
         )
     except Exception as e:
         logger.exception("git/pr/review error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"SmartGit pr/review error: {e}")
 
     _pg_save_git_report(
         user_email   = user.email,
         report_type  = "pr_review",
-        raw_data     = result,
+        raw_data     = {"pr_report": report, "response": response},
         github_slug  = f"{req.owner}/{req.repo}",
         project_name = req.repo,
         pr_number    = req.pr_number,
-        verdict      = (result.get("pr_report") or {}).get("verdict", ""),
-        summary      = result.get("response", "")[:2000],
+        verdict      = (report or {}).get("verdict", ""),
+        summary      = response[:2000],
     )
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response        = response,
+        intent          = "pr_review",
+        confidence      = 0.9,
+        safe_mode       = True,
+        elapsed_seconds = round(time.time() - t0, 2),
+        pr_report       = report or {},
+    )
 
 
 @git_router.post("/pr/readiness", response_model=GitResponse, summary="PR merge readiness")
@@ -488,32 +520,42 @@ async def git_pr_readiness(req: GitPRRequest, user: Principal = Depends(get_curr
     """
     t0 = time.time()
     try:
-        result = await _invoke(
-            message=f"is PR #{req.pr_number} ready to merge?",
-            owner=req.owner,
-            repo=req.repo,
-            pr_number=req.pr_number,
-            session_id=req.session_id,
+        from langchain_agents.agents.lc_git_pr_agent import git_pr_agent
+        from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
+
+        if not req.owner or not req.repo or not req.pr_number:
+            report = {"success": False, "error": "Missing owner/repo/pr_number"}
+        else:
+            report = await git_pr_agent.readiness(req.owner, req.repo, req.pr_number)
+        response = git_synthesis_agent.synthesize(
+            {"intent": "pr_readiness", "readiness_report": report}
         )
     except Exception as e:
         logger.exception("git/pr/readiness error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"SmartGit pr/readiness error: {e}")
 
-    _ready = (result.get("readiness_report") or {}).get("ready")
+    _ready = (report or {}).get("ready")
     _verdict = "READY" if _ready is True else ("BLOCKED" if _ready is False else "")
 
     _pg_save_git_report(
         user_email   = user.email,
         report_type  = "pr_review",
-        raw_data     = result,
+        raw_data     = {"readiness_report": report, "response": response},
         github_slug  = f"{req.owner}/{req.repo}",
         project_name = req.repo,
         pr_number    = req.pr_number,
         verdict      = _verdict,
-        summary      = result.get("response", "")[:2000],
+        summary      = response[:2000],
     )
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response         = response,
+        intent           = "pr_readiness",
+        confidence       = 0.9,
+        safe_mode        = True,
+        elapsed_seconds  = round(time.time() - t0, 2),
+        readiness_report = report or {},
+    )
 
 
 # ── Fuzzy replacement engine ─────────────────────────────────────────────────
@@ -713,26 +755,40 @@ async def git_secret_scan(req: GitSecretScanRequest, user: Principal = Depends(g
 
     t0 = time.time()
     try:
-        result = await _invoke(
-            message="scan secrets staged files",
-            project_path=str(project_path),
-            session_id=req.session_id,
+        from langchain_agents.agents.lc_git_secret_agent import LCGitSecretAgent
+        from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
+
+        scanned = await asyncio.to_thread(
+            LCGitSecretAgent().run, {"project_path": str(project_path.resolve())}
+        )
+        report = scanned.get("secret_scan_report") or {}
+        response = git_synthesis_agent.synthesize(
+            {"intent": "secret_scan", "secret_scan_report": report}
         )
     except Exception as e:
         logger.exception("git/secret-scan error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"SmartGit secret-scan error: {e}")
 
-    _found = (result.get("secret_scan_report") or {}).get("found", False)
+    # Comportement préservé à l'identique : la clé "found" n'existe pas dans le
+    # rapport sérialisé (has_secrets/blocked), donc _found reste False comme avant.
+    _found = report.get("found", False)
     _pg_save_git_report(
         user_email  = user.email,
         report_type = "secret_scan",
-        raw_data    = result,
+        raw_data    = {"secret_scan_report": report, "response": response},
         local_path  = str(project_path),
         verdict     = "BLOCKED" if _found else "CLEAN",
-        summary     = result.get("response", "")[:2000],
+        summary     = response[:2000],
     )
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response           = response,
+        intent             = "secret_scan",
+        confidence         = 0.92,
+        safe_mode          = True,
+        elapsed_seconds    = round(time.time() - t0, 2),
+        secret_scan_report = report or {},
+    )
 
 
 # ── F3: Commit Lint ───────────────────────────────────────────────────────────
@@ -953,31 +1009,43 @@ async def git_cross_pr_conflicts(req: GitCrossPRRequest, user: Principal = Depen
     """
     t0 = time.time()
     try:
-        result = await _invoke(
-            message=f"cross pr analysis {req.owner}/{req.repo}",
-            owner=req.owner,
-            repo=req.repo,
-            pr_number=req.pr_number,
-            base=req.base,
-            session_id=req.session_id,
+        from langchain_agents.agents.lc_git_cross_pr_agent import LCGitCrossPRAgent
+        from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
+
+        scanned = await asyncio.to_thread(LCGitCrossPRAgent().run, {
+            "owner": req.owner,
+            "repo": req.repo,
+            "pr_number": req.pr_number,
+            "base": req.base,
+        })
+        report = scanned.get("cross_pr_report") or {}
+        response = git_synthesis_agent.synthesize(
+            {"intent": "cross_pr_conflicts", "cross_pr_report": report}
         )
     except Exception as e:
         logger.exception("git/pr/cross-conflicts error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"SmartGit cross-conflicts error: {e}")
 
     _pg_save_git_report(
         user_email   = user.email,
         report_type  = "pr_review",
-        raw_data     = result,
+        raw_data     = {"cross_pr_report": report, "response": response},
         github_slug  = f"{req.owner}/{req.repo}",
         project_name = req.repo,
         pr_number    = req.pr_number,
         base_branch  = req.base,
-        verdict      = (result.get("cross_pr_report") or {}).get("verdict", ""),
-        summary      = result.get("response", "")[:2000],
+        verdict      = (report or {}).get("verdict", ""),
+        summary      = response[:2000],
     )
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response        = response,
+        intent          = "cross_pr_conflicts",
+        confidence      = 0.9,
+        safe_mode       = True,
+        elapsed_seconds = round(time.time() - t0, 2),
+        cross_pr_report = report or {},
+    )
 
 
 # ── F7: PR Auto-Description ───────────────────────────────────────────────────
@@ -991,34 +1059,46 @@ async def git_pr_description(req: GitPRDescriptionRequest, user: Principal = Dep
     """
     t0 = time.time()
     try:
-        result = await _invoke(
-            message=f"generate pr description for branch {req.branch}",
-            project_path=req.project_path or ".",
-            owner=req.owner,
-            repo=req.repo,
-            pr_number=req.pr_number,
-            branch=req.branch,
-            base=req.base,
-            session_id=req.session_id,
+        from langchain_agents.agents.lc_git_pr_description_agent import LCGitPRDescriptionAgent
+        from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
+
+        scanned = await asyncio.to_thread(LCGitPRDescriptionAgent().run, {
+            "project_path": req.project_path or ".",
+            "owner": req.owner,
+            "repo": req.repo,
+            "pr_number": req.pr_number,
+            "branch": req.branch,
+            "base": req.base,
+        })
+        report = scanned.get("pr_description") or {}
+        response = git_synthesis_agent.synthesize(
+            {"intent": "pr_description", "pr_description": report}
         )
     except Exception as e:
         logger.exception("git/pr/description error")
-        raise HTTPException(500, f"SmartGitGraph error: {e}")
+        raise HTTPException(500, f"SmartGit pr/description error: {e}")
 
     _pg_save_git_report(
         user_email   = user.email,
         report_type  = "pr_description",
-        raw_data     = result,
+        raw_data     = {"pr_description": report, "response": response},
         local_path   = req.project_path,
         github_slug  = f"{req.owner}/{req.repo}" if not req.project_path else "",
         project_name = req.repo or (Path(req.project_path).name if req.project_path else ""),
         pr_number    = req.pr_number,
         branch       = req.branch,
         base_branch  = req.base,
-        summary      = result.get("response", "")[:2000],
+        summary      = response[:2000],
     )
 
-    return _to_response(result, round(time.time() - t0, 2))
+    return GitResponse(
+        response        = response,
+        intent          = "pr_description",
+        confidence      = 0.92,
+        safe_mode       = True,
+        elapsed_seconds = round(time.time() - t0, 2),
+        pr_description  = report or {},
+    )
 
 
 # ── PR List — dashboard cloud surface (no LLM, direct REST) ──────────────────

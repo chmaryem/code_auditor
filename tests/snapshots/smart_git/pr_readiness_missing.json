@@ -1,0 +1,23 @@
+{
+  "branch_report": {},
+  "changes": {},
+  "commit_lint_report": {},
+  "commit_message": "",
+  "confidence": 0.9,
+  "conflict_report": {},
+  "cross_pr_report": {},
+  "elapsed_seconds": 0,
+  "errors": [],
+  "intent": "pr_readiness",
+  "pr_description": {},
+  "pr_report": {},
+  "readiness_report": {
+    "error": "Missing owner/repo/pr_number",
+    "success": false
+  },
+  "response": "## PR Readiness\n\nErreur : `Missing owner/repo/pr_number`",
+  "safe_mode": true,
+  "secret_scan_report": {},
+  "session_snapshot": {},
+  "test_impact_report": {}
+}

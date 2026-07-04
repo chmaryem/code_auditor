@@ -59,6 +59,10 @@ def _pairing_key(token: str) -> str:
     return f"{_NS}pairing:{token}"
 
 
+def _pairing_redeemed_key(token: str) -> str:
+    return f"{_NS}pairing:redeemed:{token}"
+
+
 def _refresh_key(jti: str) -> str:
     return f"{_NS}refresh:{jti}"
 
@@ -168,12 +172,25 @@ def pop_pairing(token: str) -> Optional[str]:
     """Single-use redeem: atomic GETDEL (fallback to get+delete on old Redis)."""
     key = _pairing_key(token)
     try:
-        return _r().getdel(key)
+        uid = _r().getdel(key)
     except redis.ResponseError:
         uid = _r().get(key)
         if uid:
             _r().delete(key)
-        return uid
+    if uid:
+        # Marker so the dashboard's status poll can tell "redeemed" apart from
+        # "expired" once the pairing key itself is gone.
+        _r().set(_pairing_redeemed_key(token), "1", ex=600)
+    return uid
+
+
+def pairing_status(token: str) -> str:
+    """Non-destructive poll for the dashboard: 'pending' | 'redeemed' | 'expired'."""
+    if _r().exists(_pairing_key(token)) == 1:
+        return "pending"
+    if _r().exists(_pairing_redeemed_key(token)) == 1:
+        return "redeemed"
+    return "expired"
 
 
 # ── VS Code OAuth-like PKCE flow ──────────────────────────────────────────────

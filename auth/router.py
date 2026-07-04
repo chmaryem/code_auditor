@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse
 
 from auth import email_service, service
 from auth.schemas import (
+    PairingStatusOut,
     PairingTokenOut,
     RedeemIn,
     RefreshIn,
@@ -98,6 +99,13 @@ def pairing_token(user: Principal = Depends(get_current_user)):
 @auth_router.post("/pairing/redeem", response_model=TokenOut)
 def redeem_pairing(body: RedeemIn):
     return _handle(service.redeem_pairing_token, body.pairing_token)
+
+
+@auth_router.get("/pairing/{token}/status", response_model=PairingStatusOut)
+def pairing_status(token: str, _user: Principal = Depends(get_current_user)):
+    """Dashboard polls this after opening the vscode:// deep link to know
+    whether the extension has redeemed the token (non-destructive read)."""
+    return _handle(service.pairing_status, token)
 
 
 # ── VS Code OAuth-like PKCE flow ──────────────────────────────────────────────
