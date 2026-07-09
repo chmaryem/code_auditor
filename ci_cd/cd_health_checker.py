@@ -49,47 +49,6 @@ class HealthReport:
         )
 
 
-@dataclass
-class MonitorSession:
-    """Aggregated result of a multi-poll monitoring window."""
-    deploy_url:       str
-    environment:      str
-    duration_s:       int              # How long we monitored
-    poll_count:       int
-    healthy_polls:    int
-    degraded_polls:   int
-    down_polls:       int
-    avg_latency_ms:   float
-    max_latency_ms:   float
-    final_grade:      str              # "HEALTHY" | "DEGRADED" | "DOWN"
-    regression:       bool             # True if regression vs pre-deploy
-    issues_detected:  List[str]        = field(default_factory=list)
-    snapshots:        List[HealthReport] = field(default_factory=list)
-
-    @property
-    def availability_pct(self) -> float:
-        if self.poll_count == 0:
-            return 100.0
-        return round(self.healthy_polls / self.poll_count * 100, 1)
-
-    def to_summary_lines(self) -> List[str]:
-        icon = {"HEALTHY": "✅", "DEGRADED": "⚠️", "DOWN": "🔴"}.get(
-            self.final_grade, "❓"
-        )
-        return [
-            f"{icon}  Post-Deploy Health — {self.final_grade}",
-            f"   URL          : {self.deploy_url}",
-            f"   Duration     : {self.duration_s}s ({self.poll_count} polls)",
-            f"   Availability : {self.availability_pct}%",
-            f"   Avg latency  : {self.avg_latency_ms:.0f}ms",
-            f"   Max latency  : {self.max_latency_ms:.0f}ms",
-            f"   Regression   : {'YES ⚠️' if self.regression else 'no'}",
-        ] + (
-            ["   Issues:"] + [f"     • {i}" for i in self.issues_detected]
-            if self.issues_detected else []
-        )
-
-
 class CDHealthChecker:
     """
     HTTP health checker for a deployed service.

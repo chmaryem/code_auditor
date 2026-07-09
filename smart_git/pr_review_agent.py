@@ -305,9 +305,10 @@ async def review_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
         return {"success": False, "error": str(e)}
 
     try:
-        # ── 1. Infos PR ──────────────────────────────────────────────────────
+        # ── 1. Infos PR (cache partagé ~90s — cf. pr_context_cache.py, Axe b) ──
         print(f"  Récupération PR #{pr_number}...")
-        pr_info = github.get_pr_info(owner, repo, pr_number)
+        from smart_git.pr_context_cache import fetch_pr_info_cached, fetch_pr_files_cached
+        pr_info = fetch_pr_info_cached(github, owner, repo, pr_number)
         if not pr_info:
             return {"success": False, "error": "PR introuvable"}
 
@@ -318,7 +319,7 @@ async def review_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
 
         # ── 2. Fichiers modifiés ──────────────────────────────────────────────
         print(f"  Récupération des fichiers...")
-        files = github.get_pr_files(owner, repo, pr_number)
+        files = fetch_pr_files_cached(github, owner, repo, pr_number)
         code_files = [
             f for f in files
             if Path(f.get("filename", f.get("path", ""))).suffix.lower() in CODE_EXTENSIONS
@@ -449,6 +450,11 @@ async def review_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
         inline_comments = all_comments[:_MAX_INLINE_COMMENTS]
         print(f"\n  Posting review sur GitHub ({len(inline_comments)} commentaire(s) inline)...")
         github.post_review(owner, repo, pr_number, body, event, comments=inline_comments)
+
+        # Rend les findings disponibles à un check Readiness ultérieur sur la
+        # même PR (collaboration opportuniste, Axe b step 3 — cf. pr_context_cache.py)
+        from smart_git.pr_context_cache import cache_review_findings
+        cache_review_findings(owner, repo, pr_number, total_critical, total_high, total_medium, event)
 
         # ── 7. Affichage terminal ─────────────────────────────────────────────
         verdict_display = {

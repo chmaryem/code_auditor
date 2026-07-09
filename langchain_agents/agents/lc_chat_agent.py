@@ -407,8 +407,51 @@ class LCChatAgent:
         prompt_text = self._build_fast_prompt(state)
         return self._call_llm_raw(prompt_text, label="chat_fast_answer", level="fast")
 
+    def _is_general_mode(self, state: Dict[str, Any]) -> bool:
+        """True quand aucune analyse projet n'est pertinente : salutation, ou question
+        générale côté dashboard sans fichier attaché. On répond alors sans le cadre
+        « Evidence from codebase »."""
+        if state.get("intent") == "chitchat":
+            return True
+        if state.get("scope") == "dashboard" and not state.get("file_code"):
+            return True
+        return False
+
+    def _build_general_prompt(self, state: Dict[str, Any]) -> str:
+        """Prompt d'assistant général : pas de restriction au projet, pas de section
+        « Evidence from codebase »."""
+        question = state.get("user_message", "")
+        if state.get("intent") == "chitchat":
+            return (
+                "Tu es Code Auditor AI, un assistant pour développeurs.\n"
+                "Réponds brièvement et chaleureusement à cette salutation, puis invite le "
+                "développeur à poser sa question ou sa demande.\n"
+                "N'ajoute AUCUNE section « Evidence from codebase » ni analyse de projet. "
+                "Réponds dans la langue du développeur.\n\n"
+                f"Message : {question}"
+            )
+        ctx_header = self._context_header(state)
+        return (
+            "Tu es Code Auditor AI, un assistant expert pour développeurs "
+            "(Git, CI/CD, DevOps, sécurité, langages, architecture).\n"
+            "Réponds à la question de façon claire, précise et structurée, à partir de tes "
+            "connaissances générales.\n"
+            "- N'ajoute PAS de section « Evidence from codebase » : aucune analyse du projet "
+            "n'est requise ici.\n"
+            "- Ne cite le projet du développeur que s'il fournit du code ou pose une question "
+            "spécifique à son dépôt.\n"
+            "- Réponds dans la langue du développeur. Sois concret, pas de remplissage.\n"
+            + (f"\nContexte : {ctx_header}\n" if ctx_header else "")
+            + f"\n## Question\n{question}"
+        )
+
     async def afast_answer(self, state: Dict[str, Any], config: Any = None) -> str:
         """Async fast answer path for SSE token streaming."""
+        if self._is_general_mode(state):
+            return await self._acall_llm_raw(
+                self._build_general_prompt(state), label="chat_general", config=config, level="fast"
+            )
+
         if not state.get("file_code", ""):
             return (
                 "Je n’ai pas trouvé le contenu du fichier cible.\n\n"
@@ -448,6 +491,13 @@ class LCChatAgent:
 
     async def aanswer(self, state: Dict[str, Any], config: Any = None) -> str:
         """Async contextual/deep answer path for LangGraph streaming."""
+        # Salutation / question générale (dashboard sans fichier) → assistant général,
+        # sans le cadre projet « Evidence from codebase ».
+        if self._is_general_mode(state):
+            return await self._acall_llm_raw(
+                self._build_general_prompt(state), label="chat_general", config=config, level="fast"
+            )
+
         prompt, inputs = self._build_context_prompt(state)
         llm = self._llm_for_level(state.get("context_level", "context"))
 

@@ -307,27 +307,6 @@ def tool_advise_rollback(
 # ── E. Monitor Tools ─────────────────────────────────────────────────────────
 
 @tool
-def tool_get_monitor_session(deploy_id: str) -> Dict[str, Any]:
-    """
-    Retrieves the stored post-deploy monitor session for a deployment.
-
-    Args:
-        deploy_id: The deploy_id from tool_record_deploy
-
-    Returns:
-        {final_grade, availability, avg_latency_ms, regression, issues, ...}
-        or {} if not found
-    """
-    try:
-        from services.mcp_redis_service import get_mcp_redis
-        redis = get_mcp_redis()
-        return redis.hgetall(f"cd:monitor:{deploy_id}") or {}
-    except Exception as e:
-        logger.error("tool_get_monitor_session failed: %s", e)
-        return {}
-
-
-@tool
 def tool_get_deploy_stats(
     repo:        str,
     environment: str = "",

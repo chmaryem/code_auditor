@@ -60,6 +60,7 @@ class TestGenState(TypedDict, total=False):
     # ── RAGAgent ───────────────────────────────────────────────────────────────
     rag_context:   Dict[str, Any]
     kg_context:    str
+    rag_curation_notes: Optional[str]   # additif — RAGCuratorAgent, résumé du filtrage ou None
 
     # ── GenerationAgent ────────────────────────────────────────────────────────
     prompt:            str   # base prompt, memorised for retries
@@ -77,10 +78,14 @@ class TestGenState(TypedDict, total=False):
     run_success:       Optional[bool]
     run_error_summary: Optional[str]
     run_error:         Any               # TestRunResult carried into runtime retry
+    _runtime_diagnosis_text: Optional[str]   # transitoire — TestReviewAgent job (b), consommé une fois
 
     # ── Retry counters (fidelity: structural max 1, runtime max 1) ─────────────
     retry_structural:  int
     retry_runtime:     int
+
+    # ── TestReviewAgent (additif, jamais lu par le routing) ─────────────────────
+    review_notes: Dict[str, Any]   # {"semantic_review": {...}|None, "runtime_diagnosis": {...}|None}
 
     # ── Transient routing markers (set by a node, read by its conditional edge) ─
     _gen_route:   str   # "validate" | "execute" | "finalize" | "end"

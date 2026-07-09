@@ -59,9 +59,10 @@ async def check_merge_readiness(owner: str, repo: str, pr_number: int) -> Dict[s
         return {"success": False, "ready": False, "error": "code_mode_client non disponible"}
 
     try:
-        # 1. Infos PR
+        # 1. Infos PR (cache partagé ~90s — cf. pr_context_cache.py, Axe b)
         print(f"  Récupération PR #{pr_number}...")
-        pr_info = github.get_pr_info(owner, repo, pr_number)
+        from smart_git.pr_context_cache import fetch_pr_info_cached
+        pr_info = fetch_pr_info_cached(github, owner, repo, pr_number)
         if not pr_info:
             return {"success": False, "ready": False, "error": "PR introuvable"}
 
@@ -102,6 +103,19 @@ async def check_merge_readiness(owner: str, repo: str, pr_number: int) -> Dict[s
         if not reviews_approved and not changes_req:
             reasons.append("pas encore d'approbation")
 
+        # 5b. Collaboration opportuniste avec l'agent Review (Axe b, step 3) :
+        # si une revue de code a déjà tourné sur cette PR (cache ~15 min), on
+        # incorpore ses findings de sécurité. Si aucune revue en cache (cas le
+        # plus courant), ce bloc est un no-op et le comportement est identique
+        # à avant — cf. smart_git/pr_context_cache.py.
+        from smart_git.pr_context_cache import get_cached_review_findings
+        security = get_cached_review_findings(owner, repo, pr_number)
+        security_critical = security.get("critical", 0) if security else 0
+        security_high      = security.get("high", 0) if security else 0
+        if security_critical > 0:
+            ready = False
+            reasons.append(f"{security_critical} vulnérabilité(s) critique(s) détectée(s) par la revue de code")
+
         details = " · ".join(reasons) if reasons else "Tous les critères sont satisfaits"
 
         # 6. Construire le rapport Markdown
@@ -131,6 +145,14 @@ async def check_merge_readiness(owner: str, repo: str, pr_number: int) -> Dict[s
             lines.append("- ❌ Modifications demandées — traiter les commentaires de review.")
         else:
             lines.append("- ℹ️ Reviews existantes mais pas d'approbation.")
+        if security is not None:
+            lines += ["", "### 4. Sécurité (Code Review)"]
+            if security_critical > 0:
+                lines.append(f"- ❌ {security_critical} vulnérabilité(s) critique(s), {security_high} high — voir l'onglet Review.")
+            elif security_high > 0:
+                lines.append(f"- ⚠️ {security_high} vulnérabilité(s) high détectée(s) — voir l'onglet Review.")
+            else:
+                lines.append("- ✅ Aucune vulnérabilité critique/high détectée par la revue de code.")
         lines += [
             "",
             "### Verdict global",
@@ -158,8 +180,12 @@ async def check_merge_readiness(owner: str, repo: str, pr_number: int) -> Dict[s
             (35 if ci_pass else 0) +
             (25 if reviews_approved else 0)
         )
+        # Security penalty only applies when a Review result is actually
+        # available (opportunistic collaboration) — never invented from thin air.
+        security_penalty = min(30, 10 * security_critical + 5 * security_high) if security else 0
+        readiness_score = max(0, readiness_score - security_penalty)
 
-        return {
+        result = {
             "success":          True,
             "ready":            ready,
             "mergeable":        mergeable,
@@ -170,6 +196,9 @@ async def check_merge_readiness(owner: str, repo: str, pr_number: int) -> Dict[s
             "body":             report,   # full markdown for frontend display
             "iterations":       0,
         }
+        if security is not None:
+            result["security_context"] = security
+        return result
 
     except Exception as e:
         logger.error("check_merge_readiness failed: %s", e)

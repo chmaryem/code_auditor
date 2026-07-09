@@ -70,6 +70,12 @@ def _generate_initial(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Memory pillar (additif) : hint préventif si un retry précédent est connu
+    # pour ce fichier. None si jamais retrié / Redis indisponible → prompt
+    # strictement identique à avant l'introduction de la Memory.
+    from langchain_agents.agents.lc_test_generation_agent import lc_test_generation_agent
+    retry_hint = lc_test_generation_agent.recall_retry_reason(str(source_path))
+
     # 8. Prompt LLM enrichi
     prompt = build_prompt(
         source_path=source_path,
@@ -82,6 +88,7 @@ def _generate_initial(state: Dict[str, Any]) -> Dict[str, Any]:
         language=language,
         incremental=is_incremental,
         existing_test_code=existing_test_code,
+        retry_hint=retry_hint,
     )
 
     # 9. Génération LLM directe
@@ -112,7 +119,11 @@ def _generate_structural_retry(state: Dict[str, Any]) -> Dict[str, Any]:
     previous_code = state["generated_code"]
 
     logger.info("Test non valide, retry avec feedback d'erreur...")
-    test_code_v2 = retry_with_error(previous_code, source_path, prompt)
+    from langchain_agents.agents.lc_test_generation_agent import lc_test_generation_agent
+    test_code_v2 = retry_with_error(
+        previous_code, source_path, prompt,
+        on_error_reason=lambda msg: lc_test_generation_agent.remember_retry_reason(str(source_path), msg),
+    )
 
     updates: Dict[str, Any] = {
         "_pre_retry_code":  previous_code,   # kept for restore if v2 also fails
@@ -132,7 +143,17 @@ def _generate_runtime_retry(state: Dict[str, Any]) -> Dict[str, Any]:
     previous_code = state["generated_code"]
     run_result = state["run_error"]
 
-    fixed_code = retry_with_runtime_error(previous_code, source_path, prompt, run_result)
+    # TestReviewAgent job (b), additif : si un diagnostic enrichi est disponible,
+    # il remplace error_summary UNIQUEMENT dans le texte envoyé au prompt de retry.
+    # Ne change JAMAIS si le retry a lieu (déjà décidé par execution_node).
+    diagnosis_text = state.get("_runtime_diagnosis_text")
+
+    from langchain_agents.agents.lc_test_generation_agent import lc_test_generation_agent
+    fixed_code = retry_with_runtime_error(
+        previous_code, source_path, prompt, run_result,
+        on_error_reason=lambda msg: lc_test_generation_agent.remember_retry_reason(str(source_path), msg),
+        diagnosis_override=diagnosis_text,
+    )
 
     updates: Dict[str, Any] = {
         "retry_runtime": state.get("retry_runtime", 0) + 1,

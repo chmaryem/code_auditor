@@ -31,6 +31,13 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Salutations / small-talk : détectées en amont pour éviter le template projet.
+_GREETING_RE = re.compile(
+    r"^\s*(bonjour|salut|coucou|hello|hi|hey|yo|bonsoir|merci|thanks?|thx|"
+    r"ok|okay|d'accord|au revoir|bye|ciao|à bientôt|good\s?(morning|evening))\b",
+    re.IGNORECASE,
+)
+
 # ── LLM Decision Prompt ───────────────────────────────────────────────────────
 
 _DECISION_PROMPT = """\
@@ -144,6 +151,22 @@ class LCChatDecisionAgent:
         msg_raw = user_message or ""
         params  = intent_params or {}
         history = conversation_history or []
+
+        # ── Small-talk / salutations : court-circuit avant tout appel LLM ─────
+        # Évite le template projet « Direct answer → Evidence from codebase » sur
+        # un simple « bonjour ». Réponse courte et directe, aucun contexte projet.
+        if _GREETING_RE.match(msg_raw.strip()) and len(msg_raw.split()) <= 5:
+            return {
+                "intent":        "chitchat",
+                "agents":        ["chat_agent"],
+                "context_level": "fast",
+                "needs_rag":     False,
+                "needs_git":     False,
+                "needs_ci":      False,
+                "confidence":    1.0,
+                "_routing":      "regex",
+                "reason":        "salutation / small-talk",
+            }
 
         # ── Attempt LLM routing ──────────────────────────────────────────────
         plan = self._decide_llm(

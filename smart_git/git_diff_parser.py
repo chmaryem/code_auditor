@@ -72,8 +72,16 @@ def get_commit_message(commit: str = "HEAD", project_path: Path = None) -> str:
 
 
 def is_git_repo(project_path: Path) -> bool:
-  
+
     return _run_git(["rev-parse", "--git-dir"], cwd=project_path) is not None
+
+
+def detect_conflict_files(project_path: Path) -> List[str]:
+    """Files with unresolved merge conflicts (git diff --diff-filter=U)."""
+    output = _run_git(["diff", "--name-only", "--diff-filter=U"], cwd=project_path)
+    if not output:
+        return []
+    return [f.strip() for f in output.strip().split("\n") if f.strip()]
 
 def get_uncommitted_files(project_path: Path = None) -> List[Dict[str, str]]:
    

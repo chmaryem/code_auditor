@@ -42,7 +42,24 @@ def node_rag(state: Dict[str, Any]) -> Dict[str, Any]:
     # 7. Contexte Knowledge Graph (dépendances, classes liées)
     kg_context = get_kg_context(source_path, state.get("_knowledge_graph"))
 
+    # RAGCuratorAgent (additif) — filtre les faux-positifs évidents, ne change pas
+    # la forme de rag_context. Fail-silent : toute exception ou forme inattendue
+    # laisse rag_context et rag_curation_notes = None tels quels (comportement
+    # pré-Curator, garde-fou en plus du fail-silent interne à curate()).
+    rag_curation_notes = None
+    try:
+        from langchain_agents.agents.lc_rag_curator_agent import rag_curator_agent
+        curated = rag_curator_agent.curate(rag_context, untested_signatures, source_path)
+        if isinstance(curated, dict) and {"test_patterns", "project_examples", "total_docs"} <= curated.keys():
+            removed = rag_context.get("total_docs", 0) - curated.get("total_docs", 0)
+            if removed > 0:
+                rag_curation_notes = f"{removed} document(s) écarté(s) comme non pertinent(s)."
+            rag_context = curated
+    except Exception as e:
+        logger.debug("RAGCuratorAgent erreur (fail-silent) : %s", e)
+
     return {
         "rag_context": rag_context,
         "kg_context":  kg_context,
+        "rag_curation_notes": rag_curation_notes,
     }

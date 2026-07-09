@@ -21,6 +21,14 @@ def hdr(msg):
     print(f"{B}{'='*70}{E}\n")
 
 
+def _parse_repo(repo_str: str):
+    """Parse 'owner/repo' into (owner, repo) — shared by CI/CD and PR commands."""
+    parts = repo_str.split("/")
+    if len(parts) != 2:
+        raise ValueError(f"Format attendu : owner/repo (reçu: {repo_str})")
+    return parts[0], parts[1]
+
+
 def cmd_file(args):
     """Analyse un seul fichier."""
     from services.llm_service import assistant_agent
@@ -277,23 +285,6 @@ def cmd_watch(args):
             import logging
             logging.getLogger(__name__).debug("GitSessionTracker non démarré : %s", e)
 
-        # ── LearningAgent lifecycle ──────────────────────────────────────────
-        from agents.learning_agent import learning_agent as _learning_agent
-        try:
-            _learning_agent.initialize(
-                llm=rag_system._llm if rag_system else None,
-                vector_store=rag_system.vector_store if rag_system else None,
-                kb_dir=config.KNOWLEDGE_BASE_DIR,
-                kb_loader=getattr(rag_system, '_kb_loader', None),
-                knowledge_graph=None,
-            )
-            _learning_agent.start()
-            info("LearningAgent démarré (Self-Improving RAG)\n")
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).debug("LearningAgent init failed: %s", e)
-            _learning_agent = None
-
         # ── File counter + shared resources ──────────────────────────────────
         import threading
         print_lock = threading.Lock()
@@ -324,7 +315,6 @@ def cmd_watch(args):
                 dep_graph=dep_graph,
                 cache=None,
                 print_lock=print_lock,
-                learning_agent=_learning_agent,
                 file_counter=file_counter,
             )
             if result.get("skip_reason"):
@@ -375,12 +365,6 @@ def cmd_watch(args):
             watcher.stop()
             if git_tracker:
                 git_tracker.stop()
-            # Stop LearningAgent (flush pending KB rules)
-            if _learning_agent:
-                try:
-                    _learning_agent.stop()
-                except Exception:
-                    pass
             # Cancel pending timers
             with _pending_lock:
                 for t in _pending_timer.values():
@@ -399,12 +383,6 @@ def cmd_watch(args):
                 print(f"   Par type :")
                 for ct, n in file_counter['by_type'].items():
                     print(f"     • {ct:20s} : {n}")
-            if _learning_agent:
-                la_stats = _learning_agent.get_stats()
-                if la_stats.get("received"):
-                    print(f"   Self-Improving RAG :")
-                    print(f"     Feedbacks reçus  : {la_stats['received']}")
-                    print(f"     Règles promues   : {la_stats.get('auto_promoted', 0) + la_stats.get('batch_promoted', 0)}")
             print(f"\n {'═' * 60}\n")
         return
 
@@ -459,7 +437,8 @@ def cmd_watch(args):
 
 def cmd_git_status(args):
     """Affiche l'état de la session courante (accumulation de bugs non commités)."""
-    from langchain_agents.graphs.smart_git_graph import invoke_smart_git
+    from langchain_agents.tools.git_tools import tool_session_status
+    from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
     project_path = Path(args.path).resolve()
     debug = getattr(args, "debug", False)
@@ -469,10 +448,20 @@ def cmd_git_status(args):
     if debug:
         info("Mode DEBUG activé\n")
 
-    result = invoke_smart_git(
-        message="git status",
-        project_path=str(project_path),
+    # Appel DIRECT du tool de session (couche domaine), sans le LangGraph.
+    snapshot = tool_session_status.invoke({"project_path": str(project_path)})
+    response = git_synthesis_agent.synthesize(
+        {"intent": "git_status", "session_snapshot": snapshot}
     )
+    result = {
+        "response": response,
+        "session_snapshot": snapshot,
+        "intent": "git_status",
+        "confidence": 0.5,
+        "safe_mode": True,
+        "stats": {},
+        "errors": [],
+    }
 
     # Extract and display results
     response = result.get("response", "")
@@ -497,7 +486,8 @@ def cmd_git_status(args):
 
 def cmd_git_branch(args):
     """Analyse une branche feature vs sa base et donne un verdict de merge."""
-    from langchain_agents.graphs.smart_git_graph import invoke_smart_git
+    from langchain_agents.tools.git_tools import tool_branch_readiness
+    from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
     project_path = Path(args.path).resolve()
     branch = getattr(args, "branch", "HEAD")
@@ -509,12 +499,22 @@ def cmd_git_branch(args):
     if debug:
         info("Mode DEBUG activé\n")
 
-    result = invoke_smart_git(
-        message=f"branch readiness {branch} vs {base}",
-        project_path=str(project_path),
-        branch=branch,
-        base=base,
+    # Appel DIRECT du tool d'analyse de branche (couche domaine), sans le LangGraph.
+    report = tool_branch_readiness.invoke(
+        {"project_path": str(project_path), "branch": branch or "HEAD", "base": base or "main"}
     )
+    response = git_synthesis_agent.synthesize(
+        {"intent": "branch_readiness", "branch_report": report}
+    )
+    result = {
+        "response": response,
+        "branch_report": report,
+        "intent": "branch_readiness",
+        "confidence": 0.9,
+        "safe_mode": True,
+        "stats": {},
+        "errors": [],
+    }
 
     # Extract and display results
     response = result.get("response", "")
@@ -585,7 +585,8 @@ def cmd_resolve_conflicts(args):
     Après un 'git merge' qui produit des conflits, cette commande
     envoie une demande au graph pour résolution automatique.
     """
-    from langchain_agents.graphs.smart_git_graph import invoke_smart_git
+    from langchain_agents.agents.lc_git_conflict_agent import git_conflict_agent
+    from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
     project_path = Path(args.path).resolve()
     debug = getattr(args, "debug", False)
@@ -595,10 +596,20 @@ def cmd_resolve_conflicts(args):
     if debug:
         info("Mode DEBUG activé\n")
 
-    result = invoke_smart_git(
-        message="resolve conflicts dry run",
-        project_path=str(project_path),
+    # Phase 0 : appel DIRECT du tool de conflits (dry-run), sans le LangGraph.
+    report = git_conflict_agent.dry_run_resolution(str(project_path))
+    response = git_synthesis_agent.synthesize(
+        {"intent": "conflict_resolution_dry_run", "conflict_report": report}
     )
+    result = {
+        "response": response,
+        "conflict_report": report,
+        "intent": "conflict_resolution_dry_run",
+        "confidence": 0.9,
+        "safe_mode": True,
+        "stats": {},
+        "errors": [],
+    }
 
     # Extract and display results
     response = result.get("response", "")
@@ -627,7 +638,8 @@ def cmd_commit_msg(args):
     Génère un message de commit basé sur les changements actuels.
     Utilise le multi-agent Smart Git pour analyser les diffs.
     """
-    from langchain_agents.graphs.smart_git_graph import invoke_smart_git
+    from langchain_agents.tools.git_tools import tool_commit_message
+    from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
     project_path = Path(args.path).resolve()
     debug = getattr(args, "debug", False)
@@ -637,10 +649,23 @@ def cmd_commit_msg(args):
     if debug:
         info("Mode DEBUG activé\n")
 
-    result = invoke_smart_git(
-        message="generate commit message",
-        project_path=str(project_path),
+    # Appel DIRECT du tool de génération de message (couche domaine), sans le LangGraph.
+    diff = tool_commit_message.invoke({"project_path": str(project_path)})
+    response = git_synthesis_agent.synthesize(
+        {"intent": "commit_message",
+         "commit_message": diff.get("commit_message", ""),
+         "changes": diff}
     )
+    result = {
+        "response": response,
+        "commit_message": diff.get("commit_message", ""),
+        "changes": diff,
+        "intent": "commit_message",
+        "confidence": 0.9,
+        "safe_mode": True,
+        "stats": {},
+        "errors": [],
+    }
 
     # Extract and display results
     response = result.get("response", "")
@@ -860,7 +885,6 @@ def cmd_ci_deploy(args):
     Détecte le langage (Java/Python/JS) et génère le YAML adapté.
     """
     import asyncio
-    from smart_git.pr_analyzer import _parse_repo
     from ci_cd.ci_deploy_agent import deploy_ci_workflow
 
     owner, repo = _parse_repo(args.repo)
@@ -883,7 +907,6 @@ def cmd_cd_score(args):
     Aggrège CI, SonarCloud, sécurité, approvals PR, risk fichiers.
     Verdict: DEPLOY_OK / DEPLOY_WARN / DEPLOY_BLOCKED
     """
-    from smart_git.pr_analyzer import _parse_repo
     from ci_cd.cd_release_scorer import CDReleaseScorer
 
     owner, repo_name = _parse_repo(args.repo)
@@ -938,7 +961,6 @@ def cmd_cd_status(args):
     Affiche l'état courant d'un environnement de déploiement.
     Montre le dernier déploiement réussi et les stats (success rate, durée).
     """
-    from smart_git.pr_analyzer import _parse_repo
     from ci_cd.cd_deploy_tracker import CDDeployTracker
     import datetime
 
@@ -1000,50 +1022,46 @@ def cmd_cd_status(args):
             )
 
 
-# ── Commande : pr-check (MCP Code Mode) ──────────────────────────────────
+# ── Commande : pr-check ───────────────────────────────────────────────────
 
 def cmd_pr_check(args):
     """
-    Analyse une Pull Request via MCP Code Mode.
-    L'agent Gemini génère un script Python qui analyse la PR
-    avec le pipeline RAG complet et poste un review structuré.
+    Analyse une Pull Request (revue de code directe, 0 overhead CodeModeAgent).
+    Poste un review structuré (critical/high/medium) sur la PR.
     """
     import asyncio
-    from smart_git.pr_analyzer import analyze_pr, _parse_repo
+    from smart_git.pr_review_agent import review_pr
 
     owner, repo = _parse_repo(args.repo)
-    asyncio.run(analyze_pr(owner, repo, args.pr))
+    asyncio.run(review_pr(owner, repo, args.pr))
 
 
-# ── Commande : pr-resolve (MCP Code Mode) ────────────────────────────────
+# ── Commande : pr-resolve ─────────────────────────────────────────────────
 
 def cmd_pr_resolve(args):
     """
-    Résout les conflits d'une PR via MCP Code Mode.
-    L'agent Gemini génère un script qui résout les conflits
-    avec le resolver 3-strategy et pousse une branche de résolution.
+    Résout les conflits d'une PR (cascade bloc-par-bloc, direct Python)
+    et pousse une branche de résolution.
     """
     import asyncio
-    from smart_git.pr_analyzer import resolve_pr_conflicts, _parse_repo
+    from smart_git.conflict_resolution_agent import resolve_pr_conflicts
 
     owner, repo = _parse_repo(args.repo)
     asyncio.run(resolve_pr_conflicts(owner, repo, args.pr))
 
 
-# ── Commande : pr-merge-check (MCP Code Mode) ────────────────────────────
+# ── Commande : pr-merge-check ─────────────────────────────────────────────
 
 def cmd_pr_merge_check(args):
     """
-    Vérifie si une PR est prête à merger via MCP Code Mode.
-    L'agent vérifie le statut mergeable, les checks CI/CD,
-    et les reviews, puis poste un rapport de readiness.
-    NE MERGE JAMAIS automatiquement.
+    Vérifie si une PR est prête à merger (mergeable, checks CI/CD, reviews)
+    et poste un rapport de readiness. NE MERGE JAMAIS automatiquement.
     """
     import asyncio
-    from smart_git.pr_analyzer import check_pr_merge_readiness, _parse_repo
+    from smart_git.merge_automation_agent import check_merge_readiness
 
     owner, repo = _parse_repo(args.repo)
-    asyncio.run(check_pr_merge_readiness(owner, repo, args.pr))
+    asyncio.run(check_merge_readiness(owner, repo, args.pr))
 
 
 # ── Commande : generate-tests ──────────────────────────────────────────────
@@ -1157,7 +1175,7 @@ Exemples :
   # CI/CD Pipeline
   python main.py ci-deploy      --repo owner/repo           # déployer workflow CI/CD
 
-  # MCP Code Mode (agents autonomes)
+  # Smart Git — Pull Requests
   python main.py pr-check       --repo owner/repo --pr 42  # revue PR via agent
   python main.py pr-resolve     --repo owner/repo --pr 42  # résoudre conflits PR
   python main.py pr-merge-check --repo owner/repo --pr 42  # vérifier readiness merge
@@ -1246,15 +1264,15 @@ Exemples :
     sp.add_argument("--repo",        required=True,   help="owner/repo")
     sp.add_argument("--environment", default="production", help="Environnement (défaut: production)")
 
-    sp = sub.add_parser("pr-check", help="Analyser une PR GitHub via MCP")
+    sp = sub.add_parser("pr-check", help="Analyser une PR GitHub (revue de code)")
     sp.add_argument("--repo", required=True, help="owner/repo")
     sp.add_argument("--pr", type=int, required=True, help="Numéro de la PR")
 
-    sp = sub.add_parser("pr-resolve", help="Résoudre les conflits d'une PR via MCP Code Mode")
+    sp = sub.add_parser("pr-resolve", help="Résoudre les conflits d'une PR")
     sp.add_argument("--repo", required=True, help="owner/repo")
     sp.add_argument("--pr", type=int, required=True, help="Numéro de la PR")
 
-    sp = sub.add_parser("pr-merge-check", help="Vérifier si une PR est prête à merger (MCP Code Mode)")
+    sp = sub.add_parser("pr-merge-check", help="Vérifier si une PR est prête à merger")
     sp.add_argument("--repo", required=True, help="owner/repo")
     sp.add_argument("--pr", type=int, required=True, help="Numéro de la PR")
 
@@ -1473,7 +1491,7 @@ def main():
         # CD Intelligence
         "cd-score":   cmd_cd_score,
         "cd-status":  cmd_cd_status,
-        # MCP Code Mode
+        # Smart Git — Pull Requests
         "pr-check":       cmd_pr_check,
         "pr-resolve":     cmd_pr_resolve,
         "pr-merge-check": cmd_pr_merge_check,

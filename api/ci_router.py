@@ -298,9 +298,11 @@ async def ci_analyze(req: CIAnalyzeRequest, user: Principal = Depends(get_curren
 
     t0 = time.time()
     try:
-        from langchain_agents.graphs.ci_graph import invoke_ci_run
+        # Dispatcher: deterministic CIGraph by default, agentic multi-agent
+        # graph when CI_CD_AGENTIC is enabled (with deterministic fallback).
+        from langchain_agents.graphs.graph_dispatch import run_ci_graph
         result = await asyncio.to_thread(
-            invoke_ci_run,
+            run_ci_graph,
             run_id=run_id,
             repo=req.repo,
             owner=owner,
@@ -1113,9 +1115,9 @@ async def cd_analyze(
 
     t0 = time.time()
     try:
-        from langchain_agents.graphs.cd_graph import invoke_cd_run
+        from langchain_agents.graphs.graph_dispatch import run_cd_graph
         result = await asyncio.to_thread(
-            invoke_cd_run,
+            run_cd_graph,
             run_id=req.run_id,
             repo=req.repo,
             owner=owner,

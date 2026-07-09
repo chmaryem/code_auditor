@@ -47,9 +47,6 @@ try:
         public User findByUsername(String username) throws SQLException {
     // All fields required for a complete User object (as per User constructor) should be retrieved.
     String query = "SELECT id, username, password_hash, email, role, created_at, last_login, is_active FROM users WHERE username = ?";
-    // Using PreparedStatement to prevent SQL Injection
-    PreparedStatement statement = connection.prepareStatement(query);
-    statement.setString(1, username);
             try (Connection conn = dataSource.getConnection();
                  PreparedStatement stmt = conn.prepareStatement(query)) {
                 try (ResultSet rs = stmt.executeQuery()) {
@@ -91,8 +88,9 @@ try:
 
         public User createUser(String username, String email, String password, String role) throws SQLException {
             String hashedPassword = hashPassword(password);
-            String insertQuery = "INSERT INTO users (username, '''
-    # Quick syntax check
+            String insertQuery = "INSERT INTO users (username, email, password_hash, role, created_at, is_active) VALUES (?, ?, ?, ?, ?, ?)";
+            try (Connection conn = dataSource.getConnection();
+                 P'''
     braces = code.count('{') == code.count('}')
     no_markers = '<<<<<<' not in code
     print('SANDBOX_OK' if braces and no_markers else 'SANDBOX_FAIL')

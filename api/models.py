@@ -70,6 +70,28 @@ class ProjectAnalysisResponse(BaseModel):
     file_results: Dict[str, AnalysisResultResponse] = Field(default_factory=dict)
 
 
+class ScanProjectTestsRequest(BaseModel):
+    project_path: str = Field(..., description="Chemin racine du projet")
+    max_files: int = Field(500, description="Nombre max de fichiers à scanner")
+
+
+class TestGapFileResult(BaseModel):
+    file_path: str
+    language: str
+    has_test: bool
+    test_file: Optional[str] = None
+    coverage_ratio: float = 0.0
+    untested_entities: List[str] = Field(default_factory=list)
+    tested_entities: List[str] = Field(default_factory=list)
+    framework: Optional[str] = None
+    reason: str = ""
+
+
+class ScanProjectTestsResponse(BaseModel):
+    project_path: str
+    files: List[TestGapFileResult] = Field(default_factory=list)
+
+
 
 class WatchStartRequest(BaseModel):
     project_path: str = Field(..., description="Chemin du projet à surveiller")
@@ -124,6 +146,10 @@ class GenerateTestsResponse(BaseModel):
         description="Résumé de l'erreur d'exécution si run_success=False"
     )
     cached: bool = Field(False, description="True si le résultat vient du cache Redis")
+    review_notes: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Verdicts additifs de TestReviewAgent (semantic_review + runtime_diagnosis), informatifs uniquement",
+    )
 
 
 # ── Run Tests (existing file, no LLM) ────────────────────────────────────────

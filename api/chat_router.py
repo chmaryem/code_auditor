@@ -11,7 +11,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 from auth.security import Principal, get_current_user
+from database.connection import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,12 @@ chat_router = APIRouter(prefix="/chat", tags=["ChatAgent"])
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
+
+class AttachedFile(BaseModel):
+    """Fichier joint par le dev via le bouton d'ajout (chat dashboard)."""
+    path:    str = Field("", description="Chemin/nom du fichier attaché")
+    content: str = Field("", description="Contenu texte du fichier")
+
 
 class ChatRequest(BaseModel):
     """Q&A / explain request."""
@@ -36,6 +44,9 @@ class ChatRequest(BaseModel):
     active_module:     str = Field("", description="Active dashboard module: cicd|git|chat|analyze|tests")
     branch:            str = Field("", description="Current git branch")
     active_repository: str = Field("", description="Name of the active repository")
+    # Périmètre + fichiers attachés (chat dashboard)
+    attached_files:    list[AttachedFile] = Field(default_factory=list,
+                                                  description="Fichiers joints par le dev (mode dashboard)")
 
 
 class CompletionRequest(BaseModel):
@@ -172,9 +183,29 @@ def _safe_write_generated_file(project_path: str, suggested_file: str, code: str
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
+async def _effective_active_repo(active_repository: str, user: Principal, db: AsyncSession) -> str:
+    """
+    The Chat widget (chatStore.ts) never sends active_repository/branch in
+    its request — it expects the backend to detect them. That works for
+    "branch" (local git checkout), but a repo has no local equivalent: the
+    PR Cockpit lets a developer browse ANY GitHub repo independently of the
+    local checkout. Fall back to the same users.active_github_repo the PR
+    Cockpit's "Change" button persists (history_router._resolve_active_repo).
+    """
+    if active_repository:
+        return active_repository
+    from api.history_router import _resolve_active_repo
+    return await _resolve_active_repo(user, db) or ""
+
+
 @chat_router.post("", response_model=ChatResponse, summary="Q&A / Explain")
-async def chat(req: ChatRequest, user: Principal = Depends(get_current_user)):
+async def chat(
+    req: ChatRequest,
+    user: Principal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Project-aware Q&A and code explanation with IDE cursor context."""
+    active_repository = await _effective_active_repo(req.active_repository, user, db)
     return await _run_chat(
         message           = req.message,
         project_path      = req.project_path,
@@ -187,12 +218,16 @@ async def chat(req: ChatRequest, user: Principal = Depends(get_current_user)):
         visible_range     = req.visible_range,
         active_module     = req.active_module,
         branch            = req.branch,
-        active_repository = req.active_repository,
+        active_repository = active_repository,
     )
 
 
 @chat_router.post("/stream", summary="Stream Q&A / Explain via SSE")
-async def chat_stream(req: ChatRequest, user: Principal = Depends(get_current_user)):
+async def chat_stream(
+    req: ChatRequest,
+    user: Principal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Streaming version of Q&A endpoint.
 
@@ -203,6 +238,8 @@ async def chat_stream(req: ChatRequest, user: Principal = Depends(get_current_us
       data: {"type":"done","session_id":"..."}
     """
     from langchain_agents.graphs.chat_graph import stream_chat
+
+    active_repository = await _effective_active_repo(req.active_repository, user, db)
 
     async def event_generator():
         try:
@@ -218,7 +255,7 @@ async def chat_stream(req: ChatRequest, user: Principal = Depends(get_current_us
                 visible_range     = req.visible_range,
                 active_module     = req.active_module,
                 branch            = req.branch,
-                active_repository = req.active_repository,
+                active_repository = active_repository,
             ):
                 yield chunk
         except asyncio.CancelledError:
@@ -226,6 +263,57 @@ async def chat_stream(req: ChatRequest, user: Principal = Depends(get_current_us
             raise
         except Exception as e:
             logger.exception("Stream error: %s", e)
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@chat_router.post("/dashboard/stream", summary="Chat dashboard (périmètre restreint) via SSE")
+async def dashboard_chat_stream(
+    req: ChatRequest,
+    user: Principal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Chat du dashboard — périmètre RESTREINT.
+
+    Contrairement à /stream (extension VS Code, analyse projet complète), cet endpoint
+    NE scanne PAS le projet local : il répond sur Git, PR, dépôt, CI/CD et questions
+    générales, et n'utilise comme code que les fichiers explicitement attachés par le dev.
+    Techniquement : scope="dashboard" + attached_files transmis au graphe.
+    """
+    from langchain_agents.graphs.chat_graph import stream_chat
+
+    active_repository = await _effective_active_repo(req.active_repository, user, db)
+    attached = [{"path": f.path, "content": f.content} for f in (req.attached_files or [])]
+
+    async def event_generator():
+        try:
+            async for chunk in stream_chat(
+                message           = req.message,
+                project_path      = req.project_path,
+                session_id        = req.session_id,
+                user_id           = user.id,
+                active_module     = req.active_module,
+                branch            = req.branch,
+                active_repository = active_repository,
+                scope             = "dashboard",
+                attached_files    = attached,
+            ):
+                yield chunk
+        except asyncio.CancelledError:
+            logger.info("Client disconnected from dashboard chat stream")
+            raise
+        except Exception as e:
+            logger.exception("Dashboard stream error: %s", e)
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(

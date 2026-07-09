@@ -92,27 +92,6 @@ def tool_sonar_get_issues(
         return []
 
 
-@tool
-def tool_sonar_pr_issues(project_key: str, pr_number: str) -> List[Dict[str, Any]]:
-    """
-    Récupère les nouvelles issues introduites par une PR spécifique.
-
-    Args:
-        project_key: Clé SonarCloud
-        pr_number: Numéro de la PR (en string, ex: "42")
-
-    Returns:
-        Liste d'issues nouvelles sur cette PR
-    """
-    try:
-        from services.mcp_sonarqube_service import get_mcp_sonarqube
-        sonar = get_mcp_sonarqube()
-        return sonar.get_new_issues_on_pr(project_key, pr_number)
-    except Exception as e:
-        logger.error("tool_sonar_pr_issues failed: %s", e)
-        return []
-
-
 # ── B. GitHub Actions Tools ───────────────────────────────────────────────────
 
 @tool

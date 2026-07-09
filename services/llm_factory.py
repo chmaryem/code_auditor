@@ -175,11 +175,13 @@ def _build_openrouter_llm(
         base_url        = "https://openrouter.ai/api/v1",
         temperature     = temperature,
         max_tokens      = max_tokens,
+        max_retries     = 0,     # fail-fast : pas de backoff interne SDK → bascule immédiate sur le fallback (Groq)
+        timeout         = 30,    # coupe les appels qui traînent au lieu d'attendre 18s+30s
         default_headers = {
             "HTTP-Referer": "https://github.com/code-auditor",
             "X-Title":      "Code Auditor",
         },
-    ), resolved_model 
+    ), resolved_model
 
 
 def _build_groq_llm(
@@ -203,6 +205,8 @@ def _build_groq_llm(
         base_url    = "https://api.groq.com/openai/v1",
         temperature = temperature,
         max_tokens  = max_tokens,
+        max_retries = 0,     # fail-fast : bascule immédiate sur le fallback suivant (Gemini)
+        timeout     = 30,
     )
 
 

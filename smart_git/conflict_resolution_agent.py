@@ -353,7 +353,21 @@ def resolve_file_smart(
       - Auto    : imports, package, whitespace, simple changes
       - Interactif (interactive=True, terminal uniquement) : [1] OURS [2] THEIRS [3] LLM
       - Sandbox : validation après résolution LLM
+
+    Axe 2 (refactor multi-agents) : le chemin interactive=False (celui utilisé
+    en production, via resolve_pr_conflicts) délègue désormais à un sous-graphe
+    LangGraph explicite — cf. smart_git/conflict_resolution_graph.py et
+    tests/conflict_resolution_snapshot.py. Sortie garantie identique. Le chemin
+    interactive=True (aucun appelant dans le code actuel) reste inchangé
+    ci-dessous.
     """
+    if not interactive:
+        from smart_git.conflict_resolution_graph import run_resolve_file_smart_graph
+        return run_resolve_file_smart_graph(
+            filename, base_content, ours_content, theirs_content, rag_context
+        )
+
+    # ── Chemin interactif (terminal, [1] OURS [2] THEIRS [3] LLM) ────────────
     # Niveau 0 : fichiers identiques
     if ours_content == theirs_content:
         return ours_content, "identical", []
@@ -477,7 +491,7 @@ def _ensure_list(value: Any) -> List:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API publique — appelée par pr_analyzer.py
+# API publique — appelée par main.py (CLI), api/git_router.py, smart_git_dispatch.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _generate_resolve_readme(

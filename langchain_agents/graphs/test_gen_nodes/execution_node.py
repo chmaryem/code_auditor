@@ -59,10 +59,40 @@ def node_execution(state: Dict[str, Any]) -> Dict[str, Any]:
         # Retry LLM avec l'erreur d'exécution comme contexte
         updates["run_error"] = run_result
         updates["_exec_route"] = "generate"
+
+        # TestReviewAgent job (b) — diagnostic de cause racine, PUREMENT ADDITIF.
+        # N'affecte JAMAIS si un retry a lieu ni combien de fois (déjà décidé
+        # ci-dessus par retry_runtime < MAX_RETRY_RUNTIME). Fail-silent.
+        review_notes = dict(state.get("review_notes") or {})
+        try:
+            from langchain_agents.agents.lc_test_review_agent import test_review_agent
+            diagnosis = test_review_agent.diagnose_failure(
+                generated_code, run_result, state["source_code"],
+            )
+            review_notes["runtime_diagnosis"] = diagnosis
+            if diagnosis and diagnosis.get("root_cause"):
+                updates["_runtime_diagnosis_text"] = diagnosis["root_cause"]
+        except Exception as e:
+            logger.debug("TestReviewAgent.diagnose_failure erreur (fail-silent) : %s", e)
+            review_notes["runtime_diagnosis"] = None
+        updates["review_notes"] = review_notes
     else:
         logger.info("Retry runtime épuisé : %s", run_result.error_summary[:150])
         updates["_exec_route"] = "finalize"
     return updates
+
+
+def _normalize_review_notes(review_notes: Any) -> Dict[str, Any]:
+    """
+    TestReviewAgent (additif) : garantit que review_notes a toujours ses 2
+    sous-clés (semantic_review, runtime_diagnosis), défaut None si absentes —
+    évite tout KeyError côté consommateur (ex. write=False où le job (b) ne
+    tourne jamais).
+    """
+    notes = dict(review_notes or {})
+    notes.setdefault("semantic_review", None)
+    notes.setdefault("runtime_diagnosis", None)
+    return notes
 
 
 def node_finalize(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -79,6 +109,8 @@ def node_finalize(state: Dict[str, Any]) -> Dict[str, Any]:
         "incremental":        state.get("is_incremental", False),
         "run_success":        run_result.success if run_result else None,
         "run_error_summary":  run_result.error_summary if run_result and not run_result.success else None,
+        "review_notes":       _normalize_review_notes(state.get("review_notes")),
+        "rag_curation_notes": state.get("rag_curation_notes"),
     }
 
     # Mettre en cache uniquement si le test est valide ET passe à l'exécution

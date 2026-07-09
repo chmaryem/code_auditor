@@ -113,7 +113,12 @@ class GitTestImpactAnalyzer:
                 return report
 
             changed = [f.strip() for f in result.stdout.strip().splitlines() if f.strip()]
-            source_files = [f for f in changed if Path(f).suffix.lower() in SOURCE_EXTENSIONS]
+            # Un fichier de test n'est pas une "source à couvrir" : on l'exclut
+            # pour ne pas générer de faux gap (ex: test_x.py stagé).
+            source_files = [
+                f for f in changed
+                if Path(f).suffix.lower() in SOURCE_EXTENSIONS and not self._is_test_file(f)
+            ]
 
             if not source_files:
                 return report
@@ -148,7 +153,10 @@ class GitTestImpactAnalyzer:
         report = TestImpactReport()
 
         try:
-            src = [f for f in source_files if Path(f).suffix.lower() in SOURCE_EXTENSIONS]
+            src = [
+                f for f in source_files
+                if Path(f).suffix.lower() in SOURCE_EXTENSIONS and not self._is_test_file(f)
+            ]
             if not src:
                 return report
 
@@ -184,7 +192,7 @@ class GitTestImpactAnalyzer:
         ext  = Path(src_file).suffix.lower()
 
         # Stratégie 1 : Convention de nommage
-        naming_tests = self._find_by_naming(stem, ext, test_dirs, project_path)
+        naming_tests = self._find_by_naming(stem, ext, test_dirs, project_path, src_file)
         if naming_tests:
             impact.test_files.extend(naming_tests)
             impact.discovery_method.append("naming")
@@ -202,7 +210,8 @@ class GitTestImpactAnalyzer:
     # ── Stratégie 1 : Convention de nommage ──────────────────────────────────
 
     def _find_by_naming(
-        self, stem: str, ext: str, test_dirs: List[Path], project_path: Path
+        self, stem: str, ext: str, test_dirs: List[Path], project_path: Path,
+        src_file: Optional[str] = None,
     ) -> List[str]:
         """Cherche les fichiers de test par convention de nommage."""
         found = []
@@ -220,7 +229,18 @@ class GitTestImpactAnalyzer:
         else:
             candidates = [f"test_{stem}{ext}", f"{stem}_test{ext}"]
 
-        for test_dir in test_dirs:
+        # En plus des dossiers de tests dédiés, chercher aussi à la racine du
+        # projet et dans le dossier du fichier source lui-même (layout plat :
+        # test_x.py à côté de x.py, sans dossier tests/).
+        search_dirs: List[Path] = list(test_dirs)
+        if project_path not in search_dirs:
+            search_dirs.append(project_path)
+        if src_file:
+            src_dir = (project_path / src_file).parent
+            if src_dir.is_dir() and src_dir not in search_dirs:
+                search_dirs.append(src_dir)
+
+        for test_dir in search_dirs:
             for candidate in candidates:
                 test_path = test_dir / candidate
                 if test_path.exists():
@@ -308,10 +328,14 @@ class GitTestImpactAnalyzer:
     def _is_test_file(self, file_path: str) -> bool:
         """Retourne True si le fichier est un fichier de test."""
         p = file_path.replace("\\", "/").lower()
+        basename = p.rsplit("/", 1)[-1]
         return (
             "/test" in p or "/spec" in p or "/__tests__/" in p
             or p.endswith((".test.py", "_test.py", "test_.py"))
             or p.endswith((".test.ts", ".spec.ts", ".test.js", ".spec.js"))
+            # Préfixe test_ / spec_ sur le nom de fichier (layout plat à la racine)
+            or bool(re.match(r"(test|spec)_.+\.\w+$", basename))
+            or bool(re.match(r".+[_.](test|spec)\.\w+$", basename))
             or bool(re.search(r"test[s]?[/\\]", p))
         )
 

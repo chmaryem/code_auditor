@@ -8,15 +8,26 @@ with conditional edges.
 Replaces: core/orchestrator.py Orchestrator._analyze_file() (12 steps)
 
 Graph topology:
-  hash_check → read_file → change_filter → parse_ast → index_chromadb
-  → update_kg → update_dep_graph → get_neighborhood → rag_retrieve
-  → build_context → llm_analyze → cache_results → learn_feedback
-  → [conditional] analyze_dependents → END
+  hash_check → read_file → change_filter → parse_ast → test_gap_detect
+  → [conditional] index_chromadb → update_kg → update_dep_graph
+  → get_neighborhood → rag_retrieve → build_context → llm_analyze
+  → cache_results → learn_feedback → [conditional] analyze_dependents → END
+  → [conditional] emit_test_gap_only → END
 
 Conditional edges:
-  - hash_check:     unchanged → END (skip)
-  - change_filter:  minor     → END (skip)
-  - learn_feedback: has_deps  → analyze_dependents
+  - hash_check:        not found / read error → END (skip)
+  - read_file:         unsupported language    → END (skip)
+  - test_gap_detect:   insignificant change     → emit_test_gap_only → END
+  - learn_feedback:    has_deps                 → analyze_dependents
+
+TestGapAgent is 0-token (no LLM call) and must run on every save regardless of
+whether the edit is "significant" enough for the LLM-analysis path. It used to
+sit downstream of hash_check's unchanged-hash skip and change_filter's
+significance skip — both designed to protect the EXPENSIVE llm_analyze node —
+so a missing-test gap was silently never (re)detected once a file's content
+hash had been seen once, or whenever an edit was classified as minor. Fixed by
+moving test_gap_detect right after parse_ast (its only real data dependency)
+and gating only the downstream LLM-heavy branch behind significance.
 """
 from __future__ import annotations
 
@@ -46,7 +57,14 @@ _DM = "\033[2m"
 
 
 def node_hash_check(state: WatchState) -> Dict[str, Any]:
-    """Node 1: Check if file content has changed (hash comparison)."""
+    """Node 1: Read the file (hard-stops only on real errors).
+
+    An unchanged hash no longer skips the pipeline — test_gap_detect (0 token)
+    must still run so a missing-test gap is reliably (re)detected on every
+    save. has_content_changed() is still called for its side effect (keeps the
+    stored hash in sync for change_filter's own diffing), but its return value
+    no longer gates anything here.
+    """
     from langchain_agents.agents.lc_code_agent import lc_code_agent
 
     file_path = state["file_path"]
@@ -60,8 +78,7 @@ def node_hash_check(state: WatchState) -> Dict[str, Any]:
     except Exception as e:
         return {"skip_reason": f"Read error: {e}"}
 
-    if not lc_code_agent.has_content_changed(file_path, content):
-        return {"skip_reason": "unchanged (same hash)"}
+    lc_code_agent.has_content_changed(file_path, content)
 
     return {
         "code": content,
@@ -86,7 +103,12 @@ def node_read_file(state: WatchState) -> Dict[str, Any]:
 
 
 def node_change_filter(state: WatchState) -> Dict[str, Any]:
-    """Node 3: Analyze change significance (CodeAgent planning)."""
+    """Node 3: Analyze change significance (CodeAgent planning).
+
+    No longer gates the pipeline directly (parse_ast/test_gap_detect always
+    run next). skip_reason set here is read later, after test_gap_detect, by
+    is_significant_change() to decide whether the LLM-analysis branch runs.
+    """
     from langchain_agents.agents.lc_code_agent import lc_code_agent
 
     file_path = state["file_path"]
@@ -168,7 +190,12 @@ def node_update_dep_graph(state: WatchState) -> Dict[str, Any]:
 
 
 def node_test_gap_detect(state: WatchState) -> Dict[str, Any]:
-    """Node 8: Detect missing tests for the current source file (0 token).
+    """Detect missing tests for the current source file (0 token).
+
+    Runs right after parse_ast, UNCONDITIONALLY — independent of whether
+    change_filter judged this edit significant enough for the LLM-analysis
+    branch (see is_significant_change(), which reads skip_reason AFTER this
+    node runs, not before).
 
     Uses only langchain_agents/ agents:
       - LCTestGapAgent          : detects the gap, returns serializable dict
@@ -207,6 +234,48 @@ def node_test_gap_detect(state: WatchState) -> Dict[str, Any]:
         notifier.notify(gap)
 
     return {"test_gap": gap}
+
+
+def node_emit_test_gap_only(state: WatchState) -> Dict[str, Any]:
+    """Reached when change_filter judged this edit not worth the LLM-analysis
+    branch (or content unchanged since last save). test_gap_detect already ran
+    before this branch point, so a missing-test warning is not silently
+    dropped just because the code edit itself was minor/unchanged.
+
+    Broadcasts ONLY the test_gap event — mirrors the exact event shape built
+    in node_emit_ws_events (the "# 3. test_gap" block) and the same real-time
+    push mechanism via state["_ws_broadcast"], without touching anything else
+    on this branch (no analysis_result, no dependency_impact, ...).
+    """
+    import uuid
+
+    test_gap = state.get("test_gap")
+    if not test_gap:
+        return {"ws_events": [], "ws_broadcasted": False}
+
+    file_path = state.get("file_path", "")
+    event = {
+        "type":               "test_gap",
+        "schema_version":     "2.0",
+        "request_id":         str(uuid.uuid4()),
+        "file_path":          file_path,
+        "severity":           "warning",
+        "missing_tests":      test_gap.get("missing", True),
+        "related_test_files": [test_gap.get("test_file")] if test_gap.get("test_file") else [],
+        "recommendation":     test_gap.get("reason", "Generate or update tests"),
+        "analyzed_at":        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    broadcasted = False
+    ws_broadcast = state.get("_ws_broadcast")
+    if callable(ws_broadcast):
+        try:
+            ws_broadcast(event)
+            broadcasted = True
+        except Exception as exc:
+            logger.warning("[WS] test_gap-only broadcast failed: %s", exc)
+
+    return {"ws_events": [event], "ws_broadcasted": broadcasted}
 
 
 def node_get_neighborhood(state: WatchState) -> Dict[str, Any]:
@@ -251,12 +320,10 @@ def node_rag_retrieve(state: WatchState) -> Dict[str, Any]:
 
 def node_git_session(state: WatchState) -> Dict[str, Any]:
     """Node 9b: Git session monitoring (reads from GitSessionTracker, 0 LLM token)."""
-    from langchain_agents.agents.lc_git_session_agent import LCGitSessionAgent
+    from langchain_agents.tools.git_tools import tool_session_status
 
     project_path = state.get("project_path", ".")
-    agent = LCGitSessionAgent()
-
-    git_session = agent.get_status(project_path)
+    git_session = tool_session_status.invoke({"project_path": project_path})
 
     if not git_session.get("success"):
         logger.debug("git_session unavailable: %s", git_session.get("error"))
@@ -483,7 +550,6 @@ def node_cache_results(state: WatchState) -> Dict[str, Any]:
 def node_learn_feedback(state: WatchState) -> Dict[str, Any]:
     """Node 13: Learning feedback (LearningAgent — self-improvement + recurring patterns)."""
     from langchain_agents.agents.lc_learning_agent import lc_learning_agent
-    from output.console_renderer import parse_fix_blocks
 
     analysis = state.get("analysis", {})
     language = state.get("language", "unknown")
@@ -514,25 +580,7 @@ def node_learn_feedback(state: WatchState) -> Dict[str, Any]:
                 except Exception as _e:
                     logger.debug("kb_suggestion broadcast failed: %s", _e)
 
-    # ── 2. Legacy LearningAgent (enriched with project context) ──────────────
-    learning_agent = state.get("_learning_agent")
-    if learning_agent:
-        analysis_text = analysis.get("analysis", "") if isinstance(analysis, dict) else str(analysis)
-        fix_blocks = parse_fix_blocks(analysis_text)
-        if fix_blocks:
-            try:
-                learning_agent.collect_feedback(
-                    blocks=fix_blocks,
-                    code_before=state.get("code", ""),
-                    language=language,
-                    file_name=Path(state["file_path"]).name,
-                    project_indexer=state.get("_project_indexer"),
-                    dependency_graph=state.get("_dep_graph"),
-                )
-            except Exception as e:
-                logger.debug("Legacy learning feedback: %s", e)
-
-    # ── 3. Display recurring patterns + broadcast to plugin ──────────────────
+    # ── 2. Display recurring patterns + broadcast to plugin ──────────────────
     try:
         from langchain_agents.memory.redis_memory import PatternMemory
         pm = PatternMemory()
@@ -668,7 +716,7 @@ def node_analyze_dependents(state: WatchState) -> Dict[str, Any]:
     from config import config
     from langchain_agents.agents.lc_analysis_agent import build_context
     from langchain_agents.agents.lc_code_agent import lc_code_agent
-    from output.console_renderer import print_results, parse_fix_blocks
+    from output.console_renderer import print_results
 
     max_deps = config.watcher.max_impacted_files
     to_analyze = dependents[:max_deps]
@@ -831,18 +879,6 @@ def node_analyze_dependents(state: WatchState) -> Dict[str, Any]:
             except Exception as exc:
                 logger.warning("[WS] dependent broadcast failed for %s: %s",
                                dep_path.name, exc)
-
-        # Self-Improving RAG for dependent
-        fix_blocks_dep = parse_fix_blocks(result_text_dep)
-        learning_agent = state.get("_learning_agent")
-        if fix_blocks_dep and learning_agent:
-            try:
-                learning_agent.collect_feedback(
-                    blocks=fix_blocks_dep, code_before=dep_content,
-                    language=dep_lang, file_name=dep_path.name,
-                )
-            except Exception as e:
-                logger.debug("Feedback dépendant %s : %s", dep_path.name, e)
 
         analyzed += 1
 
@@ -2096,6 +2132,13 @@ def should_continue_or_skip(state: WatchState) -> Literal["continue", "skip"]:
     return "continue"
 
 
+def is_significant_change(state: WatchState) -> Literal["yes", "no"]:
+    """Route (after test_gap_detect): run the full LLM-analysis branch, or
+    just the gap-only broadcast. skip_reason is set by change_filter but only
+    consumed here — test_gap_detect always runs regardless of its value."""
+    return "no" if state.get("skip_reason") else "yes"
+
+
 def has_dependents(state: WatchState) -> Literal["yes", "no"]:
     """Route: check if there are dependent files to re-analyze.
 
@@ -2123,39 +2166,45 @@ def build_watch_graph():
 
     Graph topology:
         hash_check ──→ read_file ──→ change_filter ──→ parse_ast
-        ──→ index_chromadb ──→ update_kg ──→ update_dep_graph
-        ──→ test_gap_detect ──→ get_neighborhood ──→ rag_retrieve ──→ git_session
-        ──→ build_context ──→ llm_analyze ──→ cache_results
-        ──→ emit_ws_events (broadcast PRIMARY result in real time)
-        ──→ learn_feedback (KB promotion — after the developer already has results)
-        ──→ [if deps] analyze_dependents (stream each dependent) ──→ END
-        ──→ [no deps]                                            ──→ END
+        ──→ test_gap_detect (ALWAYS runs — 0 token, independent of significance)
+        ──→ [significant?]
+            "yes" → index_chromadb ──→ update_kg ──→ update_dep_graph
+                  ──→ get_neighborhood ──→ rag_retrieve ──→ git_session
+                  ──→ build_context ──→ llm_analyze ──→ cache_results
+                  ──→ emit_ws_events (broadcast PRIMARY result in real time)
+                  ──→ learn_feedback (KB promotion — after the developer already has results)
+                  ──→ [if deps] analyze_dependents (stream each dependent) ──→ END
+                  ──→ [no deps]                                            ──→ END
+            "no"  → emit_test_gap_only (broadcast just the test_gap event) ──→ END
     """
     graph = StateGraph(WatchState)
 
     # ── Add nodes ────────────────────────────────────────────────────────────
-    graph.add_node("hash_check",         node_hash_check)
-    graph.add_node("read_file",          node_read_file)
-    graph.add_node("change_filter",      node_change_filter)
-    graph.add_node("parse_ast",          node_parse_ast)
-    graph.add_node("index_chromadb",     node_index_chromadb)
-    graph.add_node("update_kg",          node_update_kg)
-    graph.add_node("update_dep_graph",   node_update_dep_graph)
-    graph.add_node("test_gap_detect",    node_test_gap_detect)
-    graph.add_node("get_neighborhood",   node_get_neighborhood)
-    graph.add_node("rag_retrieve",       node_rag_retrieve)
-    graph.add_node("git_session",        node_git_session)
-    graph.add_node("build_context",      node_build_context)
-    graph.add_node("llm_analyze",        node_llm_analyze)
-    graph.add_node("cache_results",      node_cache_results)
-    graph.add_node("learn_feedback",     node_learn_feedback)
-    graph.add_node("analyze_dependents", node_analyze_dependents)
-    graph.add_node("emit_ws_events",     node_emit_ws_events)   # NEW ← Node 15
+    graph.add_node("hash_check",          node_hash_check)
+    graph.add_node("read_file",           node_read_file)
+    graph.add_node("change_filter",       node_change_filter)
+    graph.add_node("parse_ast",           node_parse_ast)
+    graph.add_node("test_gap_detect",     node_test_gap_detect)
+    graph.add_node("emit_test_gap_only",  node_emit_test_gap_only)
+    graph.add_node("index_chromadb",      node_index_chromadb)
+    graph.add_node("update_kg",           node_update_kg)
+    graph.add_node("update_dep_graph",    node_update_dep_graph)
+    graph.add_node("get_neighborhood",    node_get_neighborhood)
+    graph.add_node("rag_retrieve",        node_rag_retrieve)
+    graph.add_node("git_session",         node_git_session)
+    graph.add_node("build_context",       node_build_context)
+    graph.add_node("llm_analyze",         node_llm_analyze)
+    graph.add_node("cache_results",       node_cache_results)
+    graph.add_node("learn_feedback",      node_learn_feedback)
+    graph.add_node("analyze_dependents",  node_analyze_dependents)
+    graph.add_node("emit_ws_events",      node_emit_ws_events)
 
     # ── Entry point ──────────────────────────────────────────────────────────
     graph.set_entry_point("hash_check")
 
     # ── Edges ────────────────────────────────────────────────────────────────
+    # hash_check/read_file only hard-stop on real errors (file not found, read
+    # error, unsupported language) — an unchanged hash is no longer one of them.
     graph.add_conditional_edges("hash_check", should_continue_or_skip, {
         "continue": "read_file",
         "skip":     END,
@@ -2164,17 +2213,21 @@ def build_watch_graph():
         "continue": "change_filter",
         "skip":     END,
     })
-    graph.add_conditional_edges("change_filter", should_continue_or_skip, {
-        "continue": "parse_ast",
-        "skip":     END,
-    })
+    # change_filter no longer gates directly — parse_ast/test_gap_detect always
+    # run next; its skip_reason is consumed later by is_significant_change().
+    graph.add_edge("change_filter",     "parse_ast")
+    graph.add_edge("parse_ast",         "test_gap_detect")
 
-    # Sequential pipeline
-    graph.add_edge("parse_ast",         "index_chromadb")
+    graph.add_conditional_edges("test_gap_detect", is_significant_change, {
+        "yes": "index_chromadb",
+        "no":  "emit_test_gap_only",
+    })
+    graph.add_edge("emit_test_gap_only", END)
+
+    # Sequential pipeline (significant-change branch — unchanged from before)
     graph.add_edge("index_chromadb",    "update_kg")
     graph.add_edge("update_kg",         "update_dep_graph")
-    graph.add_edge("update_dep_graph",  "test_gap_detect")
-    graph.add_edge("test_gap_detect",   "get_neighborhood")
+    graph.add_edge("update_dep_graph",  "get_neighborhood")
     graph.add_edge("get_neighborhood",  "rag_retrieve")
     graph.add_edge("rag_retrieve",      "git_session")
     graph.add_edge("git_session",       "build_context")
@@ -2211,7 +2264,6 @@ def invoke_watch(
     dep_graph: Any = None,
     cache: Any = None,
     print_lock: Any = None,
-    learning_agent: Any = None,
     file_counter: Any = None,
     ws_broadcast: Any = None,
 ) -> Dict[str, Any]:
@@ -2227,7 +2279,6 @@ def invoke_watch(
         dep_graph: nx.DiGraph — dependency graph (optional).
         cache: CacheService instance (optional).
         print_lock: threading.Lock for console output (optional).
-        learning_agent: Legacy LearningAgent instance (optional).
         file_counter: Shared dict for session stats (optional).
 
     Returns:
@@ -2244,7 +2295,6 @@ def invoke_watch(
         "_dep_graph": dep_graph,
         "_cache": cache,
         "_print_lock": print_lock,
-        "_learning_agent": learning_agent,
         "_file_counter": file_counter,
         "_ws_broadcast": ws_broadcast,
         "skip_reason": None,

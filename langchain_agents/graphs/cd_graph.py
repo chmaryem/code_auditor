@@ -218,9 +218,8 @@ def node_monitor_health(state: CDState) -> CDState:
         }
 
     try:
-        # Single health check snapshot (fast path)
-        # Full 10-min monitoring runs async in CDPostDeployMonitor
-        # but we do a quick check here for the graph flow
+        # Single health check snapshot (fast path) — one probe is enough for
+        # the graph flow.
         from langchain_agents.tools.cd_tools import tool_check_health
         result = tool_check_health.invoke({
             "deploy_url":   deploy_url,

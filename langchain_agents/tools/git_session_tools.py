@@ -26,6 +26,5 @@ def tool_git_session_status(project_path: str) -> Optional[Dict[str, Any]]:
         Dict with level, score, minutes_since_commit, files_at_risk_count,
         files_unanalyzed_count, time_multiplier, has_data; or None if unavailable.
     """
-    from langchain_agents.agents.lc_git_session_agent import LCGitSessionAgent
-    agent = LCGitSessionAgent(Path(project_path))
-    return agent.get_session_context()
+    from langchain_agents.tools.git_tools import tool_session_status
+    return tool_session_status.invoke({"project_path": str(project_path)})

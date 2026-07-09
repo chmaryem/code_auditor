@@ -5,7 +5,7 @@ Role:
   Safe conflict detection and dry-run resolution wrapper.
 
 Uses existing:
-  smart_git.git_conflict_resolver.detect_conflict_files
+  smart_git.git_diff_parser.detect_conflict_files
 
 Important:
   This first LangGraph version is SAFE by default.
@@ -25,11 +25,32 @@ class LCGitConflictAgent:
       - are there conflicts?
       - which files are conflicted?
       - can we prepare a dry-run resolution?
+
+    Pillars: owns tool_conflict_scan (+ the conflict_resolution_graph subgraph
+    for actual resolution), and an AgentRedisMemory namespace.
+    Node in the graph: node_conflict (intent: conflict_resolution_dry_run).
     """
+
+    def __init__(self) -> None:
+        from langchain_agents.tools.git_tools import tool_conflict_scan
+        # Pilier TOOLS
+        self.tools = [tool_conflict_scan]
+        # Pilier MEMORY
+        from langchain_agents.memory.redis_memory import AgentRedisMemory
+        self.memory = AgentRedisMemory("conflict_agent")
+
+    async def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch: safe conflict dry-run scan. Writes conflict_report."""
+        import asyncio
+        from langchain_agents.tools.git_tools import tool_conflict_scan
+        project_path = state.get("project_path", ".") or "."
+        state["conflict_report"] = await asyncio.to_thread(
+            tool_conflict_scan.invoke, {"project_path": project_path})
+        return state
 
     def detect_conflicts(self, project_path: str) -> Dict[str, Any]:
         try:
-            from smart_git.git_conflict_resolver import detect_conflict_files
+            from smart_git.git_diff_parser import detect_conflict_files
         except Exception as e:
             return {
                 "success": False,
@@ -94,8 +115,8 @@ class LCGitConflictAgent:
             ),
             "dry_run": True,
             "next_step": (
-                "Add preview generation using resolve_single_file() and show a diff "
-                "before applying changes."
+                "Use conflict_resolution_dry_run's follow-up (Smart Git PR resolve) "
+                "to preview a resolution before applying changes."
             ),
         }
 

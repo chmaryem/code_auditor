@@ -219,8 +219,12 @@ class CIPoller:
         All other CI jobs        → CIGraph.
         Returns: nombre de runs analysés
         """
-        from langchain_agents.graphs.ci_graph import invoke_ci_run
-        from langchain_agents.graphs.cd_graph import invoke_cd_run
+        # Dispatcher: deterministic by default, agentic when CI_CD_AGENTIC=1
+        # (with automatic deterministic fallback on error).
+        from langchain_agents.graphs.graph_dispatch import (
+            run_ci_graph as invoke_ci_run,
+            run_cd_graph as invoke_cd_run,
+        )
 
         runs = self._fetch_completed_runs()
         analyzed = 0

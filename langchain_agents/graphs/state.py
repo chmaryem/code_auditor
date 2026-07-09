@@ -48,7 +48,6 @@ class WatchState(TypedDict, total=False):
     _dep_graph: Any
     _cache: Any
     _print_lock: Any
-    _learning_agent: Any
     _file_counter: Any
     # Thread-safe callback(event: dict) -> None used to push WS events to the
     # plugin *incrementally* (primary result first, dependents as they finish)
@@ -172,6 +171,11 @@ class ChatState(TypedDict, total=False):
     branch: str               # current git branch
     active_repository: str    # name of the active repository (from dashboard)
 
+    # ── Scope / périmètre du chat ─────────────────────────────────────────────
+    scope: str                          # "extension" (défaut, analyse projet complète) | "dashboard" (restreint)
+    attached_files: List[Dict[str, Any]]  # [{path, content}] fournis par le dev via le bouton d'ajout (dashboard)
+    dashboard_needs_attachment: bool    # True → question code en mode dashboard sans fichier attaché (nudge)
+
     # ── IDE Cursor context (VS Code extension → API) ─────────────────────────
     cursor_line: int             # 0 = unknown
     active_function: str         # name of function/method under cursor
@@ -242,3 +246,55 @@ class ChatState(TypedDict, total=False):
     _cache: Any
     _indexer: Any
     _dep_graph: Any
+
+
+class SmartGitState(TypedDict, total=False):
+    """
+    State for the SmartGitGraph pipeline (multi-agent Smart Git orchestration).
+
+    Flow: node_router (RouterAgent, LLM) → [route_by_intent] → one worker node
+    (WorkingCopyAgent | PRAgent | ConflictAgent) → node_synthesize (join) → END.
+    Worker nodes select their tool(s) by `intent` and write their report field;
+    node_synthesize reads whatever report is present and produces `response`.
+    """
+
+    # ── Input ────────────────────────────────────────────────────────────────
+    user_message: str
+    project_path: str
+    owner: str
+    repo: str
+    pr_number: int
+    branch: str
+    base: str
+    session_id: str
+
+    # ── Decision (written by node_router) ────────────────────────────────────
+    intent: str
+    confidence: float
+    branch_name: str            # branch explicitly named in the message (LLM-extracted)
+    selected_agents: List[str]
+    needs_confirmation: bool
+    safe_mode: bool
+    reason: str
+
+    # ── Worker report fields (each worker writes the one matching its intent) ─
+    session_snapshot: Dict[str, Any]
+    changes: Dict[str, Any]
+    commit_message: str
+    branch_report: Dict[str, Any]
+    readiness_report: Dict[str, Any]
+    pr_report: Dict[str, Any]
+    pr_description: Dict[str, Any]
+    conflict_report: Dict[str, Any]
+    secret_scan_report: Dict[str, Any]
+    commit_lint_report: Dict[str, Any]
+    test_impact_report: Dict[str, Any]
+    cross_pr_report: Dict[str, Any]
+    repo_overview_report: Dict[str, Any]
+
+    # ── Output (written by node_synthesize) ──────────────────────────────────
+    response: str
+    actions: List[Any]
+    warnings: List[Any]
+    errors: List[Any]
+    stats: Dict[str, Any]

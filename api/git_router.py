@@ -325,11 +325,11 @@ async def git_status(req: GitSessionRequest):
 
     t0 = time.time()
     try:
-        from langchain_agents.agents.lc_git_session_agent import git_session_agent
+        from langchain_agents.tools.git_tools import tool_session_status
         from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
         snapshot = await asyncio.to_thread(
-            git_session_agent.get_status, str(project_path.resolve())
+            tool_session_status.invoke, {"project_path": str(project_path.resolve())}
         )
         response = git_synthesis_agent.synthesize(
             {"intent": "git_status", "session_snapshot": snapshot}
@@ -364,14 +364,13 @@ async def git_branch(req: GitBranchRequest, user: Principal = Depends(get_curren
 
     t0 = time.time()
     try:
-        from langchain_agents.agents.lc_git_branch_agent import git_branch_agent
+        from langchain_agents.tools.git_tools import tool_branch_readiness
         from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
         report = await asyncio.to_thread(
-            git_branch_agent.analyze_branch,
-            project_path=str(project_path.resolve()),
-            branch=req.branch or "HEAD",
-            base=req.base or "main",
+            tool_branch_readiness.invoke,
+            {"project_path": str(project_path.resolve()),
+             "branch": req.branch or "HEAD", "base": req.base or "main"},
         )
         response = git_synthesis_agent.synthesize(
             {"intent": "branch_readiness", "branch_report": report}
@@ -755,13 +754,12 @@ async def git_secret_scan(req: GitSecretScanRequest, user: Principal = Depends(g
 
     t0 = time.time()
     try:
-        from langchain_agents.agents.lc_git_secret_agent import LCGitSecretAgent
+        from langchain_agents.tools.git_tools import tool_secret_scan
         from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
-        scanned = await asyncio.to_thread(
-            LCGitSecretAgent().run, {"project_path": str(project_path.resolve())}
+        report = await asyncio.to_thread(
+            tool_secret_scan.invoke, {"project_path": str(project_path.resolve())}
         )
-        report = scanned.get("secret_scan_report") or {}
         response = git_synthesis_agent.synthesize(
             {"intent": "secret_scan", "secret_scan_report": report}
         )
@@ -1009,16 +1007,15 @@ async def git_cross_pr_conflicts(req: GitCrossPRRequest, user: Principal = Depen
     """
     t0 = time.time()
     try:
-        from langchain_agents.agents.lc_git_cross_pr_agent import LCGitCrossPRAgent
+        from langchain_agents.tools.git_tools import tool_cross_pr
         from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
-        scanned = await asyncio.to_thread(LCGitCrossPRAgent().run, {
+        report = await asyncio.to_thread(tool_cross_pr.invoke, {
             "owner": req.owner,
             "repo": req.repo,
             "pr_number": req.pr_number,
             "base": req.base,
         })
-        report = scanned.get("cross_pr_report") or {}
         response = git_synthesis_agent.synthesize(
             {"intent": "cross_pr_conflicts", "cross_pr_report": report}
         )
@@ -1059,10 +1056,10 @@ async def git_pr_description(req: GitPRDescriptionRequest, user: Principal = Dep
     """
     t0 = time.time()
     try:
-        from langchain_agents.agents.lc_git_pr_description_agent import LCGitPRDescriptionAgent
+        from langchain_agents.tools.git_tools import tool_pr_description
         from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
 
-        scanned = await asyncio.to_thread(LCGitPRDescriptionAgent().run, {
+        report = await asyncio.to_thread(tool_pr_description.invoke, {
             "project_path": req.project_path or ".",
             "owner": req.owner,
             "repo": req.repo,
@@ -1070,7 +1067,6 @@ async def git_pr_description(req: GitPRDescriptionRequest, user: Principal = Dep
             "branch": req.branch,
             "base": req.base,
         })
-        report = scanned.get("pr_description") or {}
         response = git_synthesis_agent.synthesize(
             {"intent": "pr_description", "pr_description": report}
         )

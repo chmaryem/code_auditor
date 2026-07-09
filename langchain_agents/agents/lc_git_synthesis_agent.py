@@ -32,6 +32,9 @@ class LCGitSynthesisAgent:
         if intent == "pr_readiness":
             return self._pr_readiness(state)
 
+        if intent == "pr_fix_guidance":
+            return self._pr_fix_guidance(state)
+
         if intent == "pr_review":
             return self._pr_review(state)
 
@@ -53,7 +56,56 @@ class LCGitSynthesisAgent:
         if intent == "pr_description":
             return self._pr_description(state)
 
+        if intent == "repo_overview":
+            return self._repo_overview(state)
+
         return self._status(state)
+
+    # ── Repo overview (repo_overview) ────────────────────────────────────────
+
+    def _repo_overview(self, state: Dict[str, Any]) -> str:
+        ov = state.get("repo_overview_report") or {}
+        if not ov.get("success"):
+            return (
+                "## Aperçu du dépôt\n\n"
+                "Impossible de récupérer les informations du dépôt "
+                "(ni via GitHub, ni via le git local)."
+            )
+
+        if ov.get("source") == "github":
+            lines = [
+                f"## Dépôt {ov.get('full_name', '')}",
+                "",
+            ]
+            if ov.get("description"):
+                lines.append(f"{ov['description']}")
+                lines.append("")
+            lines += [
+                f"- **Visibilité** : {ov.get('visibility', '—')}",
+                f"- **Branche par défaut** : `{ov.get('default_branch', '—')}`",
+                f"- **Langage principal** : {ov.get('language') or '—'}",
+            ]
+            if ov.get("open_prs") is not None:
+                lines.append(f"- **PR ouvertes** : {ov['open_prs']}")
+            lines += [
+                f"- **Étoiles** : {ov.get('stars', 0)}",
+                f"- **Dernière activité** : {ov.get('pushed_at', '—')}",
+            ]
+            if ov.get("html_url"):
+                lines += ["", f"🔗 {ov['html_url']}"]
+            return "\n".join(lines)
+
+        # Source locale (repli)
+        return "\n".join([
+            f"## Dépôt local — {ov.get('full_name', '')}",
+            "",
+            "_Aucun dépôt GitHub connecté — informations issues du git local._",
+            "",
+            f"- **Branche courante** : `{ov.get('default_branch', '—')}`",
+            f"- **Remote** : {ov.get('remote') or '—'}",
+            f"- **Commits** : {ov.get('commits') or '—'}",
+            f"- **Dernier commit** : {ov.get('last_commit') or '—'}",
+        ])
 
     # ── Generic status ──────────────────────────────────────────────────────
 
@@ -288,6 +340,67 @@ class LCGitSynthesisAgent:
             f"| CI/CD | {'✅' if report.get('ci_pass') else '❌'} |\n"
             f"| Reviews | {'✅' if report.get('reviews_approved') else 'ℹ️ En attente'} |\n"
         )
+
+    # ── PR fix guidance ──────────────────────────────────────────────────────
+
+    def _pr_fix_guidance(self, state: Dict[str, Any]) -> str:
+        """
+        "What's the solution to merge it?" — unlike _pr_readiness, this is a
+        SOLUTION question, not a status question. Reuses the exact same
+        readiness data (mergeable/ci_pass/reviews_approved/security_context)
+        but renders it as concrete steps instead of re-stating the same report.
+        """
+        report = state.get("readiness_report") or {}
+
+        if not report.get("success"):
+            return f"## Comment merger cette PR\n\nErreur : `{report.get('error', 'unknown error')}`"
+
+        if report.get("ready"):
+            return (
+                "## Comment merger cette PR\n\n"
+                "✅ Elle est déjà prête — mergez-la directement, aucune action requise."
+            )
+
+        steps: list[str] = []
+        security = report.get("security_context") or {}
+        critical = security.get("critical", 0)
+        high     = security.get("high", 0)
+
+        if critical > 0:
+            steps.append(
+                f"**Corriger {critical} vulnérabilité(s) critique(s)** détectée(s) par la revue "
+                f"de code — voir l'onglet **Review** pour le détail de chaque fichier."
+            )
+        elif high > 0:
+            steps.append(
+                f"**Examiner {high} vulnérabilité(s) high** signalée(s) par la revue de code "
+                f"— voir l'onglet **Review**."
+            )
+        if not report.get("mergeable"):
+            steps.append(
+                "**Résoudre les conflits** — ouvrez l'onglet **Resolve** du dashboard "
+                "(ou lancez la résolution automatique) avant toute autre étape."
+            )
+        if not report.get("ci_pass"):
+            steps.append(
+                "**Corriger les checks CI/CD en échec** — consultez les logs du check "
+                "concerné et poussez un commit corrigé."
+            )
+        if not report.get("reviews_approved"):
+            steps.append(
+                "**Obtenir une approbation** — demandez une review à un(e) collègue, "
+                "ou via l'onglet **Review** du dashboard."
+            )
+
+        if not steps:
+            steps.append(
+                "Aucun blocage clair identifié automatiquement — consultez le détail "
+                "du rapport de readiness pour plus de contexte."
+            )
+
+        lines = ["## Comment merger cette PR", "", "**Plan d'action, dans l'ordre :**", ""]
+        lines += [f"{i}. {s}" for i, s in enumerate(steps, 1)]
+        return "\n".join(lines)
 
     # ── PR review ───────────────────────────────────────────────────────────
 

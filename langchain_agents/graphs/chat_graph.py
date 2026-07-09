@@ -53,6 +53,8 @@ def _initial_state(
     active_module: str = "",
     branch: str = "",
     active_repository: str = "",
+    scope: str = "extension",
+    attached_files: list | None = None,
     **services: Any,
 ) -> ChatState:
     return {
@@ -67,6 +69,11 @@ def _initial_state(
         "active_module":     active_module or "",
         "branch":            branch or "",
         "active_repository": active_repository or "",
+
+        # Scope / périmètre
+        "scope":                      scope or "extension",
+        "attached_files":             attached_files or [],
+        "dashboard_needs_attachment": False,
 
         # IDE cursor context
         "cursor_line":       cursor_line,
@@ -213,17 +220,32 @@ def node_decision_agent(state: ChatState) -> Dict[str, Any]:
         "generation_target":old_params.get("generation_target") or plan.get("generation_target", ""),
     }
 
+    resolved_intent = plan.get("intent", state.get("intent", "question"))
+
+    # ── Périmètre dashboard : les intents « code » exigent un fichier attaché ──
+    # Le chat dashboard ne scanne pas le projet. Si une question code arrive sans
+    # attachement, on redirige vers une réponse courte invitant à joindre le fichier
+    # (le vrai chat d'analyse projet est côté extension VS Code).
+    dashboard_needs_attachment = False
+    _CODE_INTENTS = {"explain", "complete_fn", "new_class", "code_generation"}
+    if (state.get("scope") == "dashboard"
+            and resolved_intent in _CODE_INTENTS
+            and not (state.get("attached_files") or [])):
+        resolved_intent = "question"
+        dashboard_needs_attachment = True
+
     return {
         "decision_plan":    plan,
-        "intent":           plan.get("intent", state.get("intent", "question")),
+        "intent":           resolved_intent,
         "intent_params":    merged_params,
-        "context_level":    plan.get("context_level", "context"),
+        "context_level":    "fast" if dashboard_needs_attachment else plan.get("context_level", "context"),
         "selected_agents":  plan.get("agents", []),
-        "needs_rag":        bool(plan.get("needs_rag", True)),
+        "needs_rag":        False if dashboard_needs_attachment else bool(plan.get("needs_rag", True)),
         "needs_git":        bool(plan.get("needs_git", False)),
         "needs_ci":         bool(plan.get("needs_ci", False)),
-        "needs_generation": bool(plan.get("needs_generation", False)),
+        "needs_generation": False if dashboard_needs_attachment else bool(plan.get("needs_generation", False)),
         "needs_tests":      bool(plan.get("needs_tests", False)),
+        "dashboard_needs_attachment": dashboard_needs_attachment,
     }
 
 
@@ -231,8 +253,48 @@ def node_decision_agent(state: ChatState) -> Dict[str, Any]:
 # Nodes — Context
 # ══════════════════════════════════════════════════════════════════════════════
 
+_EXT_LANG = {
+    ".py": "python", ".java": "java", ".js": "javascript", ".jsx": "javascript",
+    ".ts": "typescript", ".tsx": "typescript", ".go": "go", ".rb": "ruby",
+    ".php": "php", ".cs": "csharp", ".cpp": "cpp", ".c": "c", ".rs": "rust",
+    ".sql": "sql", ".sh": "bash", ".yml": "yaml", ".yaml": "yaml", ".json": "json",
+}
+
+
+def _lang_from_path(path: str) -> str:
+    """Détection légère du langage à partir de l'extension (pour fichiers attachés)."""
+    for ext, lang in _EXT_LANG.items():
+        if path.lower().endswith(ext):
+            return lang
+    return "unknown"
+
+
 def node_load_file_context(state: ChatState) -> Dict[str, Any]:
-    """Load target file, cached analysis and dependency context."""
+    """Load target file, cached analysis and dependency context.
+
+    Mode dashboard (scope="dashboard") : AUCUN scan du projet local.
+    Le seul code fourni au LLM = les fichiers explicitement attachés par le dev.
+    """
+    # ── Périmètre dashboard : uniquement les fichiers attachés ────────────────
+    if state.get("scope") == "dashboard":
+        attached = state.get("attached_files") or []
+        if not attached:
+            # Aucun fichier attaché : rien à charger (le nudge est géré en amont).
+            return {"file_code": "", "target_file": "", "target_lang": "unknown",
+                    "file_analysis": {}, "dependencies": [], "dependents": []}
+        code = "\n\n".join(
+            f"# ── {f.get('path', 'fichier')} ──\n{f.get('content', '')}" for f in attached
+        )
+        first_path = attached[0].get("path", "")
+        return {
+            "file_code":     code,
+            "target_file":   first_path,
+            "target_lang":   _lang_from_path(first_path),
+            "file_analysis": {},
+            "dependencies":  [],   # pas de graphe de dépendances en mode dashboard
+            "dependents":    [],
+        }
+
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
     params = state.get("intent_params", {}) or {}
@@ -299,6 +361,9 @@ async def node_parallel_context(state: ChatState) -> Dict[str, Any]:
       - git_context      (GitSessionTracker snapshot — only if needs_git)
 
     ~60% latency reduction vs sequential execution.
+
+    Mode dashboard : project_summary et RAG local sont désactivés (pas de scan projet) ;
+    seul le contexte git (métadonnées, pas le code source) reste chargé si nécessaire.
     """
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
@@ -310,7 +375,14 @@ async def node_parallel_context(state: ChatState) -> Dict[str, Any]:
     needs_git    = state.get("needs_git", False)
     needs_rag    = state.get("needs_rag", True)
 
+    # Périmètre dashboard : aucun scan du projet local (summary + RAG code coupés).
+    is_dashboard = state.get("scope") == "dashboard"
+    if is_dashboard:
+        needs_rag = False
+
     async def _summary():
+        if is_dashboard:
+            return {}   # pas de comptage/scan projet en mode dashboard
         try:
             return lc_chat_agent.project_summary(project_path)
         except Exception as e:
@@ -385,8 +457,20 @@ def node_rag_retrieve(state: ChatState) -> Dict[str, Any]:
 # Nodes — Answer / Specialized paths
 # ══════════════════════════════════════════════════════════════════════════════
 
+_DASHBOARD_ATTACH_NUDGE = (
+    "Pour analyser ou expliquer du code, ajoutez le(s) fichier(s) concerné(s) "
+    "via le bouton 📎 de la barre de saisie.\n\n"
+    "Le chat du dashboard répond sur **Git, les PR, le dépôt, le CI/CD et les questions générales**, "
+    "et sur les fichiers que vous attachez — il ne parcourt pas l'ensemble de votre projet. "
+    "Pour une analyse complète du code de votre projet, utilisez le chat de l'extension VS Code."
+)
+
+
 async def node_fast_answer(state: ChatState, config: Any = None) -> Dict[str, Any]:
     """Fast streamed response for simple explain/summarize questions."""
+    if state.get("dashboard_needs_attachment"):
+        return {"response": _DASHBOARD_ATTACH_NUDGE}
+
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
     response = await lc_chat_agent.afast_answer(dict(state), config=config)
@@ -395,6 +479,9 @@ async def node_fast_answer(state: ChatState, config: Any = None) -> Dict[str, An
 
 async def node_answer_question(state: ChatState, config: Any = None) -> Dict[str, Any]:
     """Generate final project-aware answer."""
+    if state.get("dashboard_needs_attachment"):
+        return {"response": _DASHBOARD_ATTACH_NUDGE}
+
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
     response = await lc_chat_agent.aanswer(dict(state), config=config)
@@ -472,12 +559,34 @@ async def node_git_question(state: ChatState) -> Dict[str, Any]:
                 "git_diff_used": False,
             }
 
-    # ── Full SmartGitGraph for heavier operations ─────────────────────────────
-    from langchain_agents.graphs.smart_git_graph import ainvoke_smart_git
+    # ── Direct Smart Git dispatch for heavier operations ──────────────────────
+    # Phase 0 (multi-agent refactor): classify + dispatch without the LangGraph.
+    # Axe a (2026-07-05): the Chat previously never passed owner/repo/branch,
+    # so PR intents (pr_review/pr_readiness) always hit "Missing owner/repo/
+    # pr_number" and branch_readiness always analyzed HEAD vs main regardless
+    # of what the user asked about.
+    #
+    # owner/repo resolution (2026-07-05, follow-up): the local git remote of
+    # `project_path` is NOT necessarily the repo the user means — the PR
+    # Cockpit lets a developer pick ANY GitHub repo independently of the
+    # local checkout (users.active_github_repo, already piped into
+    # ChatState.active_repository). Prefer that; fall back to the local git
+    # remote (previous behavior) only when no active repo is selected.
+    from langchain_agents.agents.smart_git_dispatch import adispatch_smart_git_message
 
-    result = await ainvoke_smart_git(
+    active_repository = (state.get("active_repository") or "").strip()
+    if "/" in active_repository:
+        owner, repo = active_repository.split("/", 1)
+    else:
+        owner, repo = _resolve_owner_repo(project_path)
+    branch = state.get("branch", "") or "HEAD"
+
+    result = await adispatch_smart_git_message(
         message=message,
         project_path=project_path,
+        owner=owner,
+        repo=repo,
+        branch=branch,
         session_id=state.get("session_id", ""),
     )
 
@@ -1061,6 +1170,16 @@ def _sse(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
 
 
+def _strip_code_fences(text: str) -> str:
+    """Retire les blocs de code ```...``` en gardant la prose autour.
+    Utilisé pour la génération : le code passe par l'événement `code`, pas la réponse."""
+    import re
+    stripped = re.sub(r"```[\w+.-]*\n.*?```", "", text, flags=re.DOTALL)
+    # Nettoyage : séparateurs '---' orphelins et lignes vides multiples.
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    return stripped.strip().lstrip("-").strip()
+
+
 async def stream_chat(
     message: str,
     project_path: str = ".",
@@ -1074,6 +1193,8 @@ async def stream_chat(
     active_module: str = "",
     branch: str = "",
     active_repository: str = "",
+    scope: str = "extension",
+    attached_files: list | None = None,
     **services: Any,
 ):
     """
@@ -1100,6 +1221,8 @@ async def stream_chat(
         active_module=active_module,
         branch=branch,
         active_repository=active_repository,
+        scope=scope,
+        attached_files=attached_files,
         **services,
     )
 
@@ -1110,6 +1233,13 @@ async def stream_chat(
     final_context_level = "context"
     final_response = ""
     final_context_sources: list = []
+
+    # Génération de code : le code est livré UNE seule fois, via l'événement `code`.
+    # On supprime donc (1) le streaming de tokens pendant la génération et (2) le code
+    # dans la réponse finale — sinon il apparaît 3 fois dans l'UI de l'extension.
+    _GEN_NODES = ("generate_completion", "generate_class")
+    _GEN_INTENTS = ("complete_fn", "new_class", "code_generation")
+    in_generation = False
 
     yield _sse({"type": "status", "content": "Starting...", "elapsed_ms": 0})
 
@@ -1153,15 +1283,21 @@ async def stream_chat(
             node_name = event.get("name", "")
             data = event.get("data", {}) or {}
 
-            if kind == "on_chain_start" and node_name in node_status:
-                yield _sse({
-                    "type":       "status",
-                    "node":       node_name,
-                    "content":    node_status[node_name],
-                    "elapsed_ms": round((time.time() - started_at) * 1000),
-                })
+            if kind == "on_chain_start":
+                if node_name in _GEN_NODES:
+                    in_generation = True   # début génération → on coupe le streaming de tokens
+                if node_name in node_status:
+                    yield _sse({
+                        "type":       "status",
+                        "node":       node_name,
+                        "content":    node_status[node_name],
+                        "elapsed_ms": round((time.time() - started_at) * 1000),
+                    })
 
             elif kind == "on_chat_model_stream":
+                # Pendant la génération, le code est livré via l'événement `code` uniquement.
+                if in_generation:
+                    continue
                 chunk = data.get("chunk")
                 content = getattr(chunk, "content", "")
                 if isinstance(content, list):
@@ -1193,13 +1329,19 @@ async def stream_chat(
                 elif node_name == "load_file_context" and isinstance(output, dict):
                     final_target_file = output.get("target_file", final_target_file)
 
-                elif node_name in ("generate_completion", "generate_class") and isinstance(output, dict):
+                elif node_name in _GEN_NODES and isinstance(output, dict):
+                    in_generation = False   # fin génération → on ré-autorise le streaming
                     if output.get("generated_code"):
                         yield _sse({"type": "code", "content": output["generated_code"]})
 
                 elif node_name == "format_response" and isinstance(output, dict):
                     final_response = output.get("formatted_response", final_response)
                     final_context_sources = output.get("context_sources") or final_context_sources
+
+        # Génération : le code est déjà livré via l'événement `code` — on le retire de la
+        # réponse finale pour ne pas l'afficher une seconde fois (on garde la prose/validation).
+        if final_intent in _GEN_INTENTS and final_response:
+            final_response = _strip_code_fences(final_response)
 
         yield _sse({
             "type": "done",

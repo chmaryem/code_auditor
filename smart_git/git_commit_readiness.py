@@ -17,7 +17,7 @@ Pourquoi un appel direct (et non le LangGraph) :
 
 Checks agrégés :
   1. secrets       (git_secret_scanner)   — BLOQUANT
-  2. conflicts     (git_conflict_resolver)— BLOQUANT
+  2. conflicts     (git_diff_parser)      — BLOQUANT
   3. commit_lint   (git_commit_linter)    — AVERTISSEMENT (si message fourni)
   4. test_impact   (git_test_impact)      — AVERTISSEMENT
   5. session       (git_diff_parser)      — INFORMATIF (contexte/contexte risque)
@@ -34,11 +34,11 @@ from typing import Any, Dict, List, Optional
 from smart_git.git_secret_scanner import scan_staged_secrets
 from smart_git.git_commit_linter import lint_commit_message, lint_staged_commit
 from smart_git.git_test_impact import analyze_test_impact_staged
-from smart_git.git_conflict_resolver import detect_conflict_files
 from smart_git.git_diff_parser import (
     is_git_repo,
     get_staged_files,
     get_session_stats,
+    detect_conflict_files,
 )
 
 

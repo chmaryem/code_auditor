@@ -128,8 +128,11 @@ class GitPRDescriptionGenerator:
         report = PRDescriptionReport(title=f"PR #{pr_number}")
 
         try:
+            from smart_git.pr_context_cache import fetch_pr_info_cached, fetch_pr_files_cached
+
             if not pr_data:
-                pr_data = github_service.get_pr_info(owner, repo, pr_number) or {}
+                # cache partagé ~90s — cf. pr_context_cache.py, Axe b
+                pr_data = fetch_pr_info_cached(github_service, owner, repo, pr_number)
 
             pr_title = pr_data.get("title", f"PR #{pr_number}")
             report.title = pr_title
@@ -145,8 +148,8 @@ class GitPRDescriptionGenerator:
                 for c in commits_raw
             ]
 
-            # Fichiers via API
-            files_raw = github_service.get_pr_files(owner, repo, pr_number) or []
+            # Fichiers via API (cache partagé ~90s)
+            files_raw = fetch_pr_files_cached(github_service, owner, repo, pr_number)
             file_list = [f.get("filename", "") for f in files_raw]
             additions = sum(f.get("additions", 0) for f in files_raw)
             deletions = sum(f.get("deletions", 0) for f in files_raw)

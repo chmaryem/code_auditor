@@ -326,5 +326,5 @@ _scanner = GitSecretScanner()
 
 
 def scan_staged_secrets(project_path: Path) -> SecretScanReport:
-    """Point d'entrée public — utilisé par git_hook.py et lc_git_secret_agent.py."""
+    """Point d'entrée public — utilisé par git_hook.py et tool_secret_scan (git_tools.py)."""
     return _scanner.scan_staged(project_path)

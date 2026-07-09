@@ -40,6 +40,8 @@ from api.models import (
     AnalysisResultResponse,
     AnalyzeProjectRequest,
     ProjectAnalysisResponse,
+    ScanProjectTestsRequest,
+    ScanProjectTestsResponse,
     WatchStartRequest,
     WatchStatusResponse,
     GitStatusRequest,
@@ -523,6 +525,24 @@ async def analyze_project(req: AnalyzeProjectRequest):
     )
 
 
+@app.post("/tests/scan-project", response_model=ScanProjectTestsResponse, dependencies=[Depends(get_current_user)])
+async def scan_project_tests(req: ScanProjectTestsRequest):
+    """
+    Balaie tout le projet pour l'état de couverture de tests (testés + gaps).
+    Utilisé par l'extension à l'activation pour peupler le panel Tests avec une
+    image complète, indépendamment de Watch (qui ne détecte les gaps qu'au fil
+    des sauvegardes).
+    """
+    project_path = Path(req.project_path)
+    if not project_path.exists():
+        raise HTTPException(404, f"Projet introuvable : {project_path}")
+
+    from services.test_gap_scanner import scan_project_test_gaps
+    results = await asyncio.to_thread(scan_project_test_gaps, project_path, req.max_files)
+
+    return ScanProjectTestsResponse(project_path=str(project_path), files=results)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Watch Mode — WatchGraph
 # ══════════════════════════════════════════════════════════════════════════════
@@ -829,6 +849,10 @@ async def generate_tests(req: GenerateTestsRequest):
         rag_docs_used = result.get("rag_docs_used")
         validated = result.get("validated")
         error = result.get("error")
+        run_success = result.get("run_success")
+        run_error_summary = result.get("run_error_summary")
+        cached = result.get("cached")
+        review_notes = result.get("review_notes")
 
         return GenerateTestsResponse(
             test_file=str(test_file or ""),
@@ -838,6 +862,10 @@ async def generate_tests(req: GenerateTestsRequest):
             validated=bool(validated or False),
             incremental=bool(result.get("incremental") or False),
             error=str(error or ""),
+            run_success=run_success if isinstance(run_success, bool) else None,
+            run_error_summary=str(run_error_summary) if run_error_summary else None,
+            cached=bool(cached or False),
+            review_notes=review_notes if isinstance(review_notes, dict) else None,
         )
 
     except HTTPException:

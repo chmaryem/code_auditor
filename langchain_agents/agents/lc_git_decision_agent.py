@@ -16,24 +16,131 @@ Examples:
   "est-ce que la PR 17 peut merger ?" → pr_readiness
   "résous les conflits"               → conflict_resolution_dry_run
   "génère un message de commit"       → commit_message
+
+Architecture v2 (Axe a — multi-agent refactor):
+  - Primary  : LLM call (~50 tokens, <0.5s) — understands free-text phrasing
+               that fools keyword matching (e.g. "is my commit message
+               conventional" vs "generate a commit message").
+  - Fallback : the original deterministic regex logic (kept verbatim as
+               _decide_regex), used when the LLM call fails, returns an
+               unknown intent, or returns low confidence (<0.5).
+  Same pattern already proven in lc_chat_decision_agent.py for the Chat's
+  top-level intent router.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from typing import Any, Dict
+
+logger = logging.getLogger(__name__)
+
+_VALID_INTENTS = {
+    "git_status", "can_commit", "commit_message", "summarize_changes",
+    "branch_readiness", "pr_review", "pr_readiness", "pr_description",
+    "pr_fix_guidance",
+    "conflict_resolution_dry_run", "secret_scan", "commit_lint",
+    "test_impact", "cross_pr_conflicts",
+    "repo_overview",
+}
+
+_AGENTS_FOR_INTENT = {
+    "git_status":                  ["session_agent"],
+    "can_commit":                  ["session_agent", "diff_agent"],
+    "commit_message":              ["diff_agent"],
+    "summarize_changes":           ["diff_agent"],
+    "branch_readiness":            ["branch_agent"],
+    "pr_review":                   ["pr_agent"],
+    "pr_readiness":                ["pr_agent"],
+    "pr_description":              ["pr_description_agent"],
+    "pr_fix_guidance":             ["pr_agent"],
+    "conflict_resolution_dry_run": ["conflict_agent"],
+    "secret_scan":                 ["secret_agent"],
+    "commit_lint":                 ["commit_linter_agent"],
+    "test_impact":                 ["test_impact_agent"],
+    "cross_pr_conflicts":          ["cross_pr_agent"],
+    "repo_overview":               ["repo_agent"],
+}
+
+_GIT_DECISION_PROMPT = """\
+You are a routing agent for Code Auditor's Smart Git assistant.
+Classify the developer's message and return a JSON routing plan.
+
+Developer message: {message}
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "intent": "<one of: git_status|can_commit|commit_message|summarize_changes|branch_readiness|pr_review|pr_readiness|pr_description|pr_fix_guidance|conflict_resolution_dry_run|secret_scan|commit_lint|test_impact|cross_pr_conflicts|repo_overview>",
+  "confidence": <0.0 to 1.0>,
+  "reason": "<one sentence>",
+  "branch_name": "<exact branch name ONLY if the developer names a specific branch, else empty string>"
+}}
+
+branch_name guide:
+- Fill it ONLY when a specific branch is named, e.g. "is my branch
+  'test-analyzer-conflict2' ready to merge?" -> "test-analyzer-conflict2".
+- Leave it "" for generic references with no name ("my branch", "the current branch").
+
+Intent guide:
+- git_status                  : current session status, accumulated risk/bugs — "what's my status"
+- can_commit                   : is it safe to commit right now
+- commit_message               : generate a commit message from the current diff
+- summarize_changes            : summarize/list current changes or diff
+- branch_readiness             : is MY current branch ready to merge into its base (asking for a STATUS)
+- pr_review                    : review a specific Pull Request's code (mentions review/analyze + a PR)
+- pr_readiness                 : is a specific PR ready/mergeable (mentions merge/ready + a PR) — asking IF it's ready, a STATUS question
+- pr_description                : generate a description for a Pull Request
+- pr_fix_guidance               : asking HOW TO FIX / what to DO to make a PR or branch mergeable — a SOLUTION/action-plan question,
+  not a status question. Trigger words: "solution", "fix", "how do I", "what should I do", "comment corriger",
+  "que faire", "comment la merger" (asking for STEPS, not a yes/no readiness check).
+  e.g. "what's the solution to merge it", "how do I fix this PR", "what should I do to get it merged",
+  "c'est quoi la solution pour qu'elle soit mergée". Contrast: "is it ready to merge" -> pr_readiness (status);
+  "how do I make it ready to merge" -> pr_fix_guidance (solution).
+- conflict_resolution_dry_run   : check/resolve LOCAL merge conflicts (not between PRs)
+- secret_scan                   : scan staged files for secrets/credentials/API keys
+- commit_lint                   : validate/lint the commit MESSAGE FORMAT against Conventional Commits
+  (NOT the same as commit_message — "is my commit message conventional/valid" is commit_lint,
+   "generate/write a commit message" is commit_message)
+- test_impact                   : which tests are impacted by the current changes
+- cross_pr_conflicts            : conflicts BETWEEN MULTIPLE open PRs (not a single branch's conflicts)
+- repo_overview                 : DESCRIBE the repository itself — "décris/describe my repo/dépôt/repository",
+  "c'est quoi mon repo", "présente le dépôt", "overview of the repo", general info about the project's GitHub
+  repository (name, description, default branch, visibility, language, open PRs). NOT the local working-copy
+  status (that's git_status), NOT a specific PR (that's pr_review/pr_readiness).
+"""
+
+
+def _call_git_decision_llm(message: str) -> Dict[str, Any] | None:
+    """Calls the LLM cascade for routing JSON. Returns None on any failure —
+    the caller falls back to the regex classifier."""
+    try:
+        from services.llm_factory import invoke_with_fallback
+        raw = invoke_with_fallback(
+            _GIT_DECISION_PROMPT.format(message=(message or "")[:500]),
+            label="git_decision", max_tokens=150,
+        )
+        if not raw:
+            return None
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw.strip())
+        return json.loads(raw)
+    except Exception as e:
+        logger.debug("Git decision LLM failed: %s", e)
+        return None
 
 
 class LCGitDecisionAgent:
     """
-    Lightweight decision agent for Smart Git.
+    Decision agent for Smart Git.
 
-    Current strategy:
-      - deterministic rules for speed and reliability
-      - safe mode by default for sensitive operations
-
-    Later improvement:
-      - add small LLM classifier fallback when confidence is low.
+    Primary path  : LLM call → structured JSON plan (understands free-text).
+    Fallback path : deterministic regex rules (v1, kept as safety net when
+                    the LLM is unavailable, returns an unknown intent, or
+                    returns confidence < 0.5).
     """
 
     def decide(
@@ -44,6 +151,42 @@ class LCGitDecisionAgent:
         msg = (message or "").lower()
         context = context or {}
 
+        llm_plan = _call_git_decision_llm(message)
+        if llm_plan and llm_plan.get("intent") in _VALID_INTENTS \
+                and float(llm_plan.get("confidence", 0.0)) >= 0.5:
+            intent = llm_plan["intent"]
+            plan: Dict[str, Any] = {
+                "intent": intent,
+                "confidence": float(llm_plan.get("confidence", 0.8)),
+                "selected_agents": _AGENTS_FOR_INTENT.get(intent, ["session_agent"]),
+                "safe_mode": True,
+                "needs_confirmation": intent == "conflict_resolution_dry_run",
+                "reason": llm_plan.get("reason", "LLM routing"),
+                "_routing": "llm",
+            }
+            # pr_number extraction stays with the proven regex (requires an
+            # explicit "pr"/"pull request" mention) — the LLM only classifies
+            # intent, avoiding false positives like "bug #123" -> pr_number=123.
+            pr_number = self._extract_pr_number(msg)
+            if pr_number:
+                plan["pr_number"] = pr_number
+            branch_name = (llm_plan.get("branch_name") or "").strip()
+            if branch_name:
+                plan["branch_name"] = branch_name
+            return plan
+
+        logger.debug("Git decision LLM skipped/low-confidence — using regex fallback")
+        plan = self._decide_regex(msg, context)
+        plan["_routing"] = "regex"
+        return plan
+
+    # ── Regex fallback (original v1 logic — kept verbatim as a safety net) ───
+
+    def _decide_regex(
+        self,
+        msg: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
         plan: Dict[str, Any] = {
             "intent": "git_status",
             "confidence": 0.5,
@@ -56,6 +199,20 @@ class LCGitDecisionAgent:
         pr_number = self._extract_pr_number(msg)
         if pr_number:
             plan["pr_number"] = pr_number
+
+        # ── Repo overview? (décris/describe mon repo/dépôt) ─────────────────
+        # Placé avant les règles génériques : "décris mon repo" ne doit pas tomber
+        # sur le git_status local par défaut.
+        if (self._has_any(msg, ["repo", "dépôt", "depot", "repository", "référentiel"])
+                and self._has_any(msg, ["décri", "decri", "describe", "présente", "presente",
+                                        "overview", "aperçu", "apercu", "c'est quoi", "info"])):
+            plan.update({
+                "intent": "repo_overview",
+                "confidence": 0.8,
+                "selected_agents": ["repo_agent"],
+                "reason": "developer asks for an overview/description of the repository",
+            })
+            return plan
 
         # ── Can commit? ─────────────────────────────────────────────────────
         if self._has_any(msg, ["commit", "commiter", "commit?"]) and self._has_any(
@@ -114,6 +271,34 @@ class LCGitDecisionAgent:
                     "confidence": 0.85,
                     "selected_agents": ["diff_agent"],
                     "reason": "developer asks for diff/change summary",
+                }
+            )
+            return plan
+
+        # ── F8: PR/branch fix guidance — AVANT readiness (solution vs statut) ─
+        # "c'est quoi la solution pour qu'elle soit mergée" / "how do I fix
+        # this" demande un PLAN D'ACTION, pas un statut déjà connu — testé
+        # avant les règles branch_readiness/pr_readiness par mot-clé "merge".
+        # Deux groupes (comme branch_readiness plus bas) car les phrases
+        # réelles ne collent jamais à une phrase figée ("la solution pour
+        # qu'elle soit mergée" ne contient pas "solution pour merger").
+        if self._has_any(
+            msg,
+            [
+                "solution", "comment corriger", "comment faire", "que faire",
+                "quoi faire", "comment merger", "comment la merger",
+                "comment le merger", "how to fix", "how do i fix",
+                "what should i do", "what's the fix", "rendre mergeable",
+            ],
+        ) and self._has_any(
+            msg, ["merger", "merge", "mergeable", "fusionner", "fusion"],
+        ):
+            plan.update(
+                {
+                    "intent": "pr_fix_guidance",
+                    "confidence": 0.85,
+                    "selected_agents": ["pr_agent"],
+                    "reason": "developer asks how to fix/make a PR mergeable",
                 }
             )
             return plan

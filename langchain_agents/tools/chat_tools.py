@@ -350,11 +350,22 @@ def tool_chat_project_summary(project_path: str) -> Dict[str, Any]:
     counts = {lang: 0 for lang in ["java", "python", "javascript", "typescript"]}
     examples = []
 
+    # Dossiers hors-projet : environnements virtuels, dépendances, caches, artefacts de build.
+    # Sans cette exclusion, .venv/site-packages gonflait le compte à des dizaines de milliers de fichiers.
+    _EXCLUDED_DIRS = {
+        ".venv", "venv", "env", ".env", "node_modules", "__pycache__", "site-packages",
+        ".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+        "dist", "build", "target", ".next", ".nuxt", "out", ".idea", ".vscode",
+    }
+
     if not root.exists():
         return {"project_path": str(root), "exists": False, "counts": counts, "examples": []}
 
     for p in root.rglob("*"):
         if not p.is_file():
+            continue
+        # Ignorer tout fichier dont le chemin traverse un dossier exclu.
+        if any(part in _EXCLUDED_DIRS for part in p.parts):
             continue
         lang = _detect_lang(str(p))
         if lang != "unknown":

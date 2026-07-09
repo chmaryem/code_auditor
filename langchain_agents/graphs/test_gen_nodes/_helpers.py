@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -434,8 +434,16 @@ def build_prompt(
     language: str,
     incremental: bool = False,
     existing_test_code: str = "",
+    retry_hint: Optional[str] = None,
 ) -> str:
-    """Construit un prompt LLM structuré et enrichi pour la génération de tests."""
+    """
+    Construit un prompt LLM structuré et enrichi pour la génération de tests.
+
+    retry_hint (Memory pillar, additif) : si un précédent retry a été enregistré
+    pour ce fichier (voir LCTestGenerationAgent.memory), la raison est injectée en
+    préventif pour éviter de redéclencher le même échec. None → comportement
+    strictement identique à avant l'introduction de la Memory.
+    """
 
     # Séparer les signatures par visibilité
     public_sigs = [s for s in signatures if s.get("visibility") in ("public", None)]
@@ -533,7 +541,16 @@ plutôt que JUnit 4 (@RunWith). Utilise les assertions de org.junit.jupiter.api.
         else "Génère un fichier de tests COMPLET et EXÉCUTABLE."
     )
 
+    retry_hint_block = ""
+    if retry_hint:
+        retry_hint_block = f"""
+## RAPPEL — échec précédent sur ce fichier :
+{retry_hint}
+Évite de reproduire cette même erreur.
+"""
+
     prompt = f"""Tu es un expert en tests unitaires. {mode_instruction}
+{retry_hint_block}
 
 Fichier source : {source_path.name}
 Langage : {language}
@@ -580,24 +597,12 @@ GÉNÈRE LE CODE {"DES NOUVELLES MÉTHODES DE TEST" if incremental else "DU FICH
 
 def call_llm(prompt: str, file_name: str = "") -> Optional[str]:
     """
-    Appelle le LLM directement via invoke_with_fallback().
-    N'utilise PAS analyze_code_with_rag() pour éviter le prompt d'audit.
+    Appelle le LLM via LCTestGenerationAgent (objet LangChain RunnableWithFallbacks,
+    cascade Groq → OpenRouter → Gemini) plutôt que le HTTP brut invoke_with_fallback().
+    Même contrat de retour : None sur échec (silencieux, logué côté agent).
     """
-    try:
-        from services.llm_factory import invoke_with_fallback
-        text = invoke_with_fallback(
-            prompt,
-            temperature=0.1,
-            max_tokens=8192,
-            label=f"test_gen:{file_name}",
-        )
-        if not text:
-            return None
-
-        return extract_code_from_response(text)
-    except Exception as e:
-        logger.error("LLM test generation erreur: %s", e)
-        return None
+    from langchain_agents.agents.lc_test_generation_agent import lc_test_generation_agent
+    return lc_test_generation_agent.generate(prompt, file_name)
 
 
 def extract_code_from_response(text: str) -> str:
@@ -795,8 +800,16 @@ def retry_with_error(
     failed_code: str,
     source_path: Path,
     original_prompt: str,
+    on_error_reason: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
-    """Retente la génération en incluant le message d'erreur."""
+    """
+    Retente la génération en incluant le message d'erreur.
+
+    on_error_reason (Memory pillar, additif) : callback optionnel appelé avec le
+    message d'erreur juste avant le retry LLM — permet à l'appelant de le
+    mémoriser (ex: LCTestGenerationAgent.remember_retry_reason). None → aucun
+    changement de comportement.
+    """
     language = detect_language(source_path)
 
     if language == "python":
@@ -850,6 +863,12 @@ def retry_with_error(
     else:
         return None
 
+    if on_error_reason:
+        try:
+            on_error_reason(error_msg)
+        except Exception:
+            pass
+
     retry_prompt = f"""{original_prompt}
 
 ## ATTENTION -- Le code precedent avait des erreurs :
@@ -872,12 +891,27 @@ def retry_with_runtime_error(
     source_path: Path,
     original_prompt: str,
     run_result,
+    on_error_reason: Optional[Callable[[str], None]] = None,
+    diagnosis_override: Optional[str] = None,
 ) -> Optional[str]:
     """
     Retente la génération LLM en incluant l'erreur d'exécution exacte.
     Utilisé quand le code passe la validation structurelle mais échoue à l'exécution.
+
+    on_error_reason (Memory pillar, additif) : callback optionnel appelé avec le
+    résumé d'erreur juste avant le retry LLM. None → aucun changement de comportement.
+
+    diagnosis_override (TestReviewAgent pillar, additif) : si fourni (diagnostic
+    de cause racine produit par TestReviewAgent.diagnose_failure), REMPLACE
+    run_result.error_summary UNIQUEMENT dans le texte envoyé au prompt de retry.
+    Ne change JAMAIS si le retry a lieu ni combien de fois (déjà décidé par
+    l'appelant). None → comportement strictement identique à avant (utilise
+    error_summary comme aujourd'hui). on_error_reason reçoit toujours le
+    error_summary BRUT, jamais le diagnostic enrichi (Memory conserve le
+    signal original, indépendant de ce raffinement).
     """
     error_summary = run_result.error_summary[:2000]
+    prompt_error_text = diagnosis_override[:2000] if diagnosis_override else error_summary
 
     # Conseil ciblé selon le type d'erreur
     hint = ""
@@ -888,12 +922,18 @@ def retry_with_runtime_error(
         hint = ("HINT: Une méthode ou attribut n'existe pas dans la classe. "
                 "N'invente pas de méthodes — utilise uniquement celles listées dans les signatures.")
 
+    if on_error_reason:
+        try:
+            on_error_reason(error_summary)
+        except Exception:
+            pass
+
     retry_prompt = f"""{original_prompt}
 
 ## ERREUR D'EXÉCUTION — Le test généré a échoué à l'exécution :
 
 ```
-{error_summary}
+{prompt_error_text}
 ```
 
 {hint}

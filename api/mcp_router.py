@@ -296,9 +296,8 @@ async def _call_explain_code(args: Dict[str, Any]) -> Any:
 async def _call_get_git_status(args: Dict[str, Any]) -> Any:
     project_path = args.get("project_path", ".")
 
-    from langchain_agents.agents.lc_git_session_agent import LCGitSessionAgent
-    agent = LCGitSessionAgent()
-    return agent.get_status(project_path)
+    from langchain_agents.tools.git_tools import tool_session_status
+    return tool_session_status.invoke({"project_path": project_path})
 
 
 async def _call_get_ci_status(args: Dict[str, Any]) -> Any:

@@ -1,384 +1,239 @@
 """
-smart_git_graph.py — LangGraph multi-agent Smart Git system.
+smart_git_graph.py — Smart Git multi-agent orchestration (LangGraph).
 
-Goal:
-  Turn the existing Smart Git modules into a clean multi-agent graph.
+Genuine multi-agent architecture for Smart Git, consistent with the platform's
+other graphs (ci_graph.py, cd_graph.py): a deterministic-then-conditional
+topology with a single convergence (join) node.
 
-Flow:
-  decide
-    → session
-    → diff
-    → branch
-    → pr
-    → conflict
-    → synthesize
+Topology (same shape as CIGraph/CDGraph):
 
-This graph is safe by default:
-  - no automatic merge
-  - no automatic push
-  - no automatic conflict write
+    entry → node_router            (RouterAgent — LLM classify → intent)
+    node_router → [route_by_intent]  (conditional edges)
+        → node_working_copy   (WorkingCopyAgent — local/pre-commit + branch)
+        → node_pr             (PRAgent — GitHub PR review/readiness/desc/cross)
+        → node_conflict       (ConflictAgent — conflict dry-run + subgraph)
+    {3 workers} → node_synthesize  (SynthesisAgent — JOIN → response) → END
+
+Four pillars, each on existing infra:
+  - Agents        : 5 LangChain agents (router, working_copy, pr, conflict, synthesis)
+  - Tools         : langchain_agents/tools/git_tools.py (each agent owns a subset)
+  - Memory        : AgentRedisMemory per agent + shared blackboard/session
+                    memory (smart_git/pr_context_cache.py)
+  - Orchestration : this StateGraph
+
+The conflict path composes an existing subgraph
+(smart_git/conflict_resolution_graph.py) for actual resolution — real graph
+composition, already live in production.
 """
-
 from __future__ import annotations
 
-import asyncio
-import time
-from pathlib import Path
+import json
+import logging
+import os
+import subprocess
+import urllib.request
 from typing import Any, Dict
 
 from langgraph.graph import END, StateGraph
 
-from langchain_agents.graphs.smart_git_state import SmartGitState
+from langchain_agents.graphs.state import SmartGitState
+
+logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Nodes
-# ══════════════════════════════════════════════════════════════════════════════
 
-def node_decide(state: SmartGitState) -> Dict[str, Any]:
+async def node_router(state: SmartGitState) -> Dict[str, Any]:
+    """RouterAgent: classify the developer's message (LLM + regex fallback)."""
     from langchain_agents.agents.lc_git_decision_agent import git_decision_agent
 
-    plan = git_decision_agent.decide(
-        state.get("user_message", ""),
-        {
-            "repo": state.get("repo", ""),
-            "owner": state.get("owner", ""),
-            "pr_number": state.get("pr_number", 0),
-            "branch": state.get("branch", ""),
-            "base": state.get("base", ""),
-        },
-    )
+    message = state.get("user_message", "") or ""
+    plan = git_decision_agent.decide(message, {
+        "repo": state.get("repo", ""), "owner": state.get("owner", ""),
+        "pr_number": state.get("pr_number", 0), "branch": state.get("branch", "HEAD"),
+        "base": state.get("base", "main"),
+    })
+    intent = plan.get("intent", "git_status")
+    resolved_pr = int(state.get("pr_number", 0) or 0) or int(plan.get("pr_number", 0) or 0)
 
     return {
-        "intent": plan.get("intent", "git_status"),
+        "intent": intent,
+        "pr_number": resolved_pr,
         "confidence": float(plan.get("confidence", 0.5)),
+        "branch_name": plan.get("branch_name", ""),
         "selected_agents": plan.get("selected_agents", []),
         "needs_confirmation": bool(plan.get("needs_confirmation", False)),
         "safe_mode": bool(plan.get("safe_mode", True)),
         "reason": plan.get("reason", ""),
-        "pr_number": state.get("pr_number") or plan.get("pr_number", 0),
     }
 
 
-def node_session(state: SmartGitState) -> Dict[str, Any]:
-    from langchain_agents.agents.lc_git_session_agent import git_session_agent
-
-    snapshot = git_session_agent.get_status(
-        state.get("project_path", ".")
-    )
-
-    return {
-        "session_snapshot": snapshot,
-    }
-
-
-def node_diff(state: SmartGitState) -> Dict[str, Any]:
-    from langchain_agents.agents.lc_git_diff_agent import git_diff_agent
-
-    intent = state.get("intent", "git_status")
-
-    if intent == "commit_message":
-        result = git_diff_agent.generate_commit_message(
-            state.get("project_path", ".")
-        )
-        return {
-            "commit_message": result.get("commit_message", ""),
-            "changes": result,
-        }
-
-    changes = git_diff_agent.get_changes(
-        state.get("project_path", ".")
-    )
-
-    return {
-        "changes": changes,
-    }
-
-
-def node_branch(state: SmartGitState) -> Dict[str, Any]:
-    from langchain_agents.agents.lc_git_branch_agent import git_branch_agent
-
-    report = git_branch_agent.analyze_branch(
-        project_path=state.get("project_path", "."),
-        branch=state.get("branch") or "HEAD",
-        base=state.get("base") or "main",
-    )
-
-    return {
-        "branch_report": report,
-    }
+async def node_working_copy(state: SmartGitState) -> Dict[str, Any]:
+    """WorkingCopyAgent: local/pre-commit checks + local branch readiness."""
+    from langchain_agents.agents.lc_git_working_copy_agent import working_copy_agent
+    return await working_copy_agent.run(dict(state))
 
 
 async def node_pr(state: SmartGitState) -> Dict[str, Any]:
+    """PRAgent: GitHub PR review / readiness / fix-guidance / description / cross-PR."""
     from langchain_agents.agents.lc_git_pr_agent import git_pr_agent
-
-    owner = state.get("owner", "")
-    repo = state.get("repo", "")
-    pr_number = int(state.get("pr_number", 0) or 0)
-
-    if not owner or not repo or not pr_number:
-        error = {
-            "success": False,
-            "error": "Missing owner/repo/pr_number",
-        }
-
-        if state.get("intent") == "pr_readiness":
-            return {"readiness_report": error}
-
-        return {"pr_report": error}
-
-    if state.get("intent") == "pr_readiness":
-        readiness = await git_pr_agent.readiness(owner, repo, pr_number)
-        return {
-            "readiness_report": readiness,
-        }
-
-    review = await git_pr_agent.review_pr(owner, repo, pr_number)
-    return {
-        "pr_report": review,
-    }
+    return await git_pr_agent.run(dict(state))
 
 
-def node_conflict(state: SmartGitState) -> Dict[str, Any]:
+async def node_conflict(state: SmartGitState) -> Dict[str, Any]:
+    """ConflictAgent: safe conflict dry-run scan (+ resolution subgraph capability)."""
     from langchain_agents.agents.lc_git_conflict_agent import git_conflict_agent
+    return await git_conflict_agent.run(dict(state))
 
-    report = git_conflict_agent.dry_run_resolution(
-        state.get("project_path", ".")
-    )
+
+def _github_token() -> str:
+    return os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+
+
+def _github_repo_overview(owner: str, repo: str, token: str) -> Dict[str, Any]:
+    """Aperçu essentiel du dépôt via l'API REST GitHub (1 à 2 appels, best-effort)."""
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept":        "application/vnd.github.v3+json",
+        "User-Agent":    "code-auditor/1.0",
+    }
+    url = f"https://api.github.com/repos/{owner}/{repo}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        d = json.loads(resp.read().decode())
+
+    # Nombre de PR ouvertes — appel léger, dégradé silencieusement en cas d'échec.
+    open_prs = None
+    try:
+        purl = f"https://api.github.com/repos/{owner}/{repo}/pulls?state=open&per_page=100"
+        preq = urllib.request.Request(purl, headers=headers)
+        with urllib.request.urlopen(preq, timeout=15) as presp:
+            open_prs = len(json.loads(presp.read().decode()))
+    except Exception as e:
+        logger.debug("open PR count failed: %s", e)
 
     return {
-        "conflict_report": report,
+        "success":        True,
+        "source":         "github",
+        "full_name":      d.get("full_name", f"{owner}/{repo}"),
+        "description":    d.get("description") or "",
+        "default_branch": d.get("default_branch", ""),
+        "visibility":     "privé" if d.get("private") else "public",
+        "language":       d.get("language") or "",
+        "open_prs":       open_prs,
+        "stars":          d.get("stargazers_count", 0),
+        "pushed_at":      d.get("pushed_at", ""),
+        "html_url":       d.get("html_url", ""),
     }
 
 
-def node_secret_scan(state: SmartGitState) -> Dict[str, Any]:
-    from langchain_agents.agents.lc_git_secret_agent import LCGitSecretAgent
-    return LCGitSecretAgent().run(dict(state))
+def _local_repo_overview(project_path: str) -> Dict[str, Any]:
+    """Repli local (aucun réseau) : branche, remote, commits, fichiers suivis."""
+    def _git(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", "-C", project_path, *args],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except Exception:
+            return ""
+
+    return {
+        "success":        True,
+        "source":         "local",
+        "full_name":      _git("rev-parse", "--show-toplevel").split("/")[-1] or project_path,
+        "default_branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "remote":         _git("remote", "get-url", "origin"),
+        "commits":        _git("rev-list", "--count", "HEAD"),
+        "last_commit":    _git("log", "-1", "--format=%s (%cr)"),
+    }
 
 
-def node_commit_lint(state: SmartGitState) -> Dict[str, Any]:
-    from langchain_agents.agents.lc_git_commit_linter_agent import LCGitCommitLinterAgent
-    return LCGitCommitLinterAgent().run(dict(state))
+def build_repo_overview(owner: str, repo: str, project_path: str) -> Dict[str, Any]:
+    """Hybride : aperçu GitHub si dépôt connecté + token dispo, sinon repli git local."""
+    token = _github_token()
+    if owner and repo and token:
+        try:
+            return _github_repo_overview(owner, repo, token)
+        except Exception as e:
+            logger.info("repo_overview GitHub échoué (%s) → repli local", e)
+    return _local_repo_overview(project_path)
 
 
-def node_test_impact(state: SmartGitState) -> Dict[str, Any]:
-    from langchain_agents.agents.lc_git_test_impact_agent import LCGitTestImpactAgent
-    return LCGitTestImpactAgent().run(dict(state))
-
-
-def node_cross_pr(state: SmartGitState) -> Dict[str, Any]:
-    from langchain_agents.agents.lc_git_cross_pr_agent import LCGitCrossPRAgent
-    return LCGitCrossPRAgent().run(dict(state))
-
-
-def node_pr_description(state: SmartGitState) -> Dict[str, Any]:
-    from langchain_agents.agents.lc_git_pr_description_agent import LCGitPRDescriptionAgent
-    return LCGitPRDescriptionAgent().run(dict(state))
+async def node_repo_overview(state: SmartGitState) -> Dict[str, Any]:
+    """RepoAgent: aperçu essentiel du dépôt (GitHub API si connecté, sinon git local)."""
+    import asyncio
+    overview = await asyncio.to_thread(
+        build_repo_overview,
+        state.get("owner", "") or "",
+        state.get("repo", "") or "",
+        state.get("project_path", ".") or ".",
+    )
+    return {"repo_overview_report": overview}
 
 
 def node_synthesize(state: SmartGitState) -> Dict[str, Any]:
+    """SynthesisAgent (JOIN): format whatever report is present into `response`."""
     from langchain_agents.agents.lc_git_synthesis_agent import git_synthesis_agent
-
-    response = git_synthesis_agent.synthesize(dict(state))
-
-    return {
-        "response": response,
-    }
+    return {"response": git_synthesis_agent.synthesize(dict(state))}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Routing
-# ══════════════════════════════════════════════════════════════════════════════
 
-def route_after_decision(state: SmartGitState) -> str:
+_WORKING_COPY_INTENTS = {
+    "git_status", "can_commit", "commit_message", "summarize_changes",
+    "commit_lint", "secret_scan", "test_impact", "branch_readiness",
+}
+_PR_INTENTS = {
+    "pr_review", "pr_readiness", "pr_fix_guidance", "pr_description",
+    "cross_pr_conflicts",
+}
+
+
+def route_by_intent(state: SmartGitState) -> str:
+    """Conditional router: intent → worker node (like CIGraph's route_after_classify)."""
     intent = state.get("intent", "git_status")
-
-    if intent == "can_commit":
-        return "session"
-
-    if intent == "git_status":
-        return "session"
-
-    if intent in ("summarize_changes", "commit_message"):
-        return "diff"
-
-    if intent == "branch_readiness":
-        return "branch"
-
-    if intent in ("pr_review", "pr_readiness"):
+    if intent == "repo_overview":
+        return "repo_overview"
+    if intent in _PR_INTENTS:
         return "pr"
-
     if intent == "conflict_resolution_dry_run":
         return "conflict"
-
-    if intent == "secret_scan":
-        return "secret_scan"
-
-    if intent == "commit_lint":
-        return "commit_lint"
-
-    if intent == "test_impact":
-        return "test_impact"
-
-    if intent == "cross_pr_conflicts":
-        return "cross_pr"
-
-    if intent == "pr_description":
-        return "pr_description"
-
-    return "session"
+    return "working_copy"  # all working-copy intents + safe default
 
 
-def route_after_session(state: SmartGitState) -> str:
-    """
-    can_commit needs:
-      - session risk
-      - current changes/staged files
-    """
-    if state.get("intent") == "can_commit":
-        return "diff"
 
-    return "synthesize"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Graph builder
-# ══════════════════════════════════════════════════════════════════════════════
 
 def build_smart_git_graph():
     graph = StateGraph(SmartGitState)
 
-    graph.add_node("decide", node_decide)
-    graph.add_node("session", node_session)
-    graph.add_node("diff", node_diff)
-    graph.add_node("branch", node_branch)
+    graph.add_node("router", node_router)
+    graph.add_node("working_copy", node_working_copy)
     graph.add_node("pr", node_pr)
     graph.add_node("conflict", node_conflict)
-    graph.add_node("secret_scan", node_secret_scan)
-    graph.add_node("commit_lint", node_commit_lint)
-    graph.add_node("test_impact", node_test_impact)
-    graph.add_node("cross_pr", node_cross_pr)
-    graph.add_node("pr_description", node_pr_description)
+    graph.add_node("repo_overview", node_repo_overview)
     graph.add_node("synthesize", node_synthesize)
 
-    graph.set_entry_point("decide")
-
+    graph.set_entry_point("router")
     graph.add_conditional_edges(
-        "decide",
-        route_after_decision,
-        {
-            "session":       "session",
-            "diff":          "diff",
-            "branch":        "branch",
-            "pr":            "pr",
-            "conflict":      "conflict",
-            "secret_scan":   "secret_scan",
-            "commit_lint":   "commit_lint",
-            "test_impact":   "test_impact",
-            "cross_pr":      "cross_pr",
-            "pr_description": "pr_description",
-        },
+        "router",
+        route_by_intent,
+        {"working_copy": "working_copy", "pr": "pr", "conflict": "conflict",
+         "repo_overview": "repo_overview"},
     )
 
-    graph.add_conditional_edges(
-        "session",
-        route_after_session,
-        {
-            "diff": "diff",
-            "synthesize": "synthesize",
-        },
-    )
-
-    graph.add_edge("diff", "synthesize")
-    graph.add_edge("branch", "synthesize")
-    graph.add_edge("pr", "synthesize")
-    graph.add_edge("conflict", "synthesize")
-    graph.add_edge("secret_scan", "synthesize")
-    graph.add_edge("commit_lint", "synthesize")
-    graph.add_edge("test_impact", "synthesize")
-    graph.add_edge("cross_pr", "synthesize")
-    graph.add_edge("pr_description", "synthesize")
-
+    # All workers converge on the single synthesis (join) node.
+    for worker in ("working_copy", "pr", "conflict", "repo_overview"):
+        graph.add_edge(worker, "synthesize")
     graph.add_edge("synthesize", END)
 
     return graph.compile()
 
 
-_smart_git_graph = None
+_SMART_GIT_GRAPH = None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Public API
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def ainvoke_smart_git(
-    message: str,
-    project_path: str = ".",
-    repo: str = "",
-    owner: str = "",
-    pr_number: int = 0,
-    branch: str = "HEAD",
-    base: str = "main",
-    session_id: str = "",
-) -> Dict[str, Any]:
-    """
-    Async entry point for:
-      - ChatAgent
-      - FastAPI
-      - Plugin backend
-    """
-    global _smart_git_graph
-
-    if _smart_git_graph is None:
-        _smart_git_graph = build_smart_git_graph()
-
-    initial: SmartGitState = {
-        "user_message": message,
-        "project_path": str(Path(project_path).resolve()),
-        "repo": repo,
-        "owner": owner,
-        "pr_number": pr_number,
-        "branch": branch,
-        "base": base,
-        "session_id": session_id,
-        "safe_mode": True,
-        "actions": [],
-        "warnings": [],
-        "errors": [],
-        "stats": {},
-    }
-
-    start = time.time()
-    result = await _smart_git_graph.ainvoke(initial)
-
-    result.setdefault("stats", {})
-    result["stats"]["elapsed"] = round(time.time() - start, 2)
-
-    return result
-
-
-def invoke_smart_git(
-    message: str,
-    project_path: str = ".",
-    repo: str = "",
-    owner: str = "",
-    pr_number: int = 0,
-    branch: str = "HEAD",
-    base: str = "main",
-    session_id: str = "",
-) -> Dict[str, Any]:
-    """
-    Sync entry point for CLI/tests.
-    """
-    return asyncio.run(
-        ainvoke_smart_git(
-            message=message,
-            project_path=project_path,
-            repo=repo,
-            owner=owner,
-            pr_number=pr_number,
-            branch=branch,
-            base=base,
-            session_id=session_id,
-        )
-    )
+def get_smart_git_graph():
+    """Compiled-graph singleton (same pattern as the other graphs)."""
+    global _SMART_GIT_GRAPH
+    if _SMART_GIT_GRAPH is None:
+        _SMART_GIT_GRAPH = build_smart_git_graph()
+    return _SMART_GIT_GRAPH
