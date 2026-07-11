@@ -17,8 +17,11 @@ Hybrid design:
 
 Flow:
   fetch_deployment → pre_deploy_risk_score → check_environment → monitor_health
-    → supervise → deploy_analysis → rollback → consolidate
+    → supervise → [deploy_analysis] → [rollback] → consolidate
     → post_deploy_report → index_result → notify → END
+  (conditional edges: only the specialists picked by the supervisor's route
+  are actually visited — a healthy deploy skips both and goes straight to
+  consolidate.)
 """
 from __future__ import annotations
 
@@ -83,8 +86,7 @@ def _cd_context(state: CDAgentState) -> Dict[str, Any]:
 
 
 def node_deploy_analysis(state: CDAgentState) -> CDAgentState:
-    if "deploy_analysis" not in state.get("route", []):
-        return state
+    """Only reached when the graph's conditional edge routed here."""
     from langchain_agents.agents.cd_agents import get_deploy_analysis_agent
     result = get_deploy_analysis_agent().run(
         task="Analyze this failed/unhealthy deployment. Give ROOT CAUSE + SUGGESTED FIX.",
@@ -105,8 +107,7 @@ def node_deploy_analysis(state: CDAgentState) -> CDAgentState:
 
 
 def node_rollback(state: CDAgentState) -> CDAgentState:
-    if "rollback" not in state.get("route", []):
-        return state
+    """Only reached when the graph's conditional edge routed here."""
     from langchain_agents.agents.cd_agents import get_rollback_agent
     result = get_rollback_agent().run(
         task="Decide whether to roll back this deployment and assess the risk.",
@@ -149,6 +150,23 @@ def node_consolidate_cd(state: CDAgentState) -> CDAgentState:
     return {**state, **updates}
 
 
+# ── Conditional routing ──────────────────────────────────────────────────────
+# Fixed specialist order (deploy_analysis → rollback) — only presence in
+# `route` decides whether a node is actually visited by the graph.
+
+def _route_after_supervise_cd(state: CDAgentState) -> str:
+    route = state.get("route", [])
+    if "deploy_analysis" in route:
+        return "deploy_analysis"
+    if "rollback" in route:
+        return "rollback"
+    return "consolidate"
+
+
+def _route_after_deploy_analysis(state: CDAgentState) -> str:
+    return "rollback" if "rollback" in state.get("route", []) else "consolidate"
+
+
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
 def build_cd_agent_graph():
@@ -171,9 +189,18 @@ def build_cd_agent_graph():
     g.add_edge("pre_deploy_risk_score", "check_environment")
     g.add_edge("check_environment",     "monitor_health")
     g.add_edge("monitor_health",        "supervise")
-    g.add_edge("supervise",             "deploy_analysis")
-    g.add_edge("deploy_analysis",       "rollback")
+
+    g.add_conditional_edges("supervise", _route_after_supervise_cd, {
+        "deploy_analysis": "deploy_analysis",
+        "rollback":        "rollback",
+        "consolidate":     "consolidate",
+    })
+    g.add_conditional_edges("deploy_analysis", _route_after_deploy_analysis, {
+        "rollback":    "rollback",
+        "consolidate": "consolidate",
+    })
     g.add_edge("rollback",              "consolidate")
+
     g.add_edge("consolidate",           "post_deploy_report")
     g.add_edge("post_deploy_report",    "index_result")
     g.add_edge("index_result",          "notify")

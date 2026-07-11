@@ -788,6 +788,7 @@ def node_memory_save(state: ChatState) -> Dict[str, Any]:
     response     = state.get("response", "")
     project_path = state.get("project_path", "")
     intent       = state.get("intent", "")
+    scope        = state.get("scope", "extension")
 
     metadata = {
         "intent":          intent,
@@ -811,7 +812,14 @@ def node_memory_save(state: ChatState) -> Dict[str, Any]:
     )
 
     # ── 2. PostgreSQL (source de vérité — thread daemon non-bloquant) ─────────
-    if user_id and session_id:
+    # Périmètre : SEUL le chat DASHBOARD est persisté dans la table `conversations`.
+    # Le chat de l'EXTENSION VS Code possède ses propres tables dédiées
+    # (extension_chat_sessions / extension_chat_messages, via /api/extension/chat/*)
+    # qu'il persiste lui-même côté frontend (ChatSidebarProvider._saveHistory).
+    # Sans ce garde-fou, chaque conversation de l'extension fuitait aussi dans
+    # `conversations` → /api/chat/sessions (qui lit cette table sans filtre de
+    # scope) affichait les chats de l'extension dans l'historique du dashboard.
+    if scope == "dashboard" and user_id and session_id:
         def _persist_to_pg() -> None:
             from services.persistent_chat_memory_service import persistent_chat_memory
             persistent_chat_memory.save_exchange_sync(

@@ -68,6 +68,9 @@ class TestGenState(TypedDict, total=False):
     generated_code:    str
     _pre_retry_code:   str   # original code kept if a structural retry fails
     _runtime_fix:      bool  # True if the runtime retry produced a fix
+    # ── Reflexion (Generator ↔ Critic) — additif, borné à MAX_RETRY_REFLEXION ──
+    _reflexion_issues:   Optional[List[str]]  # transitoire : issues du Critic à corriger
+    _pre_reflexion_code: Optional[str]        # code valide gardé si la v2 réflexive est invalide
 
     # ── ValidationAgent ────────────────────────────────────────────────────────
     validated:         bool
@@ -83,13 +86,14 @@ class TestGenState(TypedDict, total=False):
     # ── Retry counters (fidelity: structural max 1, runtime max 1) ─────────────
     retry_structural:  int
     retry_runtime:     int
+    retry_reflexion:   int   # additif : boucle Reflexion Generator↔Critic (max 1)
 
     # ── TestReviewAgent (additif, jamais lu par le routing) ─────────────────────
     review_notes: Dict[str, Any]   # {"semantic_review": {...}|None, "runtime_diagnosis": {...}|None}
 
     # ── Transient routing markers (set by a node, read by its conditional edge) ─
     _gen_route:   str   # "validate" | "execute" | "finalize" | "end"
-    _val_route:   str   # "generate" | "proceed"
+    _val_route:   str   # "generate" | "proceed" | "reflexion"
     _exec_route:  str   # "generate" | "finalize" | "end"
 
     # ── Output ─────────────────────────────────────────────────────────────────
@@ -101,3 +105,6 @@ class TestGenState(TypedDict, total=False):
 # runtime retry. Keep these at 1 to guarantee zero regression.
 MAX_RETRY_STRUCTURAL = 1
 MAX_RETRY_RUNTIME = 1
+# Reflexion (Generator↔Critic) — 1 passe max : coût borné (+1 génération +1 review)
+# et pas de boucle. Ne se déclenche que sur un verdict "concerns" du Critic.
+MAX_RETRY_REFLEXION = 1

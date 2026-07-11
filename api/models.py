@@ -129,6 +129,12 @@ class GenerateTestsRequest(BaseModel):
     )
 
 
+class TestCaseResultDTO(BaseModel):
+    name: str
+    status: str = "pass"          # pass | fail | skip
+    error: Optional[str] = None
+
+
 class GenerateTestsResponse(BaseModel):
     test_file: str = ""
     test_code: str = ""
@@ -150,6 +156,10 @@ class GenerateTestsResponse(BaseModel):
         None,
         description="Verdicts additifs de TestReviewAgent (semantic_review + runtime_diagnosis), informatifs uniquement",
     )
+    test_results: List[TestCaseResultDTO] = Field(
+        default_factory=list,
+        description="Résultat par test (pass/fail/skip). Vide si non exécuté ou langage non parsé.",
+    )
 
 
 # ── Run Tests (existing file, no LLM) ────────────────────────────────────────
@@ -166,6 +176,10 @@ class RunTestsResponse(BaseModel):
     run_error_summary: Optional[str] = None
     duration_seconds: float = 0.0
     error: str = ""
+    test_results: List[TestCaseResultDTO] = Field(
+        default_factory=list,
+        description="Résultat par test (pass/fail/skip). Vide si langage non parsé.",
+    )
 
 
 # ── WebSocket Events ─────────────────────────────────────────────────────────

@@ -219,6 +219,162 @@ def extract_dependency_classes(code: str, file_path: Path = None) -> List[tuple]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Résolution des classes importées du même projet (Python)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_FROM_IMPORT_RE = re.compile(r"^from\s+([.\w]+)\s+import\s+(.+)$")
+
+
+def resolve_imported_project_classes(
+    imports: List[str],
+    project_path: Path,
+    source_path: Path,
+) -> str:
+    """
+    Pour chaque `from X import A[, B...]` où X est un module du MÊME projet,
+    localise X.py et extrait via ast la signature de construction de A
+    (champs d'un @dataclass, sinon params de __init__) + ses méthodes publiques.
+
+    Retourne un bloc texte compact à injecter dans le prompt, ou "" si rien à
+    résoudre. But : éviter que le LLM invente des champs de constructeur
+    inexistants (ex. Task(description=...)) faute de connaître la vraie classe.
+
+    Fail-silent : tout import non résoluble (stdlib, tiers, fichier illisible,
+    parse KO, classe absente) est simplement ignoré, jamais d'exception.
+    """
+    # Python uniquement (les autres langages ont des conventions d'import
+    # différentes ; le resolver renvoie "" et le comportement reste inchangé).
+    if source_path.suffix.lower() != ".py":
+        return ""
+
+    try:
+        import ast
+    except Exception:
+        return ""
+
+    lines: List[str] = []
+    seen_classes: set = set()
+
+    for imp in imports:
+        m = _FROM_IMPORT_RE.match(imp.strip())
+        if not m:
+            continue
+        module, names_part = m.group(1), m.group(2)
+
+        module_file = _find_project_module(module, project_path)
+        if module_file is None:
+            continue  # stdlib / tiers / introuvable → ignoré
+
+        try:
+            tree = ast.parse(module_file.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+
+        # Noms importés (ignore les alias `as`, les `*`, garde les identifiants)
+        wanted = {
+            n.strip().split(" as ")[0].strip()
+            for n in names_part.replace("(", "").replace(")", "").split(",")
+            if n.strip() and n.strip() != "*"
+        }
+
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or node.name not in wanted:
+                continue
+            if node.name in seen_classes:
+                continue
+            seen_classes.add(node.name)
+            desc = _describe_class(node, ast)
+            if desc:
+                lines.append(f"  - {desc}")
+
+    return "\n".join(lines)
+
+
+def _find_project_module(module: str, project_path: Path) -> Optional[Path]:
+    """Localise le fichier .py d'un module importé, s'il appartient au projet."""
+    try:
+        rel = module.lstrip(".").replace(".", "/")
+        if not rel:
+            return None
+        candidate = project_path / f"{rel}.py"
+        if candidate.is_file():
+            return candidate
+        pkg_init = project_path / rel / "__init__.py"
+        if pkg_init.is_file():
+            return pkg_init
+        # Fallback : chercher <dernier_segment>.py ailleurs dans le projet
+        leaf = rel.rsplit("/", 1)[-1]
+        for found in project_path.rglob(f"{leaf}.py"):
+            if found.is_file():
+                return found
+    except Exception:
+        return None
+    return None
+
+
+def _describe_class(node, ast) -> str:
+    """Construit une description compacte 'Name(params) · méthodes: ...' via ast."""
+    try:
+        is_dataclass = any(
+            (isinstance(d, ast.Name) and d.id == "dataclass")
+            or (isinstance(d, ast.Attribute) and d.attr == "dataclass")
+            or (isinstance(d, ast.Call) and (
+                (isinstance(d.func, ast.Name) and d.func.id == "dataclass")
+                or (isinstance(d.func, ast.Attribute) and d.func.attr == "dataclass")))
+            for d in node.decorator_list
+        )
+
+        params: List[str] = []
+        methods: List[str] = []
+        init_node = None
+
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef):
+                if item.name == "__init__":
+                    init_node = item
+                elif not item.name.startswith("_"):
+                    methods.append(f"{item.name}()")
+            elif is_dataclass and isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                fname = item.target.id
+                if fname.startswith("_"):
+                    continue
+                ann = _ast_unparse(item.annotation, ast)
+                default = " = ..." if item.value is not None else ""
+                params.append(f"{fname}: {ann}{default}" if ann else f"{fname}{default}")
+
+        # Classe non-dataclass : prendre les params de __init__ (hors self)
+        if not params and init_node is not None:
+            args = init_node.args
+            defaults_count = len(args.defaults)
+            pos = args.args[1:]  # drop self
+            n_no_default = len(pos) - defaults_count
+            for i, a in enumerate(pos):
+                ann = _ast_unparse(a.annotation, ast) if a.annotation else ""
+                has_default = i >= n_no_default
+                default = " = ..." if has_default else ""
+                params.append(f"{a.arg}: {ann}{default}" if ann else f"{a.arg}{default}")
+
+        sig = f"{node.name}({', '.join(params)})"
+        if methods:
+            sig += f"  · méthodes: {', '.join(methods[:8])}"
+        return sig
+    except Exception:
+        return ""
+
+
+def _ast_unparse(node, ast) -> str:
+    """ast.unparse si dispo (3.9+), sinon best-effort sur les cas simples."""
+    if node is None:
+        return ""
+    try:
+        return ast.unparse(node)
+    except Exception:
+        if isinstance(node, ast.Name):
+            return node.id
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Mode incrémentiel
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -435,6 +591,7 @@ def build_prompt(
     incremental: bool = False,
     existing_test_code: str = "",
     retry_hint: Optional[str] = None,
+    imported_class_defs: str = "",
 ) -> str:
     """
     Construit un prompt LLM structuré et enrichi pour la génération de tests.
@@ -476,6 +633,17 @@ def build_prompt(
         deps_text = "\n## Dépendances à mocker :\n"
         for cls_name, usage in dep_classes[:8]:
             deps_text += f"  - {cls_name} (utilisé comme : {usage})\n"
+
+    # Définitions réelles des classes importées d'autres modules du projet.
+    # Évite que le LLM invente des champs/arguments de constructeur inexistants
+    # (ex. Task(description=...)) faute de connaître la vraie signature.
+    imported_defs_text = ""
+    if imported_class_defs:
+        imported_defs_text = (
+            "\n## Définitions EXACTES des classes importées du projet "
+            "(utilise ces signatures telles quelles — n'invente AUCUN champ/argument absent) :\n"
+            f"{imported_class_defs}\n"
+        )
 
     # Patterns de test RAG
     patterns_text = ""
@@ -562,7 +730,7 @@ Framework de test détecté : {framework}
 
 ## Signatures (avec visibilité) :
 {sig_text or "  (aucune signature détectée)"}
-{deps_text}
+{deps_text}{imported_defs_text}
 {private_warning}
 {kg_context}
 
@@ -583,12 +751,38 @@ Framework de test détecté : {framework}
 8. Le code DOIT être compilable/exécutable sans erreur.
 9. CHAQUE variable utilisée dans un test DOIT être déclarée DANS ce test. Ne référence JAMAIS une variable d'un autre test.
 10. Nomme les tests : test_<method>_<scenario> ou <method>_should<Behavior>.
-11. N'invente PAS de méthodes ou classes qui n'existent pas dans le code source.
+11. N'invente PAS de méthodes ou classes qui n'existent pas dans le code source, ni de champ/argument de constructeur absent des définitions des classes importées ci-dessus.
 12. Inclus tous les imports nécessaires (framework + mocks + classes du source).
 
 GÉNÈRE LE CODE {"DES NOUVELLES MÉTHODES DE TEST" if incremental else "DU FICHIER DE TEST"} MAINTENANT :"""
 
     return prompt
+
+
+def build_reflexion_prompt(base_prompt: str, previous_code: str, issues: List[str]) -> str:
+    """
+    Prompt de régénération réflexive (pattern Reflexion Generator↔Critic).
+
+    Reprend le prompt de génération de base, y ajoute les problèmes de qualité
+    relevés par le Critic (TestReviewAgent.review) et la version précédente à
+    corriger. C'est le Generator qui refait le travail — le Critic ne fait que
+    fournir le feedback.
+    """
+    issues_text = "\n".join(f"- {i}" for i in (issues or [])[:8]) or "- (aucun détail)"
+    return f"""{base_prompt}
+
+## RÉVISION QUALITÉ (Reflexion) — un agent critique a relevé ces problèmes sur ta version précédente :
+{issues_text}
+
+Version précédente (à améliorer, pas à répéter telle quelle) :
+```
+{previous_code[:3000]}
+```
+
+Régénère le fichier de test COMPLET et EXÉCUTABLE en corrigeant ces problèmes :
+garde les tests corrects, remplace/renforce ceux qui sont critiqués (assertions
+tautologiques, mock de la mauvaise dépendance, assertions manquantes…). Même
+format qu'avant (code seul, sans explication)."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

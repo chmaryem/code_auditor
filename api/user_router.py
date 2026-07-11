@@ -295,6 +295,23 @@ async def get_github_status(
     return GithubStatusResponse(connected=bool(token))
 
 
+@user_router.post("/user/github-disconnect", response_model=GithubStatusResponse)
+async def github_disconnect(
+    principal: Principal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Clear the user's stored GitHub OAuth token (local disconnect only).
+
+    Does NOT revoke the OAuth grant on GitHub's side — the app stays
+    authorized there, so reconnecting via /auth/github/start does not
+    require re-approving scopes. active_repo is left untouched.
+    """
+    async with db.begin():
+        await UserRepo(db).set_github_token_by_email(principal.email, None)
+    return GithubStatusResponse(connected=False)
+
+
 @user_router.get("/user/github-repos", response_model=List[GithubRepoItem])
 async def list_github_repos(
     q: str = "",

@@ -25,8 +25,10 @@ from typing import Any, Dict
 
 from langchain_agents.graphs.test_gen_nodes._helpers import (
     build_prompt,
+    build_reflexion_prompt,
     call_llm,
     merge_incremental,
+    resolve_imported_project_classes,
     retry_with_error,
     retry_with_runtime_error,
 )
@@ -44,6 +46,10 @@ def node_generation(state: Dict[str, Any]) -> Dict[str, Any]:
     # ── STRUCTURAL retry mode ──────────────────────────────────────────────────
     if state.get("validation_error"):
         return _generate_structural_retry(state)
+
+    # ── REFLEXION mode (Critic → Generator, pattern Reflexion) ─────────────────
+    if state.get("_reflexion_issues"):
+        return _generate_reflexion_retry(state)
 
     # ── INITIAL generation ─────────────────────────────────────────────────────
     return _generate_initial(state)
@@ -76,6 +82,17 @@ def _generate_initial(state: Dict[str, Any]) -> Dict[str, Any]:
     from langchain_agents.agents.lc_test_generation_agent import lc_test_generation_agent
     retry_hint = lc_test_generation_agent.recall_retry_reason(str(source_path))
 
+    # Résolution des classes importées d'autres modules du projet : injecte leur
+    # vraie signature de constructeur pour que le LLM n'invente pas de champs
+    # inexistants (ex. Task(description=...)). Fail-silent → "" si rien à résoudre.
+    imported_defs = ""
+    try:
+        imported_defs = resolve_imported_project_classes(
+            imports, state["project_path"], source_path,
+        )
+    except Exception as e:
+        logger.debug("resolve_imported_project_classes erreur (fail-silent) : %s", e)
+
     # 8. Prompt LLM enrichi
     prompt = build_prompt(
         source_path=source_path,
@@ -89,6 +106,7 @@ def _generate_initial(state: Dict[str, Any]) -> Dict[str, Any]:
         incremental=is_incremental,
         existing_test_code=existing_test_code,
         retry_hint=retry_hint,
+        imported_class_defs=imported_defs,
     )
 
     # 9. Génération LLM directe
@@ -134,6 +152,37 @@ def _generate_structural_retry(state: Dict[str, Any]) -> Dict[str, Any]:
     if test_code_v2:
         updates["generated_code"] = test_code_v2
     # else: keep the previous (original) generated_code unchanged
+    return updates
+
+
+def _generate_reflexion_retry(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Mode REFLEXION (pattern Generator↔Critic) : le Critic a jugé le test valide
+    mais faible (verdict "concerns"). Le Generator régénère UNE fois en tenant
+    compte des `issues` du Critic, puis ValidationAgent réévalue.
+
+    Sécurité : on garde `_pre_reflexion_code` (la version VALIDE courante). Si la
+    v2 réflexive s'avère invalide, validation_node la restaure — la reflexion ne
+    dégrade jamais un test déjà valide.
+    """
+    source_path = state["source_path"]
+    base_prompt = state["prompt"]
+    previous_code = state["generated_code"]
+    issues = state.get("_reflexion_issues") or []
+
+    logger.info("Reflexion : Critic a relevé %d point(s), régénération...", len(issues))
+    reflexion_prompt = build_reflexion_prompt(base_prompt, previous_code, issues)
+    v2 = call_llm(reflexion_prompt, source_path.name)   # c'est le Generator qui refait le travail
+
+    updates: Dict[str, Any] = {
+        "_pre_reflexion_code": previous_code,   # version valide gardée pour restore
+        "_reflexion_issues":   None,            # consommé (évite de reboucler)
+        "validation_error":    None,            # laisse ValidationAgent réévaluer
+        "_gen_route":          "validate",
+    }
+    if v2:
+        updates["generated_code"] = v2
+    # else: garde le code valide courant (rien ne change → revalidé comme valide)
     return updates
 
 

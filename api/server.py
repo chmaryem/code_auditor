@@ -306,6 +306,16 @@ def _get_project_services(project_path: Path) -> Dict[str, Any]:
     svc["rag_system"] = _watch_services.get("rag_system")
     svc["test_kb"]    = _watch_services.get("test_kb")
 
+    # CacheService écrit le cache `ca:fc:` que le hook pre-commit LIT pour
+    # décider si un fichier est "stale". Sans elle, l'analyse déclenchée par
+    # l'extension (via /analyze/file → invoke_watch) ne peuple jamais ce cache,
+    # et le hook bloque tout commit ("fichier sans analyse Watch récente").
+    try:
+        from services.cache_service import CacheService
+        svc["cache"] = CacheService()
+    except Exception as e:
+        logger.warning("CacheService init failed for %s: %s", key, e)
+
     with _project_services_lock:
         _project_services_cache[key] = svc
 
@@ -439,6 +449,7 @@ async def analyze_file(req: AnalyzeFileRequest):
             extractor=_svc.get("extractor"),
             rag_system=_svc.get("rag_system"),
             dep_graph=_svc.get("dep_graph"),
+            cache=_svc.get("cache"),
         )
     except Exception as e:
         logger.exception("analyze_file error: %s", e)
@@ -853,6 +864,7 @@ async def generate_tests(req: GenerateTestsRequest):
         run_error_summary = result.get("run_error_summary")
         cached = result.get("cached")
         review_notes = result.get("review_notes")
+        test_results = result.get("test_results")
 
         return GenerateTestsResponse(
             test_file=str(test_file or ""),
@@ -866,6 +878,7 @@ async def generate_tests(req: GenerateTestsRequest):
             run_error_summary=str(run_error_summary) if run_error_summary else None,
             cached=bool(cached or False),
             review_notes=review_notes if isinstance(review_notes, dict) else None,
+            test_results=test_results if isinstance(test_results, list) else [],
         )
 
     except HTTPException:
@@ -904,6 +917,7 @@ async def run_tests(req: RunTestsRequest):
             run_error_summary=result.error_summary or None,
             duration_seconds=round(result.duration_seconds, 2),
             error="",
+            test_results=result.test_results or [],
         )
 
     except HTTPException:
@@ -943,6 +957,7 @@ async def kb_reject(req: KBRuleAction):
 @app.get("/api/kb/pending", dependencies=[Depends(get_current_user)])
 async def kb_list_pending():
     """List all KB rules staged for human approval (pending/ directories)."""
+    from config import config
     rules = []
     kb_root = config.KNOWLEDGE_BASE_DIR
     if not kb_root.exists():

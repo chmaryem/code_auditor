@@ -29,8 +29,6 @@ logger = logging.getLogger(__name__)
 CI_SPECIALISTS = ("diagnostic", "security_triage", "remediation")
 
 
-# ── Specialist agents ─────────────────────────────────────────────────────────
-
 def _ci_tools():
     """Imported lazily so importing this module never eagerly pulls heavy deps."""
     from langchain_agents.tools.ci_tools import (

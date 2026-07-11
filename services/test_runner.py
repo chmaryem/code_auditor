@@ -20,13 +20,14 @@ Sécurité :
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,10 @@ class TestRunResult:
     duration_seconds: float = 0.0
     error_summary: str = ""         # Message d'erreur condensé pour le retry LLM
     failing_tests: List[str] = field(default_factory=list)
+    # Résultat par test : [{"name": str, "status": "pass"|"fail"|"skip", "error": str|None}, ...]
+    # Alimenté pour Python (pytest -v) ; vide pour les langages non encore parsés → le
+    # consommateur retombe sur le booléen success (comportement historique).
+    test_results: List[Dict[str, Any]] = field(default_factory=list)
     language: str = ""
 
     @property
@@ -108,6 +113,8 @@ class TestRunner:
 
         result.duration_seconds = round(time.time() - start, 2)
         result.language = language
+        if language == "python":
+            result.test_results = self._parse_pytest_results(result.stdout)
         result.error_summary = self._build_error_summary(result)
 
         logger.info(
@@ -121,17 +128,71 @@ class TestRunner:
     # ── Python (pytest) ──────────────────────────────────────────────────────
 
     def _run_pytest(self, test_file: Path) -> TestRunResult:
-        """Exécute pytest avec --tb=short -x sur le fichier de test."""
+        """Exécute pytest en mode verbeux (tous les tests, résultat par test)."""
         python_exe = self._find_python()
         cmd = [
             python_exe, "-m", "pytest",
             str(test_file),
+            "-v",            # une ligne PASSED/FAILED par test → parsable
             "--tb=short",    # traceback court — assez pour le LLM
-            "-x",            # stop au premier échec
             "--no-header",
-            "-q",            # sortie condensée
+            # NB : pas de -x — on exécute TOUS les tests pour un rapport complet
+            # par test (sinon les tests après le 1er échec ne tournent jamais).
         ]
         return self._subprocess(cmd)
+
+    # ── Parsing du résultat par test (pytest -v) ─────────────────────────────
+
+    _PYTEST_LINE_RE = re.compile(
+        r"^(?P<file>.+?)::(?P<name>[\w\[\]\-.]+)\s+"
+        r"(?P<status>PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\b"
+    )
+    _PYTEST_SUMMARY_RE = re.compile(
+        r"^(?:FAILED|ERROR)\s+.+?::(?P<name>[\w\[\]\-.]+)\s*-\s*(?P<msg>.+)$"
+    )
+
+    def _parse_pytest_results(self, stdout: str) -> List[Dict[str, Any]]:
+        """
+        Extrait le statut par test depuis la sortie `pytest -v`.
+        Retourne [] si rien n'est parsable (ex. erreur de collection) → le
+        consommateur retombe alors sur le booléen success (comportement legacy).
+        """
+        if not stdout:
+            return []
+
+        status_map = {
+            "PASSED": "pass", "XPASS": "pass",
+            "FAILED": "fail", "ERROR": "fail", "XFAIL": "fail",
+            "SKIPPED": "skip",
+        }
+
+        results: List[Dict[str, Any]] = []
+        seen: set = set()
+        for line in stdout.splitlines():
+            m = self._PYTEST_LINE_RE.match(line.strip())
+            if not m:
+                continue
+            name = m.group("name")
+            if name in seen:
+                continue
+            seen.add(name)
+            results.append({
+                "name": name,
+                "status": status_map.get(m.group("status"), "fail"),
+                "error": None,
+            })
+
+        # Enrichir le message d'échec par test depuis le "short test summary info"
+        errors_by_name: Dict[str, str] = {}
+        for line in stdout.splitlines():
+            sm = self._PYTEST_SUMMARY_RE.match(line.strip())
+            if sm:
+                errors_by_name.setdefault(sm.group("name"), sm.group("msg").strip())
+        for r in results:
+            if r["status"] == "fail" and r["name"] in errors_by_name:
+                r["error"] = errors_by_name[r["name"]]
+
+        return results
 
     def _find_python(self) -> str:
         """Cherche le python du venv du projet, sinon sys.executable."""

@@ -43,8 +43,17 @@ KEY_PREFIX = "ca:"
 # ── Utility ──────────────────────────────────────────────────────────────────
 
 def key_hash(value: str) -> str:
-    """Hash SHA-256 tronqué (16 hex chars) pour clés Redis sûres."""
-    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+    """Hash SHA-256 tronqué (16 hex chars) pour clés Redis sûres.
+
+    Passe par os.path.normcase() avant hashage : sur Windows, les chemins de
+    fichiers arrivent avec une casse de lettre de lecteur incohérente selon
+    la source (ex. VS Code fsPath → "c:\\...", Python Path.resolve() → "C:\\...").
+    Sans normalisation, le même fichier produit deux clés Redis différentes
+    selon qui écrit/lit le cache (extension vs hook), rendant le cache
+    perpétuellement "stale". normcase() est un no-op sur POSIX (casse
+    préservée), donc ce changement est sans risque hors Windows.
+    """
+    return hashlib.sha256(os.path.normcase(value).encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 # ── Event Loop dédié ─────────────────────────────────────────────────────────

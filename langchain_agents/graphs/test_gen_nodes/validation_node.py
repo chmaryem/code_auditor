@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from langchain_agents.graphs.test_gen_state import MAX_RETRY_STRUCTURAL
+from langchain_agents.graphs.test_gen_state import MAX_RETRY_STRUCTURAL, MAX_RETRY_REFLEXION
 from langchain_agents.graphs.test_gen_nodes._helpers import validate_generated_test
 
 logger = logging.getLogger(__name__)
@@ -51,9 +51,43 @@ def node_validation(state: Dict[str, Any]) -> Dict[str, Any]:
     review_notes.setdefault("runtime_diagnosis", None)
 
     if validated:
+        # ── Reflexion (Generator ↔ Critic) ─────────────────────────────────────
+        # Le code passe la validation MÉCANIQUE, mais le Critic le juge faible
+        # (verdict "concerns"). Il déclenche UNE régénération réflexive, bornée.
+        # C'est ici que le verdict du Critic influence enfin le Generator — la
+        # coordination inter-agents qui fait de ce module un vrai MAS.
+        semantic = review_notes.get("semantic_review")
+        concerns = bool(
+            semantic
+            and semantic.get("verdict") == "concerns"
+            and semantic.get("issues")
+        )
+        if concerns and state.get("retry_reflexion", 0) < MAX_RETRY_REFLEXION:
+            return {
+                "validated": True,               # la vérité mécanique ne change pas
+                "validation_error": None,
+                "_val_route": "reflexion",
+                "review_notes": review_notes,
+                "_reflexion_issues": list(semantic["issues"]),
+                "retry_reflexion": state.get("retry_reflexion", 0) + 1,
+            }
         return {
             "validated": True, "validation_error": None, "_val_route": "proceed",
             "review_notes": review_notes,
+        }
+
+    # ── Invalide ────────────────────────────────────────────────────────────────
+    # Sécurité Reflexion : si une v2 réflexive est invalide, restaurer la version
+    # VALIDE d'avant la reflexion (la reflexion ne dégrade jamais un test valide).
+    pre_reflexion = state.get("_pre_reflexion_code")
+    if pre_reflexion is not None:
+        return {
+            "validated": True,
+            "validation_error": None,
+            "_val_route": "proceed",
+            "review_notes": review_notes,
+            "generated_code": pre_reflexion,
+            "_pre_reflexion_code": None,
         }
 
     # Invalid — one structural retry allowed

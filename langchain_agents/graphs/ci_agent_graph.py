@@ -13,8 +13,11 @@ Hybrid design:
     run.
 
 Flow:
-  fetch_run → classify_failure → supervise
-    → diagnostic → security_triage → remediation   (each no-ops if not routed)
+  fetch_run → classify_failure → retry_check → supervise
+    → [diagnostic] → [security_triage] → [remediation]   (conditional edges:
+      only the specialists picked by the supervisor's route are actually
+      visited, in that fixed order — the others are skipped by the graph
+      itself, not called-and-ignored)
     → consolidate → post_pr_comment → index_result → notify → END
 """
 from __future__ import annotations
@@ -26,10 +29,13 @@ from typing import Any, Dict, List
 from langgraph.graph import StateGraph, END
 
 from langchain_agents.graphs.state import CIState
-# Reuse the deterministic nodes unchanged — prefetch + side-effects.
+# Reuse the deterministic nodes unchanged — prefetch + side-effects. Includes
+# retry_check (T6, flaky-test auto-rerun) which must stay in this graph too:
+# it was dropped from the first cut of this file and is restored here.
 from langchain_agents.graphs.ci_graph import (
     node_fetch_run,
     node_classify_failure,
+    node_retry_check,
     node_post_pr_comment,
     node_index_result,
     node_notify,
@@ -87,8 +93,8 @@ def _agent_context(state: CIAgentState) -> Dict[str, Any]:
 
 
 def node_diagnostic(state: CIAgentState) -> CIAgentState:
-    if "diagnostic" not in state.get("route", []):
-        return state
+    """Only reached when the graph's conditional edge routed here — no no-op
+    guard needed, unlike the earlier soft-routing design."""
     from langchain_agents.agents.ci_agents import get_diagnostic_agent
     result = get_diagnostic_agent().run(
         task="Diagnose this pipeline failure and give ROOT CAUSE + SUGGESTED FIX.",
@@ -103,8 +109,6 @@ def node_diagnostic(state: CIAgentState) -> CIAgentState:
 
 
 def node_security_triage(state: CIAgentState) -> CIAgentState:
-    if "security_triage" not in state.get("route", []):
-        return state
     from langchain_agents.agents.ci_agents import get_security_triage_agent
     result = get_security_triage_agent().run(
         task="Triage the security findings for this run and give a SECURITY VERDICT.",
@@ -118,8 +122,6 @@ def node_security_triage(state: CIAgentState) -> CIAgentState:
 
 
 def node_remediation(state: CIAgentState) -> CIAgentState:
-    if "remediation" not in state.get("route", []):
-        return state
     from langchain_agents.agents.ci_agents import get_remediation_agent
     ctx = _agent_context(state)
     ctx["diagnosis"] = state.get("diagnostic_output", "")[:1500]
@@ -238,6 +240,34 @@ def _parse_root_cause_fix(text: str) -> tuple[str, str]:
     return rc, fix
 
 
+# ── Conditional routing ──────────────────────────────────────────────────────
+# The specialist sequence stays fixed (diagnostic → security_triage →
+# remediation) regardless of the order the supervisor's `route` list lists
+# them in — only presence/absence in `route` decides whether a node is
+# actually visited. This makes the routing real (LangGraph skips the node
+# entirely) instead of the earlier "visit every node, no-op if not routed".
+
+def _route_after_supervise(state: CIAgentState) -> str:
+    route = state.get("route", [])
+    for step in ("diagnostic", "security_triage", "remediation"):
+        if step in route:
+            return step
+    return "consolidate"
+
+
+def _route_after_diagnostic(state: CIAgentState) -> str:
+    route = state.get("route", [])
+    if "security_triage" in route:
+        return "security_triage"
+    if "remediation" in route:
+        return "remediation"
+    return "consolidate"
+
+
+def _route_after_security(state: CIAgentState) -> str:
+    return "remediation" if "remediation" in state.get("route", []) else "consolidate"
+
+
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
 def build_ci_agent_graph():
@@ -245,6 +275,7 @@ def build_ci_agent_graph():
 
     g.add_node("fetch_run",        node_fetch_run)
     g.add_node("classify_failure", node_classify_failure)
+    g.add_node("retry_check",      node_retry_check)
     g.add_node("supervise",        node_supervise)
     g.add_node("diagnostic",       node_diagnostic)
     g.add_node("security_triage",  node_security_triage)
@@ -256,11 +287,26 @@ def build_ci_agent_graph():
 
     g.set_entry_point("fetch_run")
     g.add_edge("fetch_run",        "classify_failure")
-    g.add_edge("classify_failure", "supervise")
-    g.add_edge("supervise",        "diagnostic")
-    g.add_edge("diagnostic",       "security_triage")
-    g.add_edge("security_triage",  "remediation")
+    g.add_edge("classify_failure", "retry_check")
+    g.add_edge("retry_check",      "supervise")
+
+    g.add_conditional_edges("supervise", _route_after_supervise, {
+        "diagnostic":      "diagnostic",
+        "security_triage": "security_triage",
+        "remediation":     "remediation",
+        "consolidate":     "consolidate",
+    })
+    g.add_conditional_edges("diagnostic", _route_after_diagnostic, {
+        "security_triage": "security_triage",
+        "remediation":     "remediation",
+        "consolidate":     "consolidate",
+    })
+    g.add_conditional_edges("security_triage", _route_after_security, {
+        "remediation": "remediation",
+        "consolidate": "consolidate",
+    })
     g.add_edge("remediation",      "consolidate")
+
     g.add_edge("consolidate",      "post_pr_comment")
     g.add_edge("post_pr_comment",  "index_result")
     g.add_edge("index_result",     "notify")

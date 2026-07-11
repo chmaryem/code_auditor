@@ -249,6 +249,25 @@ def node_emit_test_gap_only(state: WatchState) -> Dict[str, Any]:
     """
     import uuid
 
+    # ── Backfill du cache lu par le hook pre-commit (ca:fc:) ──────────────────
+    # Ce chemin (changement mineur / contenu inchangé) ne passe PAS par
+    # node_cache_results, donc le cache `ca:fc:` n'est jamais écrit ici. Or le
+    # hook exige une analyse fraîche par fichier stagé : sans ce backfill, un
+    # fichier propre et inchangé reste éternellement "stale" et bloque le commit.
+    # On ré-écrit donc l'entrée `ca:fc:` depuis l'analyse déjà en cache (ca:mem)
+    # avec le content_hash courant, pour que le hook la considère à jour.
+    cache = state.get("_cache")
+    if cache and state.get("content_hash"):
+        try:
+            from langchain_agents.agents.lc_analysis_agent import lc_analysis_agent
+            cached = lc_analysis_agent.get_cached_analysis(
+                state["file_path"], state["content_hash"]
+            )
+            if cached:
+                cache.update_file_cache(Path(state["file_path"]), cached)
+        except Exception as exc:
+            logger.warning("[cache] skip-path ca:fc backfill failed: %s", exc)
+
     test_gap = state.get("test_gap")
     if not test_gap:
         return {"ws_events": [], "ws_broadcasted": False}

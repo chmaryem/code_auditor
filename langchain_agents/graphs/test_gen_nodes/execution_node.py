@@ -109,6 +109,7 @@ def node_finalize(state: Dict[str, Any]) -> Dict[str, Any]:
         "incremental":        state.get("is_incremental", False),
         "run_success":        run_result.success if run_result else None,
         "run_error_summary":  run_result.error_summary if run_result and not run_result.success else None,
+        "test_results":       run_result.test_results if run_result else [],
         "review_notes":       _normalize_review_notes(state.get("review_notes")),
         "rag_curation_notes": state.get("rag_curation_notes"),
     }

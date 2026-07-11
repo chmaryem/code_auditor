@@ -86,7 +86,9 @@ def route_after_generation(state: TestGenState) -> Literal["validation", "execut
 
 
 def route_after_validation(state: TestGenState) -> Literal["generation", "execution", "finalize"]:
-    if state.get("_val_route") == "generate":
+    # "reflexion" (Critic → Generator) réutilise le même nœud generation que le
+    # retry structurel — pas de nouvelle branche de graphe.
+    if state.get("_val_route") in ("generate", "reflexion"):
         return "generation"
     # proceed: original wrote + executed only when write=True
     if state.get("write"):
