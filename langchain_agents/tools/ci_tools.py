@@ -94,6 +94,40 @@ def tool_sonar_get_issues(
 
 # ── B. GitHub Actions Tools ───────────────────────────────────────────────────
 
+# Strong error markers, in priority order. Used to slice the log window around
+# the ACTUAL failure instead of the setup preamble (checkout / node-deprecation
+# noise) that would otherwise fill a naive `logs[:N]` truncation.
+_ERROR_MARKERS = (
+    "compilation error", "cannot find symbol", "build failure",
+    "[error]", "error:", "error :", "no source code",
+    "process completed with exit code", "exit code 1",
+    "quality gate has failed", "failures:", "traceback", "exception:",
+)
+
+
+def _extract_error_window(text: str, max_chars: int = 4000) -> str:
+    """Return the slice of a log most likely to contain the real error.
+
+    Finds the first strong error marker and returns a window around it (a little
+    context before, the error details after). Falls back to the log TAIL when no
+    marker is found — errors are far more often at the end than the start, so
+    this is still better than a head truncation for a failing job.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+    low = text.lower()
+    pos = -1
+    for m in _ERROR_MARKERS:
+        i = low.find(m)
+        if i != -1:
+            pos = i
+            break
+    if pos == -1:
+        return text[-max_chars:]
+    start = max(0, pos - 800)
+    return text[start:start + max_chars]
+
+
 @tool
 def tool_fetch_run_logs(owner: str, repo: str, run_id: str) -> Dict[str, Any]:
     """
@@ -117,27 +151,36 @@ def tool_fetch_run_logs(owner: str, repo: str, run_id: str) -> Dict[str, Any]:
             "build failure", "compilation error", "assert",
             "tests run:", "failures:", "quality gate has failed",
         )
-        logs_parts = []
+        all_parts = []       # (name, content) — every step file
+        failing_parts = []   # (name, content) — step files containing an error
         stage_failed = ""
-        # Trier pour avoir les fichiers du job le plus récent en premier
-        names = sorted(zf.namelist())
-        for name in names:
+        total_chars = 0
+        for name in sorted(zf.namelist()):
             try:
                 content = zf.open(name).read().decode("utf-8", errors="replace")
-                logs_parts.append(f"=== {name} ===\n{content}")
+            except Exception:
+                continue
+            all_parts.append((name, content))
+            total_chars += len(content)
+            content_lower = content.lower()
+            if any(k in content_lower for k in _FAIL_KEYWORDS):
+                failing_parts.append((name, content))
                 # Détecter le job en échec (format: "job-name/N_step-name.txt")
                 if not stage_failed and "/" in name:
-                    job_name = name.split("/")[0]
-                    content_lower = content.lower()
-                    if any(k in content_lower for k in _FAIL_KEYWORDS):
-                        stage_failed = job_name
-            except Exception:
-                pass
-        logs_text = "\n".join(logs_parts)
+                    stage_failed = name.split("/")[0]
+
+        # Prioritise the FAILING steps and hand the agent their error window, so
+        # it sees the real error (compilation, exit code…) instead of the
+        # alphabetically-first setup files (checkout / node-deprecation noise).
+        chosen = failing_parts or all_parts[-3:]  # fall back to the last steps
+        blocks = [
+            f"=== {name} ===\n{_extract_error_window(content, 3500)}"
+            for name, content in chosen
+        ]
         return {
-            "logs": logs_text[:10000],
+            "logs": "\n\n".join(blocks)[:10000],
             "stage_failed": stage_failed,
-            "total_chars": len(logs_text),
+            "total_chars": total_chars,
         }
 
     try:
@@ -235,7 +278,9 @@ def tool_fetch_job_logs(owner: str, repo: str, job_id: str) -> Dict[str, Any]:
 
     try:
         logs = _fetch()
-        return {"logs": logs[-10000:], "total_chars": len(logs)}
+        # Extract the error window rather than a blind tail: post-steps and
+        # cleanup output can push the real error out of a naive logs[-N:].
+        return {"logs": _extract_error_window(logs, 10000), "total_chars": len(logs)}
     except Exception as e:
         logger.error("tool_fetch_job_logs %s/%s job=%s: %s", owner, repo, job_id, e)
         return {"logs": f"[ERROR] {e}", "total_chars": 0}

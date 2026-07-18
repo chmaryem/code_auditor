@@ -54,6 +54,9 @@ class CDAgentState(CDState, total=False):
     deploy_analysis_output: str
     rollback_output: str
     rollback_raw: Dict[str, Any]
+    deploy_used_tools: bool        # did the deploy-analysis agent call any tool?
+    quality_score: float           # deterministic quality guard (0-1)
+    quality_flags: List[str]
 
 
 # ── Agent nodes ────────────────────────────────────────────────────────────────
@@ -93,6 +96,7 @@ def node_deploy_analysis(state: CDAgentState) -> CDAgentState:
         context=_cd_context(state),
     )
     response = result.get("response", "")
+    used_tools = bool(result.get("tools_called"))
     # Clean fallback: on LLM error, produce a deterministic message instead of
     # leaking a 429/400 blob into the dashboard's Failure Analysis block.
     if result.get("llm_error") or _is_llm_error_text(response):
@@ -103,7 +107,8 @@ def node_deploy_analysis(state: CDAgentState) -> CDAgentState:
             "Automated deep analysis is temporarily unavailable (model rate limit).\n\n"
             "SUGGESTED FIX:\nReview the deploy job logs and server connectivity, then retry."
         )
-    return {**state, "deploy_analysis_output": response}
+        used_tools = True  # grounded in the real monitor grade / issues
+    return {**state, "deploy_analysis_output": response, "deploy_used_tools": used_tools}
 
 
 def node_rollback(state: CDAgentState) -> CDAgentState:
@@ -135,6 +140,22 @@ def node_consolidate_cd(state: CDAgentState) -> CDAgentState:
             updates["deploy_failure_reason"] = rc
         if fix:
             updates["deploy_suggested_fix"] = fix
+        # Deterministic quality guard (0 LLM call): score the answer's
+        # structural reliability and surface it. Context = the real monitor
+        # signals the analysis is supposed to be grounded in.
+        if rc:
+            from langchain_agents.graphs.response_quality import assess_quality
+            ctx = " ".join([
+                state.get("monitor_grade", "") or "",
+                ", ".join(state.get("monitor_issues", []) or []),
+                state.get("logs", "") or "",
+            ])
+            q = assess_quality(
+                root_cause=rc, suggested_fix=fix,
+                context_text=ctx, used_tools=bool(state.get("deploy_used_tools")),
+            )
+            updates["quality_score"] = q["score"]
+            updates["quality_flags"] = q["flags"]
 
     # Structured rollback fields — read the REAL dict the rollback agent got
     # back from tool_advise_rollback (kept in raw_tool_results).

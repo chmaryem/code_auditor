@@ -243,6 +243,7 @@ def invoke_with_fallback(
     temperature: float = 0.0,
     max_tokens: int = 8192,
     label: str = "LLM",
+    max_retries: int = 4,
 ) -> Optional[str]:
     """
     Cascade OpenRouter → Gemini pour le CI Analyzer et la couche IA.
@@ -252,6 +253,14 @@ def invoke_with_fallback(
          → Résout le crash fbgemm.dll sur Windows.
       2. Si HTTP échoue (erreur réseau, etc.), tente LangChain comme fallback.
          → Garde la compatibilité avec le multi-agent watch mode.
+
+    Args:
+        max_retries: Nombre de tentatives (avec backoff) par provider Groq/Gemini.
+            Par défaut 4 (jusqu'à ~220s d'attente cumulée par provider en cas de
+            quota). Les appelants dont le résultat est optionnel / non bloquant
+            pour l'utilisateur (ex. suggestions KB en arrière-plan) doivent passer
+            une valeur basse (1-2) pour échouer/réussir vite plutôt que de retenir
+            un thread pendant plusieurs minutes.
     """
     from config import config
 
@@ -293,21 +302,21 @@ def invoke_with_fallback(
     api_key = config.api.groq_api_key or os.getenv("GROQ_API_KEY", "")
     if api_key:
         model = config.api.groq_model or "llama-3.3-70b-versatile"
-        for attempt in range(4):
+        for attempt in range(max_retries):
             try:
-                print(f"    [Groq/{model}] {label} — appel HTTP (tentative {attempt + 1}/4)...")
+                print(f"    [Groq/{model}] {label} — appel HTTP (tentative {attempt + 1}/{max_retries})...")
                 text = _call_groq_http(prompt_text, api_key, model, min(max_tokens, 8192))
                 logger.info("[%s] réponse via Groq/%s (HTTP)", label, model)
                 return text
             except Exception as e:
                 err = str(e)
                 if _is_quota_error(err):
-                    if attempt < 3:
+                    if attempt < max_retries - 1:
                         wait = _BACKOFF[attempt]
                         print(f"   ⚠️  [Groq] quota — attente {wait}s...")
                         time.sleep(wait)
                     else:
-                        logger.error("[%s] Groq épuisé après 4 tentatives", label); break
+                        logger.error("[%s] Groq épuisé après %d tentative(s)", label, max_retries); break
                 elif _is_auth_error(err):
                     logger.error("[%s] Groq clé invalide", label); break
                 else:
@@ -317,21 +326,21 @@ def invoke_with_fallback(
     api_key = config.api.gemini_api_key or os.getenv("GOOGLE_API_KEY", "")
     if api_key:
         model = config.api.gemini_model or "gemini-2.0-flash"
-        for attempt in range(4):
+        for attempt in range(max_retries):
             try:
-                print(f"    [Gemini] {label} — appel HTTP (tentative {attempt + 1}/4)...")
+                print(f"    [Gemini] {label} — appel HTTP (tentative {attempt + 1}/{max_retries})...")
                 text = _call_gemini_http(prompt_text, api_key, model, max_tokens)
                 logger.info("[%s] réponse via Gemini (HTTP)", label)
                 return text
             except Exception as e:
                 err = str(e)
                 if _is_quota_error(err):
-                    if attempt < 3:
+                    if attempt < max_retries - 1:
                         wait = _BACKOFF[attempt]
                         print(f"   ⚠️  [Gemini] quota — attente {wait}s...")
                         time.sleep(wait)
                     else:
-                        logger.error("[%s] Gemini épuisé après 4 tentatives", label); break
+                        logger.error("[%s] Gemini épuisé après %d tentative(s)", label, max_retries); break
                 elif _is_auth_error(err):
                     logger.error("[%s] Gemini clé invalide", label); break
                 else:

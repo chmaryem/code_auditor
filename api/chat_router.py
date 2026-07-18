@@ -83,6 +83,14 @@ class ChatResponse(BaseModel):
     generation_errors: List[str] = Field(default_factory=list)
     elapsed_seconds: float = 0.0
     context_sources: List[str] = Field(default_factory=list)
+    # Migration SMA — observabilité (Phase 4). Champs additifs : vides en mode
+    # legacy, non-breaking pour les clients existants (dashboard/extension).
+    llm_calls: int = 0
+    active_agents: List[str] = Field(default_factory=list)
+    tools_called: List[str] = Field(default_factory=list)
+    # Garde-fou qualité déterministe (Phase 6). quality_score None = non évalué.
+    quality_score: Optional[float] = None
+    quality_flags: List[str] = Field(default_factory=list)
 
 
 class HistoryEntry(BaseModel):
@@ -163,6 +171,11 @@ async def _run_chat(
         generation_errors=result.get("generation_errors") or [],
         elapsed_seconds=elapsed,
         context_sources=result.get("context_sources") or [],
+        llm_calls=result.get("stats", {}).get("llm_calls", 0),
+        active_agents=result.get("active_agents") or [],
+        tools_called=result.get("tools_called") or [],
+        quality_score=result.get("quality_score"),
+        quality_flags=result.get("quality_flags") or [],
     )
 
 
@@ -194,8 +207,18 @@ async def _effective_active_repo(active_repository: str, user: Principal, db: As
     """
     if active_repository:
         return active_repository
-    from api.history_router import _resolve_active_repo
-    return await _resolve_active_repo(user, db) or ""
+    # Résolution best-effort : si la base est injoignable (timeout Supabase,
+    # hôte IPv6-only, projet en pause…), on ne fait PAS échouer tout le chat en
+    # 500 pour un contexte optionnel — on poursuit sans dépôt actif.
+    try:
+        from api.history_router import _resolve_active_repo
+        return await _resolve_active_repo(user, db) or ""
+    except Exception as exc:
+        logger.warning(
+            "active repo resolution indisponible (DB down ?): %s — chat poursuivi sans dépôt actif",
+            exc,
+        )
+        return ""
 
 
 @chat_router.post("", response_model=ChatResponse, summary="Q&A / Explain")

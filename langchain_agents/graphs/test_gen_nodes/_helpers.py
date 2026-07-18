@@ -637,32 +637,39 @@ def build_prompt(
     # Définitions réelles des classes importées d'autres modules du projet.
     # Évite que le LLM invente des champs/arguments de constructeur inexistants
     # (ex. Task(description=...)) faute de connaître la vraie signature.
+    # Bornée défensivement (était non bornée — un projet avec beaucoup de classes
+    # importées pouvait faire exploser le prompt sans qu'aucune limite ne s'applique).
     imported_defs_text = ""
     if imported_class_defs:
+        defs_preview = imported_class_defs[:1200]
         imported_defs_text = (
             "\n## Définitions EXACTES des classes importées du projet "
             "(utilise ces signatures telles quelles — n'invente AUCUN champ/argument absent) :\n"
-            f"{imported_class_defs}\n"
+            f"{defs_preview}\n"
         )
 
-    # Patterns de test RAG
+    # Patterns de test RAG — réduit à 2 patterns × 900 chars (contexte suffisant
+    # pour illustrer un style de test, sans dupliquer 3 exemples complets).
     patterns_text = ""
     if rag_context["test_patterns"]:
         patterns_text = "\n\n## Patterns de test de référence (Knowledge Base) :\n"
-        for i, pat in enumerate(rag_context["test_patterns"][:3], 1):
+        for i, pat in enumerate(rag_context["test_patterns"][:2], 1):
             patterns_text += f"\n--- Pattern {i} ({pat['language']}, score: {pat['score']}) ---\n"
-            patterns_text += pat["content"][:1800] + "\n"
+            patterns_text += pat["content"][:900] + "\n"
 
-    # Exemples de tests existants dans le projet
+    # Exemples de tests existants dans le projet — 1 exemple suffit à montrer les
+    # conventions de l'équipe (imports, style de mock, nommage).
     examples_text = ""
     if rag_context["project_examples"]:
         examples_text = "\n\n## Exemples de tests existants dans CE projet :\n"
-        for i, ex in enumerate(rag_context["project_examples"][:2], 1):
+        for i, ex in enumerate(rag_context["project_examples"][:1], 1):
             examples_text += f"\n--- Exemple {i} ({ex['file']}) ---\n"
-            examples_text += ex["content"][:1500] + "\n"
+            examples_text += ex["content"][:1000] + "\n"
 
-    # Budget dynamique pour le code source
-    max_code = min(len(source_code), 6000)
+    # Budget dynamique pour le code source — 4000 chars couvrent la quasi-totalité
+    # des fichiers unitaires raisonnables ; au-delà, les signatures extraites
+    # (sig_text) donnent déjà au LLM ce dont il a besoin pour le reste du fichier.
+    max_code = min(len(source_code), 4000)
     code_block = source_code[:max_code]
     if len(source_code) > max_code:
         code_block += f"\n// ... [tronqué — {len(source_code) - max_code} chars restants]"
@@ -688,12 +695,24 @@ Exemple : si hashPassword() est private et appelé dans save(), teste hashPasswo
 Note: Préfère JUnit 5 (org.junit.jupiter.api) avec @ExtendWith(MockitoExtension.class)
 plutôt que JUnit 4 (@RunWith). Utilise les assertions de org.junit.jupiter.api.Assertions."""
 
-    # Contexte du fichier de test existant pour le mode incrémentiel
+    # Règle pytest — courte (peu de tokens) mais évite 2 défauts récurrents :
+    # fixture appelée directement (erreur runtime), et fichiers temporaires
+    # nettoyés à la main (tmp_path élimine le besoin de cleanup, donc réduit
+    # aussi le code généré).
+    pytest_fixture_hint = ""
+    if language == "python" and framework == "pytest":
+        pytest_fixture_hint = """
+Regles pytest : une @pytest.fixture se demande en parametre du test (def test_x(sample_task):),
+jamais en appel direct (sample_task()). Pour un fichier, utilise le fixture tmp_path
+(pas de nettoyage manuel ni os.remove/os.rmdir)."""
+
+    # Contexte du fichier de test existant pour le mode incrémentiel — 1500 chars
+    # suffisent à montrer le style/imports déjà en place sans dupliquer tout le fichier.
     incremental_block = ""
     if incremental and existing_test_code:
-        preview = existing_test_code[:3000]
-        if len(existing_test_code) > 3000:
-            preview += f"\n// ... [{len(existing_test_code) - 3000} chars tronqués]"
+        preview = existing_test_code[:1500]
+        if len(existing_test_code) > 1500:
+            preview += f"\n// ... [{len(existing_test_code) - 1500} chars tronqués]"
         incremental_block = f"""
 ## Fichier de test EXISTANT (NE PAS réécrire ce qui est déjà testé) :
 ```{language}
@@ -709,11 +728,13 @@ plutôt que JUnit 4 (@RunWith). Utilise les assertions de org.junit.jupiter.api.
         else "Génère un fichier de tests COMPLET et EXÉCUTABLE."
     )
 
+    # Bornée défensivement (était non bornée — un message de retry inhabituellement
+    # long, ex. une stacktrace collée telle quelle, pouvait gonfler le prompt).
     retry_hint_block = ""
     if retry_hint:
         retry_hint_block = f"""
 ## RAPPEL — échec précédent sur ce fichier :
-{retry_hint}
+{retry_hint[:400]}
 Évite de reproduire cette même erreur.
 """
 
@@ -723,7 +744,7 @@ plutôt que JUnit 4 (@RunWith). Utilise les assertions de org.junit.jupiter.api.
 Fichier source : {source_path.name}
 Langage : {language}
 Framework de test détecté : {framework}
-{junit_version_hint}
+{junit_version_hint}{pytest_fixture_hint}
 
 ## Imports du fichier source :
 {imports_text or "  (aucun import détecté)"}
@@ -838,13 +859,60 @@ def extract_code_from_response(text: str) -> str:
 # Validation post-génération
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def detect_python_fixture_misuse(test_code: str) -> List[str]:
+    """
+    Détection déterministe (0 token, AST) d'un défaut récurrent de la génération
+    LLM : une fixture @pytest.fixture appelée directement (sample_task()) au lieu
+    d'être demandée en paramètre du test — pytest lève "Fixture called directly"
+    à l'EXÉCUTION, jamais à la compilation, donc compile() seul ne l'attrape pas.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError:
+        return []
+
+    fixture_names = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            (isinstance(d, ast.Attribute) and d.attr == "fixture")
+            or (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == "fixture")
+            or (isinstance(d, ast.Name) and d.id == "fixture")
+            for d in node.decorator_list
+        )
+    }
+    if not fixture_names:
+        return []
+
+    issues = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+            continue
+        params = {a.arg for a in node.args.args}
+        for call in ast.walk(node):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id in fixture_names
+                and call.func.id not in params
+            ):
+                issues.append(
+                    f"{node.name}() appelle la fixture '{call.func.id}()' directement "
+                    f"au lieu de la demander en paramètre : def {node.name}({call.func.id}):"
+                )
+    return issues
+
+
 def validate_generated_test(
     test_code: str, source_path: Path,
     signatures: List[Dict] = None,
 ) -> bool:
     """
     Valide le test généré selon le langage :
-      - Python : compile() pour vérifier la syntaxe
+      - Python : compile() pour vérifier la syntaxe + usage correct des fixtures pytest
       - Java   : vérifications structurelles + private method calls
     """
     language = detect_language(source_path)
@@ -852,11 +920,17 @@ def validate_generated_test(
     if language == "python":
         try:
             compile(test_code, f"test_{source_path.stem}.py", "exec")
-            logger.info("Test Python genere: syntaxe valide")
-            return True
         except SyntaxError as e:
             logger.warning("Test Python genere: erreur syntaxe -- %s", e)
             return False
+
+        fixture_issues = detect_python_fixture_misuse(test_code)
+        if fixture_issues:
+            logger.warning("Test Python genere: %s", " | ".join(fixture_issues))
+            return False
+
+        logger.info("Test Python genere: syntaxe valide")
+        return True
 
     elif language == "java":
         return validate_java_structural(test_code, signatures=signatures)
@@ -1009,7 +1083,10 @@ def retry_with_error(
     if language == "python":
         try:
             compile(failed_code, "test.py", "exec")
-            return failed_code
+            fixture_issues = detect_python_fixture_misuse(failed_code)
+            if not fixture_issues:
+                return failed_code
+            error_msg = " | ".join(fixture_issues)
         except SyntaxError as e:
             error_msg = f"Ligne {e.lineno}: {e.msg}"
     elif language == "java":

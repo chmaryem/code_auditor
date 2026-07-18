@@ -168,28 +168,120 @@ class LCChatDecisionAgent:
                 "reason":        "salutation / small-talk",
             }
 
-        # ── Attempt LLM routing ──────────────────────────────────────────────
-        plan = self._decide_llm(
-            msg_raw, target_file, base_intent, params, history,
-            cursor_line, active_function, selected_text,
-        )
+        from config import config as _cfg
 
-        # ── Fallback to regex if LLM failed or low confidence ───────────────
-        if plan is None or plan.get("confidence", 0.0) < 0.5:
-            logger.debug("Decision LLM skipped — using regex fallback")
-            plan = self._decide_regex(msg_raw, target_file, base_intent, params, history)
-            plan["_routing"] = "regex"
+        # ── Phase 1.3 · Cache décision (1er tour uniquement) ─────────────────
+        # On ne met en cache QUE lorsque history est vide : le routage d'un
+        # follow-up dépend de l'historique (voir _decide_regex), donc le mettre
+        # en cache par simple texte serait incorrect. Un 1er message est, lui,
+        # auto-suffisant (routage fonction de message+fichier+intent seulement).
+        cache_ok = (not history) and getattr(_cfg.chat, "decision_cache_enabled", False)
+        ckey = self._decision_cache_key(msg_raw, target_file, base_intent) if cache_ok else ""
+        if ckey:
+            cached = self._decision_cache_get(ckey)
+            if cached is not None:
+                # Hit = AUCUN appel LLM ce tour → _routing="cache" pour que la
+                # télémétrie (node_decision_agent) compte 0 (et non 1).
+                cached["_routing"] = "cache"
+                return self._enrich_cursor(cached, target_file, active_function, selected_text)
+
+        # ── Phase 1.1 · Router regex-first (économie de tokens) ──────────────
+        # Par défaut (config.chat.router_regex_first=True) : on classe d'abord par
+        # règles déterministes (0 token). Si une règle FORTE matche (confiance ≥
+        # seuil : git/ci/génération/explain/project_state), on s'en tient là et on
+        # NE consulte PAS le LLM. Sinon (message ambigu), on escalade vers le LLM
+        # pour préserver la précision de l'ancien routage.
+        regex_first = getattr(_cfg.chat, "router_regex_first", False)
+        min_conf    = getattr(_cfg.chat, "router_regex_min_confidence", 0.85)
+
+        if regex_first:
+            rplan = self._decide_regex(msg_raw, target_file, base_intent, params, history)
+            if rplan.get("confidence", 0.0) >= min_conf:
+                rplan["_routing"] = "regex"
+                plan = rplan
+            else:
+                # Règle faible → on tente le LLM, avec repli sur le plan regex.
+                llm_plan = self._decide_llm(
+                    msg_raw, target_file, base_intent, params, history,
+                    cursor_line, active_function, selected_text,
+                )
+                if llm_plan and llm_plan.get("confidence", 0.0) >= 0.5:
+                    llm_plan["_routing"] = "llm"
+                    plan = llm_plan
+                else:
+                    rplan["_routing"] = "regex"
+                    plan = rplan
         else:
-            plan["_routing"] = "llm"
+            # ── Legacy : LLM d'abord, regex en repli ─────────────────────────
+            plan = self._decide_llm(
+                msg_raw, target_file, base_intent, params, history,
+                cursor_line, active_function, selected_text,
+            )
+            if plan is None or plan.get("confidence", 0.0) < 0.5:
+                logger.debug("Decision LLM skipped — using regex fallback")
+                plan = self._decide_regex(msg_raw, target_file, base_intent, params, history)
+                plan["_routing"] = "regex"
+            else:
+                plan["_routing"] = "llm"
 
-        # ── Enrich with cursor context ───────────────────────────────────────
+        if ckey:
+            self._decision_cache_set(ckey, plan, getattr(_cfg.chat, "decision_cache_ttl", 900))
+
+        return self._enrich_cursor(plan, target_file, active_function, selected_text)
+
+    @staticmethod
+    def _enrich_cursor(
+        plan: Dict[str, Any],
+        target_file: str,
+        active_function: str,
+        selected_text: str,
+    ) -> Dict[str, Any]:
+        """Complète le plan avec le contexte curseur (symbole actif, fichier sélectionné)."""
         if active_function and not plan.get("target_symbol"):
             plan["target_symbol"] = active_function
         if selected_text and not plan.get("target_file"):
-            # If user selected code, work with current file
+            # Si l'utilisateur a sélectionné du code, on travaille sur le fichier courant.
             plan["target_file"] = target_file or plan.get("target_file", "")
-
         return plan
+
+    # ── Phase 1.3 · Cache décision (Redis via MCP) ───────────────────────────
+
+    @staticmethod
+    def _decision_cache_key(message: str, target_file: str, base_intent: str) -> str:
+        """Clé stable = hash(message normalisé | fichier | intent de base)."""
+        import hashlib
+        raw = f"{(message or '').strip().lower()}|{target_file or ''}|{base_intent or ''}"
+        return "ca:chat:decision:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _decision_cache_get(key: str) -> Optional[Dict[str, Any]]:
+        """Lit un plan mis en cache. Encodé en base64 pour éviter le gotcha du
+        client MCP-Redis (les valeurs commençant par { ou [ sont ignorées)."""
+        try:
+            import base64
+            from services.mcp_redis_service import get_mcp_redis
+            raw = get_mcp_redis().get(key)
+            if not raw:
+                return None
+            decoded = base64.b64decode(raw).decode("utf-8")
+            plan = json.loads(decoded)
+            return plan if isinstance(plan, dict) else None
+        except Exception as e:
+            # Erreur MCP-Redis renvoyée sous forme de chaîne → base64/json échoue → miss.
+            logger.debug("decision cache get miss: %s", e)
+            return None
+
+    @staticmethod
+    def _decision_cache_set(key: str, plan: Dict[str, Any], ttl: int) -> None:
+        try:
+            import base64
+            from services.mcp_redis_service import get_mcp_redis
+            payload = base64.b64encode(
+                json.dumps(plan, default=str).encode("utf-8")
+            ).decode("ascii")
+            get_mcp_redis().set(key, payload, expire_seconds=ttl)
+        except Exception as e:
+            logger.debug("decision cache set failed: %s", e)
 
     # ── LLM routing ──────────────────────────────────────────────────────────
 
@@ -302,7 +394,7 @@ class LCChatDecisionAgent:
             "quoi faire ensuite", "prochaines actions",
         ]):
             plan.update({"intent": "project_state", "agents": ["project_state_agent", "chat_agent"],
-                         "context_level": "deep", "needs_file": False,
+                         "context_level": "deep", "needs_file": False, "confidence": 0.9,
                          "reason": "holistic project-state keyword"})
             return plan
 
@@ -314,7 +406,7 @@ class LCChatDecisionAgent:
             plan.update({
                 "intent": "ci_question", "agents": ["ci_agent", "chat_agent"],
                 "context_level": "deep", "needs_file": False,
-                "needs_ci": True, "needs_rag": False,
+                "needs_ci": True, "needs_rag": False, "confidence": 0.9,
                 "reason": "CI/CD keyword",
             })
             return plan
@@ -328,7 +420,7 @@ class LCChatDecisionAgent:
             plan.update({
                 "intent": "git_question", "agents": ["git_agent", "chat_agent"],
                 "context_level": "deep", "needs_file": False,
-                "needs_git": True, "needs_rag": False,
+                "needs_git": True, "needs_rag": False, "confidence": 0.9,
                 "reason": "Git keyword",
             })
             return plan
@@ -341,7 +433,7 @@ class LCChatDecisionAgent:
                 "agents": ["code_generation_agent", "validator_agent"],
                 "needs_file": base_intent == "complete_fn",
                 "needs_generation": True, "needs_validation": True,
-                "needs_rag": True,
+                "needs_rag": True, "confidence": 0.9,
                 "reason": f"Phase 2: {base_intent}",
             })
             return plan
@@ -357,7 +449,7 @@ class LCChatDecisionAgent:
                 "intent": "code_generation", "target_symbol": target, "generation_target": target,
                 "agents": ["code_generation_agent", "validator_agent"],
                 "needs_generation": True, "needs_validation": True,
-                "needs_rag": True,
+                "needs_rag": True, "confidence": 0.9,
                 "reason": "code generation keyword",
             })
             return plan
@@ -381,7 +473,7 @@ class LCChatDecisionAgent:
             plan.update({
                 "intent": "explain", "agents": ["code_agent", "chat_agent"],
                 "context_level": "fast", "needs_project_summary": False,
-                "needs_rag": False,
+                "needs_rag": False, "confidence": 0.9,
                 "reason": "explain keyword — fast path",
             })
             return plan

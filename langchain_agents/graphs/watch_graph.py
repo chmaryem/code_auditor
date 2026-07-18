@@ -1996,12 +1996,15 @@ def node_emit_ws_events(state: WatchState) -> Dict[str, Any]:
                 return False
 
         # de-dup + filter to real project files, excluding the analyzed file itself
+        # AND excluding test files — a generated/existing test is not an "impacted"
+        # dependency to warn about (mirrors the _is_test_path filter used in
+        # node_analyze_dependents so the WS impact list and the cascade agree).
         _self_abs = _os.path.normcase(_os.path.abspath(file_path)) if file_path else ""
         seen = set()
         filtered = []
         for f in impacted:
             fa = _os.path.normcase(_os.path.abspath(f)) if f else ""
-            if fa and fa != _self_abs and fa not in seen and _in_project(f):
+            if fa and fa != _self_abs and fa not in seen and _in_project(f) and not _is_test_path(f):
                 seen.add(fa)
                 filtered.append(f)
         impacted = filtered

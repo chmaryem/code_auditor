@@ -1,13 +1,4 @@
-"""
-cd_graph.py — LangGraph CDGraph: Continuous Deployment Intelligence.
 
-Graph flow:
-  fetch_deployment → pre_deploy_risk_score → check_environment
-  → monitor_health → analyze_failure → suggest_rollback
-  → post_deploy_report → index_result → notify → END
-
-Triggered by: CIPoller when a deploy/publish job completes.
-"""
 from __future__ import annotations
 
 import logging
@@ -22,15 +13,9 @@ from langchain_agents.graphs.state import CDState
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Node 1 — fetch_deployment
-# ─────────────────────────────────────────────────────────────────────────────
 
 def node_fetch_deployment(state: CDState) -> CDState:
-    """
-    Fetches deployment metadata from the GitHub Actions run.
-    Extracts version (Docker tag), deploy_url, and environment.
-    """
+   
     run_id = state.get("run_id", "")
     repo   = state.get("repo", "")
     owner  = state.get("owner", "")

@@ -124,6 +124,9 @@ def _initial_state(
         "code_blocks": [],
         "suggested_files": [],
 
+        # Télémétrie (Phase 0.2) — compteur d'appels LLM de premier plan (reducer additif)
+        "llm_calls": 0,
+
         **services,
     }
 
@@ -192,25 +195,85 @@ def node_intent_router(state: ChatState) -> Dict[str, Any]:
     }
 
 
+def _decision_cache_key(state: ChatState) -> str:
+    """Clé de cache d'une décision de routage : message normalisé + scope + fichier."""
+    import hashlib
+    msg    = " ".join((state.get("user_message", "") or "").lower().split())
+    scope  = state.get("scope", "extension")
+    target = state.get("target_file", "") or ""
+    raw    = f"{msg}|{scope}|{target}"
+    return "ca:chat:decision:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _cached_or_decide(state: ChatState, agent: Any) -> Dict[str, Any]:
+    """
+    Phase 1.3 (migration SMA) — cache Redis des décisions de routage.
+
+    Ne met en cache QUE les décisions issues du LLM (les seules coûteuses en
+    tokens) ; les décisions regex/cache sont recalculées gratuitement. Tout échec
+    Redis ⇒ recalcul → comportement rigoureusement identique à l'absence de cache.
+    """
+    from config import config as _cfg
+
+    def _decide() -> Dict[str, Any]:
+        return agent.decide(
+            user_message         = state.get("user_message", ""),
+            target_file          = state.get("target_file", "") or "",
+            base_intent          = state.get("intent", "question"),
+            intent_params        = state.get("intent_params", {}) or {},
+            conversation_history = state.get("history", []),
+            cursor_line          = state.get("cursor_line", 0),
+            active_function      = state.get("active_function", ""),
+            selected_text        = state.get("selected_text", ""),
+        )
+
+    if not getattr(_cfg.chat, "decision_cache_enabled", False):
+        return _decide()
+
+    key = _decision_cache_key(state)
+    try:
+        from services.mcp_redis_service import get_mcp_redis
+        redis = get_mcp_redis()
+    except Exception:
+        redis = None
+
+    if redis:
+        try:
+            raw = redis.get(key)
+            if raw:
+                cached = json.loads(raw)
+                if isinstance(cached, dict) and cached.get("intent"):
+                    cached["_routing"] = "cache"   # → 0 appel LLM comptabilisé
+                    return cached
+        except Exception as e:
+            logger.debug("decision cache read failed: %s", e)
+
+    plan = _decide()
+
+    # Ne cache que les décisions LLM (coûteuses) ; regex/cache sont déjà gratuites.
+    if redis and plan.get("_routing") == "llm":
+        try:
+            redis.set(
+                key,
+                json.dumps(plan, ensure_ascii=False, default=str),
+                expire_seconds=int(getattr(_cfg.chat, "decision_cache_ttl", 900)),
+            )
+        except Exception as e:
+            logger.debug("decision cache write failed: %s", e)
+
+    return plan
+
+
 def node_decision_agent(state: ChatState) -> Dict[str, Any]:
     """
     LLM-powered decision agent (v2).
     Passes cursor context for IDE-aware routing.
     Falls back to regex if LLM unavailable or low confidence.
+    Phase 1.1/1.3 : routing regex-first + cache Redis (voir _cached_or_decide).
     """
     from langchain_agents.agents.lc_chat_decision_agent import chat_decision_agent
 
-    plan = chat_decision_agent.decide(
-        user_message         = state.get("user_message", ""),
-        target_file          = state.get("target_file", "") or "",
-        base_intent          = state.get("intent", "question"),
-        intent_params        = state.get("intent_params", {}) or {},
-        conversation_history = state.get("history", []),
-        # cursor context
-        cursor_line          = state.get("cursor_line", 0),
-        active_function      = state.get("active_function", ""),
-        selected_text        = state.get("selected_text", ""),
-    )
+    plan = _cached_or_decide(state, chat_decision_agent)
 
     old_params = state.get("intent_params", {}) or {}
     merged_params = {
@@ -246,6 +309,9 @@ def node_decision_agent(state: ChatState) -> Dict[str, Any]:
         "needs_generation": False if dashboard_needs_attachment else bool(plan.get("needs_generation", False)),
         "needs_tests":      bool(plan.get("needs_tests", False)),
         "dashboard_needs_attachment": dashboard_needs_attachment,
+        # Télémétrie : le routage n'a coûté un appel LLM que si _routing == "llm"
+        # (regex-first le met à "regex" sur les cas clairs → 0 token).
+        "llm_calls":        1 if plan.get("_routing") == "llm" else 0,
     }
 
 
@@ -469,23 +535,23 @@ _DASHBOARD_ATTACH_NUDGE = (
 async def node_fast_answer(state: ChatState, config: Any = None) -> Dict[str, Any]:
     """Fast streamed response for simple explain/summarize questions."""
     if state.get("dashboard_needs_attachment"):
-        return {"response": _DASHBOARD_ATTACH_NUDGE}
+        return {"response": _DASHBOARD_ATTACH_NUDGE}   # nudge = 0 appel LLM
 
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
     response = await lc_chat_agent.afast_answer(dict(state), config=config)
-    return {"response": response}
+    return {"response": response, "llm_calls": 1, **_response_quality_fields(state, response)}
 
 
 async def node_answer_question(state: ChatState, config: Any = None) -> Dict[str, Any]:
     """Generate final project-aware answer."""
     if state.get("dashboard_needs_attachment"):
-        return {"response": _DASHBOARD_ATTACH_NUDGE}
+        return {"response": _DASHBOARD_ATTACH_NUDGE}   # nudge = 0 appel LLM
 
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
     response = await lc_chat_agent.aanswer(dict(state), config=config)
-    return {"response": response}
+    return {"response": response, "llm_calls": 1, **_response_quality_fields(state, response)}
 
 
 async def node_git_question(state: ChatState) -> Dict[str, Any]:
@@ -547,7 +613,7 @@ async def node_git_question(state: ChatState) -> Dict[str, Any]:
                 f"```diff\n{diff_text[:3000]}\n```"
             )
             response = await lc_chat_agent.aanswer(enriched_state)
-            return {"response": response, "git_diff_used": True}
+            return {"response": response, "git_diff_used": True, "llm_calls": 1}
         else:
             return {
                 "response": (
@@ -556,7 +622,7 @@ async def node_git_question(state: ChatState) -> Dict[str, Any]:
                     "Si tu viens de committer, utilise :\n"
                     "```bash\ngit show --stat\n```"
                 ),
-                "git_diff_used": False,
+                "git_diff_used": False,   # réponse template = 0 appel LLM
             }
 
     # ── Direct Smart Git dispatch for heavier operations ──────────────────────
@@ -593,6 +659,9 @@ async def node_git_question(state: ChatState) -> Dict[str, Any]:
     return {
         "response":   result.get("response", ""),
         "git_result": result,
+        # Approx. : le SmartGitGraph appelle au moins son routeur LLM. Les appels
+        # internes des agents Git ne sont pas comptés ici (sous-graphe séparé).
+        "llm_calls":  1,
     }
 
 
@@ -642,7 +711,7 @@ async def node_ci_question(state: ChatState) -> Dict[str, Any]:
         f"component_scores={ci['component_scores']}\n"
     )
     response = await lc_chat_agent.aanswer(enriched_state)
-    return {"response": response, "project_state_context": {"ci_readiness": ci}}
+    return {"response": response, "project_state_context": {"ci_readiness": ci}, "llm_calls": 1}
 
 
 async def node_project_state(state: ChatState) -> Dict[str, Any]:
@@ -674,7 +743,7 @@ async def node_project_state(state: ChatState) -> Dict[str, Any]:
         "Prioritize what's blocking or risky, then suggest concrete next actions."
     )
     response = await lc_chat_agent.aanswer(enriched_state)
-    return {"response": response, "project_state_context": summary}
+    return {"response": response, "project_state_context": summary, "llm_calls": 1}
 
 
 def node_test_generation(state: ChatState) -> Dict[str, Any]:
@@ -716,6 +785,9 @@ def node_generate_completion(state: ChatState) -> Dict[str, Any]:
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
     result = lc_chat_agent.complete_function(dict(state))
+    # LLM appelé uniquement quand du code a été produit (les retours d'erreur
+    # précoces — fonction/fichier introuvable — ne coûtent aucun token).
+    result["llm_calls"] = 1 if result.get("generated_code") else 0
     return result
 
 
@@ -724,6 +796,7 @@ def node_generate_class(state: ChatState) -> Dict[str, Any]:
     from langchain_agents.agents.lc_chat_agent import lc_chat_agent
 
     result = lc_chat_agent.generate_class(dict(state))
+    result["llm_calls"] = 1 if result.get("generated_code") else 0
     return result
 
 
@@ -835,19 +908,29 @@ def node_memory_save(state: ChatState) -> Dict[str, Any]:
         threading.Thread(target=_persist_to_pg, daemon=True).start()
 
     # ── 3. Semantic memory (Phase C1 — thread daemon non-bloquant) ───────────
-    def _write_semantic() -> None:
-        try:
-            from langchain_agents.memory.lc_semantic_memory import semantic_memory
-            semantic_memory.write_memory(
-                session_id=session_id,
-                user_message=user_message,
-                assistant_message=response,
-                metadata={"intent": intent, "file": state.get("target_file", "")},
-            )
-        except Exception as exc:
-            logger.debug("semantic memory write failed: %s", exc)
+    # Phase 1.2 (migration SMA) : l'extraction de faits coûte 1 appel LLM par tour
+    # en arrière-plan. On ne l'exécute plus qu'1 tour sur N (config.chat.
+    # semantic_memory_every : 1 = chaque tour = ancien comportement · 0 = désactivé).
+    # N'impacte QUE le rappel sémantique du chemin "deep" — invisible côté UI.
+    from config import config as _cfg
+    _every = getattr(_cfg.chat, "semantic_memory_every", 1)
+    _exchanges = len(state.get("history", []) or []) // 2   # échanges déjà stockés
+    _should_write_semantic = _every > 0 and (_exchanges % _every == 0)
 
-    threading.Thread(target=_write_semantic, daemon=True).start()
+    if _should_write_semantic:
+        def _write_semantic() -> None:
+            try:
+                from langchain_agents.memory.lc_semantic_memory import semantic_memory
+                semantic_memory.write_memory(
+                    session_id=session_id,
+                    user_message=user_message,
+                    assistant_message=response,
+                    metadata={"intent": intent, "file": state.get("target_file", "")},
+                )
+            except Exception as exc:
+                logger.debug("semantic memory write failed: %s", exc)
+
+        threading.Thread(target=_write_semantic, daemon=True).start()
 
     # ── 4. LearningAgent feedback (code generation uniquement) ────────────────
     if intent in ("complete_fn", "new_class", "code_generation"):
@@ -891,6 +974,105 @@ def node_format_response(state: ChatState) -> Dict[str, Any]:
     )
 
     return {"formatted_response": formatted, "context_sources": sources}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Nodes — Migration SMA (Phase 2) : blackboard gather + synthèse unique
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _merge_blackboard(acc: Dict[str, Any], contrib: Dict[str, Any]) -> None:
+    """Fusionne une contribution d'agent dans l'accumulateur. `project_state_context`
+    est fusionné en profondeur (CiAgent ET ProjectStateAgent peuvent y écrire)."""
+    for k, v in (contrib or {}).items():
+        if k == "project_state_context" and isinstance(v, dict):
+            base = dict(acc.get("project_state_context") or {})
+            base.update(v)
+            acc["project_state_context"] = base
+        else:
+            acc[k] = v
+
+
+async def node_gather(state: ChatState) -> Dict[str, Any]:
+    """Blackboard : chaque agent spécialisé décide de sa pertinence (0 token) et
+    contribue sa section. FileAgent (wave 0) d'abord — il produit `file_code` dont
+    dépend RAG — puis les autres agents en parallèle (asyncio.gather)."""
+    from langchain_agents.chat_agents.base import get_registry
+
+    registry = get_registry()
+    updates: Dict[str, Any] = {}
+
+    # Wave 0 — contexte fichier (séquentiel, produit file_code / dependencies)
+    for agent in registry:
+        if getattr(agent, "wave", 1) == 0 and agent.should_activate(state):
+            try:
+                _merge_blackboard(updates, await agent.contribute(state))
+            except Exception as e:
+                logger.debug("gather wave0 %s failed: %s", agent.name, e)
+
+    merged = {**state, **updates}
+
+    # Wave 1 — agents parallèles (RAG, git, CI, état projet, résumé)
+    wave1 = [a for a in registry if getattr(a, "wave", 1) != 0 and a.should_activate(merged)]
+    if wave1:
+        results = await asyncio.gather(
+            *[a.contribute(merged) for a in wave1], return_exceptions=True
+        )
+        for agent, res in zip(wave1, results):
+            if isinstance(res, dict):
+                _merge_blackboard(updates, res)
+            elif isinstance(res, Exception):
+                logger.debug("gather %s failed: %s", agent.name, res)
+
+    merged2 = {**state, **updates}
+    updates["active_agents"] = [a.name for a in registry if a.should_activate(merged2)]
+    return updates
+
+
+def _response_quality_fields(state: ChatState, response: str, used_tools: bool = False) -> Dict[str, Any]:
+    """Garde-fou qualité DÉTERMINISTE (0 token). Non destructif : n'altère jamais
+    la réponse, expose seulement quality_score + quality_flags pour l'observabilité.
+
+    Le contexte de « grounding » (anti-hallucination) est reconstitué à partir du
+    blackboard : code fichier, docs RAG, snapshot git et état projet."""
+    try:
+        from config import config as _cfg
+        if not getattr(_cfg.chat, "quality_guard_enabled", True):
+            return {}
+        from langchain_agents.graphs.response_quality import assess_chat_quality
+
+        rag_txt = "\n".join(
+            d.get("content", "") for d in (state.get("rag_docs") or []) if isinstance(d, dict)
+        )
+        ctx = "\n".join([
+            state.get("file_code", "") or "",
+            rag_txt,
+            json.dumps(state.get("git_context") or {}, default=str),
+            json.dumps(state.get("project_state_context") or {}, default=str),
+        ])
+        has_ctx = bool(
+            state.get("file_code") or state.get("rag_docs")
+            or state.get("git_context") or state.get("project_state_context")
+        )
+        q = assess_chat_quality(
+            response or "", context_text=ctx,
+            used_tools=used_tools, has_project_context=has_ctx,
+        )
+        return {"quality_score": q["score"], "quality_flags": q["flags"]}
+    except Exception as e:
+        logger.debug("quality guard failed: %s", e)
+        return {}
+
+
+async def node_synthesize(state: ChatState, config: Any = None) -> Dict[str, Any]:
+    """Synthèse unique — le SEUL appel LLM du flux blackboard (streamé).
+    Agrège fichier + RAG + git + CI + état projet + historique en une réponse."""
+    if state.get("dashboard_needs_attachment"):
+        return {"response": _DASHBOARD_ATTACH_NUDGE}   # nudge = 0 appel LLM
+
+    from langchain_agents.agents.lc_chat_agent import lc_chat_agent
+
+    response = await lc_chat_agent.asynthesize(dict(state), config=config)
+    return {"response": response, "llm_calls": 1, **_response_quality_fields(state, response)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -946,6 +1128,7 @@ def _route_after_parallel_context(state: ChatState) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_chat_graph():
+    """Orchestrateur LEGACY (comportement historique). Sélectionné par défaut."""
     graph = StateGraph(ChatState)
 
     # Core orchestration nodes
@@ -1091,11 +1274,130 @@ async def node_tool_calling_answer(state: ChatState) -> Dict[str, Any]:
         target_file  = state.get("target_file", "") or "",
     )
 
+    # Chaque itération de la boucle ReAct = 1 invocation LLM ; le repli sans
+    # outils (llm None) fait 1 appel mais rapporte iterations=0 → on plancher à 1.
+    _iters = result.get("iterations", 0)
+    _llm_calls = _iters if _iters > 0 else (1 if result.get("response") else 0)
+    _resp = result.get("response", "")
+    _tools = result.get("tools_called", [])
     return {
-        "response":      result.get("response", ""),
-        "tools_called":  result.get("tools_called", []),
+        "response":      _resp,
+        "tools_called":  _tools,
+        "llm_calls":     _llm_calls,
+        **_response_quality_fields(state, _resp, used_tools=bool(_tools)),
     }
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Graph builder — BLACKBOARD (Migration SMA — Phase 2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _route_after_decision_bb(state: ChatState) -> str:
+    """Routage blackboard : génération / git / tests réutilisent les chemins legacy ;
+    les questions "deep" ESCALADENT vers la boucle tool-calling (ReAct-like, bornée)
+    au lieu du gather — évite le double travail (gather collecte tout, tool-calling
+    ne tire que ce dont il a besoin) ; tout le reste (explain/ci/project_state/
+    question simple) → gather → synthèse unique (Phase 3.1)."""
+    intent = state.get("intent", "question")
+    if intent in ("complete_fn", "new_class", "code_generation"):
+        return "load_file_context"   # sous-chemin génération (réutilisé)
+    if intent == "git_question":
+        return "git_question"
+    if intent == "test_generation":
+        return "test_generation"
+    if state.get("context_level") == "deep" and intent == "question":
+        return "semantic_recall"     # → tool_calling_answer (escalade bornée)
+    return "gather"
+
+
+def _route_gen_bb(state: ChatState) -> str:
+    return "generate_class" if state.get("intent") == "new_class" else "generate_completion"
+
+
+def build_blackboard_chat_graph():
+    """Orchestrateur SMA : router → gather (agents déterministes) → synthèse unique.
+
+    - Q&A / explain / CI / project_state / deep → gather → synthesize (1 seul LLM).
+    - Génération de code, Git, tests → chemins legacy RÉUTILISÉS tels quels
+      (aucune régression sur ces intents : événement `code`, SmartGit, etc.).
+    """
+    graph = StateGraph(ChatState)
+
+    # Cœur
+    graph.add_node("load_ai_settings",   node_load_ai_settings)
+    graph.add_node("load_memory",        node_load_memory)
+    graph.add_node("intent_router",      node_intent_router)
+    graph.add_node("decision_agent",     node_decision_agent)
+
+    # Blackboard (nouveaux)
+    graph.add_node("gather",             node_gather)
+    graph.add_node("synthesize",         node_synthesize)
+
+    # Chemins spécialisés réutilisés
+    graph.add_node("git_question",       node_git_question)
+    graph.add_node("test_generation",    node_test_generation)
+
+    # Escalade "deep" (Phase 3.1) — réutilise les nœuds legacy tels quels
+    graph.add_node("semantic_recall",    node_semantic_recall)
+    graph.add_node("tool_calling_answer",node_tool_calling_answer)
+
+    # Sous-chemin génération (réutilise les nœuds legacy)
+    graph.add_node("load_file_context",     node_load_file_context)
+    graph.add_node("parallel_context",      node_parallel_context)
+    graph.add_node("load_project_patterns", node_load_project_patterns)
+    graph.add_node("rag_retrieve",          node_rag_retrieve)
+    graph.add_node("generate_completion",   node_generate_completion)
+    graph.add_node("generate_class",        node_generate_class)
+    graph.add_node("validate_generated",    node_validate_generated)
+
+    # Fin de chaîne
+    graph.add_node("memory_save",        node_memory_save)
+    graph.add_node("format_response",    node_format_response)
+
+    graph.set_entry_point("load_ai_settings")
+    graph.add_edge("load_ai_settings", "load_memory")
+    graph.add_edge("load_memory",   "intent_router")
+    graph.add_edge("intent_router", "decision_agent")
+
+    graph.add_conditional_edges(
+        "decision_agent",
+        _route_after_decision_bb,
+        {
+            "gather":            "gather",
+            "git_question":      "git_question",
+            "test_generation":   "test_generation",
+            "load_file_context": "load_file_context",   # génération
+            "semantic_recall":   "semantic_recall",      # escalade deep
+        },
+    )
+
+    # Chemin blackboard : agents parallèles → synthèse unique
+    graph.add_edge("gather", "synthesize")
+
+    # Escalade deep : rappel sémantique → boucle tool-calling (bornée, ≤4 itér.)
+    graph.add_edge("semantic_recall", "tool_calling_answer")
+
+    # Sous-chemin génération (linéaire, réutilise les nœuds legacy)
+    graph.add_edge("load_file_context",     "parallel_context")
+    graph.add_edge("parallel_context",      "load_project_patterns")
+    graph.add_edge("load_project_patterns", "rag_retrieve")
+    graph.add_conditional_edges(
+        "rag_retrieve",
+        _route_gen_bb,
+        {"generate_completion": "generate_completion", "generate_class": "generate_class"},
+    )
+    graph.add_edge("generate_completion", "validate_generated")
+    graph.add_edge("generate_class",      "validate_generated")
+
+    # Toutes les branches → memory_save → format → END
+    for node in ("synthesize", "git_question", "test_generation",
+                 "validate_generated", "tool_calling_answer"):
+        graph.add_edge(node, "memory_save")
+    graph.add_edge("memory_save",    "format_response")
+    graph.add_edge("format_response", END)
+
+    return graph.compile()
 
 
 _chat_graph = None
@@ -1104,7 +1406,16 @@ _chat_graph = None
 def _get_chat_graph():
     global _chat_graph
     if _chat_graph is None:
-        _chat_graph = build_chat_graph()
+        try:
+            from config import config as _cfg
+            orch = getattr(_cfg.chat, "orchestrator", "legacy")
+        except Exception:
+            orch = "legacy"
+        if orch == "blackboard":
+            logger.info("ChatGraph : orchestrateur 'blackboard' (SMA — Phase 2)")
+            _chat_graph = build_blackboard_chat_graph()
+        else:
+            _chat_graph = build_chat_graph()
     return _chat_graph
 
 
@@ -1145,6 +1456,8 @@ async def ainvoke_chat(
     result = await graph.ainvoke(initial)
     result.setdefault("stats", {})
     result["stats"]["elapsed"] = round(time.time() - start, 2)
+    result["stats"]["llm_calls"] = result.get("llm_calls", 0)   # Phase 0.2
+    result["stats"]["quality_score"] = result.get("quality_score")  # Phase 6
     return result
 
 
@@ -1241,6 +1554,11 @@ async def stream_chat(
     final_context_level = "context"
     final_response = ""
     final_context_sources: list = []
+    total_llm_calls = 0   # Phase 0.2 — somme des appels LLM reportés par les nœuds
+    final_active_agents: list = []   # Phase 4.1 — agents blackboard réellement activés
+    final_tools_called: list = []    # Phase 4.3 — outils appelés lors de l'escalade ReAct
+    final_quality_score = None       # Phase 6 — garde-fou qualité déterministe
+    final_quality_flags: list = []
 
     # Génération de code : le code est livré UNE seule fois, via l'événement `code`.
     # On supprime donc (1) le streaming de tokens pendant la génération et (2) le code
@@ -1248,6 +1566,14 @@ async def stream_chat(
     _GEN_NODES = ("generate_completion", "generate_class")
     _GEN_INTENTS = ("complete_fn", "new_class", "code_generation")
     in_generation = False
+
+    # Nœuds susceptibles d'appeler le LLM (pour la télémétrie llm_calls, Phase 0.2).
+    _LLM_NODES = {
+        "decision_agent", "fast_answer", "answer_question", "git_question",
+        "ci_question", "project_state", "generate_completion", "generate_class",
+        "tool_calling_answer",
+        "synthesize",   # SMA — Phase 2 (le seul appel LLM du flux blackboard)
+    }
 
     yield _sse({"type": "status", "content": "Starting...", "elapsed_ms": 0})
 
@@ -1259,6 +1585,8 @@ async def stream_chat(
         "project_summary":      "Summarizing project...",
         "rag_retrieve":         "Searching codebase (RAG)...",
         "parallel_context":     "Loading context (parallel)...",
+        "gather":               "Gathering context (agents)...",
+        "synthesize":           "Synthesizing answer...",
         "fast_answer":          "Generating response...",
         "answer_question":      "Generating response...",
         "git_question":         "Analyzing git history...",
@@ -1316,6 +1644,19 @@ async def stream_chat(
             elif kind == "on_chain_end":
                 output = data.get("output", {})
 
+                # Télémétrie : additionne les appels LLM reportés par les NŒUDS LLM
+                # uniquement (l'événement terminal du graphe réexpose le total réduit
+                # → l'allow-list évite le double comptage).
+                if node_name in _LLM_NODES and isinstance(output, dict):
+                    if "llm_calls" in output:
+                        try:
+                            total_llm_calls += int(output.get("llm_calls") or 0)
+                        except (TypeError, ValueError):
+                            pass
+                    if "quality_score" in output:   # Phase 6 — dernier nœud de réponse
+                        final_quality_score = output.get("quality_score")
+                        final_quality_flags = output.get("quality_flags") or []
+
                 if node_name == "load_memory" and isinstance(output, dict):
                     final_session_id = output.get("session_id", final_session_id)
 
@@ -1336,6 +1677,14 @@ async def stream_chat(
 
                 elif node_name == "load_file_context" and isinstance(output, dict):
                     final_target_file = output.get("target_file", final_target_file)
+
+                elif node_name == "gather" and isinstance(output, dict):
+                    # Phase 4.1 — agents blackboard réellement activés pour ce tour
+                    final_active_agents = output.get("active_agents") or final_active_agents
+
+                elif node_name == "tool_calling_answer" and isinstance(output, dict):
+                    # Phase 4.3 — outils réellement appelés par l'escalade ReAct
+                    final_tools_called = output.get("tools_called") or final_tools_called
 
                 elif node_name in _GEN_NODES and isinstance(output, dict):
                     in_generation = False   # fin génération → on ré-autorise le streaming
@@ -1360,6 +1709,11 @@ async def stream_chat(
             "elapsed_seconds": round(time.time() - started_at, 2),
             "response": final_response,
             "context_sources": final_context_sources,
+            "llm_calls": total_llm_calls,       # Phase 0.2 — coût LLM du tour (télémétrie)
+            "active_agents": final_active_agents,  # Phase 4.1 — observabilité SMA (vide en mode legacy)
+            "tools_called": final_tools_called,    # Phase 4.3 — outils de l'escalade ReAct (vide si pas d'escalade)
+            "quality_score": final_quality_score,  # Phase 6 — garde-fou qualité (None si non évalué)
+            "quality_flags": final_quality_flags,
         })
 
     except Exception as e:

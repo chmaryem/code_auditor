@@ -119,6 +119,66 @@ async def _resolve_active_repo(principal: Principal, db: AsyncSession) -> Option
     return result.scalar_one_or_none()
 
 
+async def _attach_source_meta(
+    event_dicts: List[Dict[str, Any]],
+    events: List[HistoryEvent],
+    db: AsyncSession,
+) -> None:
+    """Batch-resolve source objects and attach a compact `source_meta` to each
+    event dict so the timeline can render source-aware rich rows without an
+    extra round-trip per event.
+    """
+    ids_by_module: Dict[str, List[str]] = {}
+    for e in events:
+        if e.source_id:
+            ids_by_module.setdefault(e.source_module, []).append(e.source_id)
+
+    meta_map: Dict[str, Dict[str, Any]] = {}
+
+    cicd_ids = ids_by_module.get("cicd")
+    if cicd_ids:
+        rows = await db.execute(
+            select(
+                CICDReport.id, CICDReport.outcome,
+                CICDReport.stage_failed, CICDReport.repo,
+            ).where(CICDReport.id.in_(cicd_ids))
+        )
+        for rid, outcome, stage, repo in rows.all():
+            meta_map[rid] = {
+                "kind": "cicd", "outcome": outcome,
+                "stage_failed": stage, "repo": repo,
+            }
+
+    git_ids = ids_by_module.get("smart_git")
+    if git_ids:
+        rows = await db.execute(
+            select(
+                GitReport.id, GitReport.verdict, GitReport.total_score,
+                GitReport.report_type, GitReport.branch,
+            ).where(GitReport.id.in_(git_ids))
+        )
+        for rid, verdict, score, rtype, branch in rows.all():
+            meta_map[rid] = {
+                "kind": "smart_git", "verdict": verdict, "total_score": score,
+                "report_type": rtype, "branch": branch,
+            }
+
+    chat_ids = ids_by_module.get("chat")
+    if chat_ids:
+        rows = await db.execute(
+            select(
+                Conversation.id, Conversation.turn_count, Conversation.intent,
+            ).where(Conversation.id.in_(chat_ids))
+        )
+        for rid, turns, intent in rows.all():
+            meta_map[rid] = {
+                "kind": "chat", "turn_count": turns, "intent": intent,
+            }
+
+    for d in event_dicts:
+        d["source_meta"] = meta_map.get(d.get("source_id"))
+
+
 # ── GET /history/summary ──────────────────────────────────────────────────────
 
 @history_router.get("/summary")
@@ -126,13 +186,20 @@ async def get_summary(
     principal: Principal = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    user_id = await _get_pg_user_id(principal.email, db)
-    if not user_id:
+    from database.models import User
+
+    user_row = (
+        await db.execute(
+            select(User.id, User.active_github_repo).where(User.email == principal.email)
+        )
+    ).first()
+    if not user_row:
         return {
             "conversations_count": 0, "cicd_analyses_count": 0,
             "git_reviews_count": 0, "fixes_count": 0,
             "open_issues_count": 0, "last_activity": None, "active_repository": None,
         }
+    user_id, active_repo = user_row
 
     cached = cache.get_summary(user_id)
     if cached:
@@ -140,7 +207,7 @@ async def get_summary(
 
     repo = HistoryEventRepo(db)
     data = await repo.get_summary(user_id)
-    data["active_repository"] = await _resolve_active_repo(principal, db)
+    data["active_repository"] = active_repo
 
     cache.set_summary(user_id, data)
     return data
@@ -202,8 +269,11 @@ async def get_timeline(
 
     next_cursor = events[-1].created_at.isoformat() if has_more and events else None
 
+    event_dicts = [HistoryEventOut.from_orm(e).model_dump() for e in events]
+    await _attach_source_meta(event_dicts, events, db)
+
     result = {
-        "events": [HistoryEventOut.from_orm(e).model_dump() for e in events],
+        "events": event_dicts,
         "next_cursor": next_cursor,
         "has_more": has_more,
     }

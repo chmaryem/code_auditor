@@ -37,7 +37,10 @@ class APIConfig(BaseModel):
     openrouter_model:   str = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-coder:free")
 
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
-    groq_model:   str = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    groq_model: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    kimi_api_key: str = os.getenv("KIMI_API_KEY", "")
+    kimi_model:   str = os.getenv("KIMI_MODEL", "kimi-k3")
 
     gemini_api_key: str = os.getenv("GOOGLE_API_KEY", "")
     gemini_model:   str = os.getenv("GEMINI_MODEL",   "gemini-2.0-flash")
@@ -45,19 +48,7 @@ class APIConfig(BaseModel):
     temperature: float = 0.0
     max_tokens:  int   = 16384
 
-    # ── P2 · Routage par complexité ──────────────────────────────────────────
-    # Le Decision Agent classe chaque message du chat en : fast | context | deep
-    # (voir langchain_agents/agents/lc_chat_decision_agent.py). Ce mapping choisit
-    # QUEL modèle répond à chaque niveau — sans toucher au reste du code.
-    #
-    # 👉 TU GARDES LA MAIN : change provider/model ci-dessous (ou via .env) quand
-    #    tu auras figé ton choix de modèles. C'est le SEUL endroit à éditer.
-    #      provider ∈ {"groq", "openrouter", "gemini"}
-    #      model    : "" → modèle par défaut du provider
-    #                 (groq_model / openrouter_model / gemini_model ci-dessus)
-    #
-    # ROUTE_BY_COMPLEXITY=false → revient à « un seul modèle pour tout » (ancien
-    # comportement, aucun routage).
+   
     route_by_complexity: bool = os.getenv("ROUTE_BY_COMPLEXITY", "true").lower() == "true"
 
     fast_provider:    str = os.getenv("FAST_PROVIDER",    "groq")        # question simple → rapide / pas cher
@@ -80,6 +71,29 @@ class APIConfig(BaseModel):
         return table.get(level, (self.context_provider, self.context_model))
 
 
+class ChatConfig(BaseModel):
+
+  
+    orchestrator: str = os.getenv("CHAT_ORCHESTRATOR", "blackboard")
+
+   
+    router_regex_first: bool = os.getenv("CHAT_ROUTER_REGEX_FIRST", "true").lower() == "true"
+  
+    router_regex_min_confidence: float = float(os.getenv("CHAT_ROUTER_REGEX_MIN_CONF", "0.85"))
+
+   
+   
+    semantic_memory_every: int = int(os.getenv("CHAT_SEMANTIC_MEMORY_EVERY", "3"))
+
+   
+    decision_cache_enabled: bool = os.getenv("CHAT_DECISION_CACHE", "true").lower() == "true"
+    decision_cache_ttl: int = int(os.getenv("CHAT_DECISION_CACHE_TTL", "900"))  # 15 min
+    history_turns: int = int(os.getenv("CHAT_HISTORY_TURNS", "8"))
+    rag_top_k: int = int(os.getenv("CHAT_RAG_TOPK", "6"))
+
+    quality_guard_enabled: bool = os.getenv("CHAT_QUALITY_GUARD", "true").lower() == "true"
+
+
 class RAGConfig(BaseModel):
     embedding_model:     str   = "jinaai/jina-embeddings-v2-base-code"
     embedding_dimension: int   = 768
@@ -90,11 +104,7 @@ class RAGConfig(BaseModel):
     chunk_overlap:       int   = 150
     top_k:               int   = 8
     relevance_threshold: float = 0.45
-
-    # ── P4 · Compression contextuelle ─────────────────────────────────────────
-    # Filtre les docs RAG (anti-doublons + pertinence) AVANT le prompt, sans appel
-    # LLM. Réduit les tokens à qualité égale. Mettre RAG_COMPRESSION=false pour
-    # désactiver. compression_threshold : 0-1, plus haut = plus strict (jette plus).
+    
     compression_enabled:   bool  = os.getenv("RAG_COMPRESSION", "true").lower() == "true"
     compression_threshold: float = float(os.getenv("RAG_COMPRESSION_THRESHOLD", "0.70"))
     compression_min_keep:  int   = 2
@@ -248,15 +258,14 @@ class Config:
     VECTOR_STORE_DIR   = DATA_DIR / "vector_store"
     CACHE_DIR          = DATA_DIR / "cache"
     KG_PATH            = DATA_DIR / "knowledge_graph.json"
-    # Racine de persistance ChromaDB pour les collections "directes" (client
-    # chromadb natif), p.ex. la mémoire sémantique du chat → data/semantic_memory.
-    # Les autres collections (LangChain Chroma) gèrent leur propre persist_directory.
+    
     CHROMA_PERSIST_DIR = DATA_DIR
 
     for _d in [DATA_DIR, KNOWLEDGE_BASE_DIR, VECTOR_STORE_DIR, CACHE_DIR]:
         _d.mkdir(parents=True, exist_ok=True)
 
     api       = APIConfig()
+    chat      = ChatConfig()
     rag       = RAGConfig()
     analysis  = AnalysisConfig()
     watcher   = WatcherConfig()

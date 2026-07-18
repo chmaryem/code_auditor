@@ -105,7 +105,11 @@ class LCLearningAgent:
             f"5. Severity: CRITICAL | HIGH | MEDIUM | LOW\n\n"
             f"Output ONLY the markdown rule. No explanations."
         )
-        return invoke_with_fallback(prompt, label=f"learn:{pattern}")
+        # This is a background, optional suggestion (Accept/Reject in the UI), not
+        # a result the developer is blocked on — unlike the primary code analysis,
+        # it must not hold a worker thread for minutes waiting on quota backoff.
+        # max_retries=1: one attempt per provider, fail fast to the next.
+        return invoke_with_fallback(prompt, label=f"learn:{pattern}", max_retries=1)
 
     # ── Tool: KB promotion ───────────────────────────────────────────────────
 

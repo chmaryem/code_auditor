@@ -161,8 +161,27 @@ def _build_llm_with_fallback():
 
     llms = []
 
-    # Primary: Groq (rapide + fiable — OpenRouter free est très souvent saturé en 429,
-    # ce qui faisait perdre un aller-retour à CHAQUE analyse avant ce changement)
+    # Primary: Kimi/Moonshot (TPM 500k — largement au-dessus des prompts RAG-lourds
+    # de test-gen, contrairement au tier gratuit Groq plafonné à 6-8k TPM qui
+    # renvoyait 413 Payload Too Large sur les prompts >8k tokens).
+    kimi_key = config.api.kimi_api_key or os.getenv("KIMI_API_KEY", "")
+    if kimi_key:
+        try:
+            from langchain_openai import ChatOpenAI
+            llms.append(ChatOpenAI(
+                model=config.api.kimi_model,
+                api_key=kimi_key,
+                base_url="https://api.moonshot.ai/v1",
+                temperature=config.api.temperature,
+                max_tokens=config.api.max_tokens,
+                max_retries=1,
+                model_kwargs={"frequency_penalty": 0.4},
+            ))
+        except Exception as e:
+            logger.debug("Kimi LLM build failed: %s", e)
+
+    # Fallback 1: Groq (rapide + fiable pour les petits prompts — attention à sa
+    # limite TPM basse en tier gratuit sur les prompts volumineux)
     groq_key = config.api.groq_api_key or os.getenv("GROQ_API_KEY", "")
     if groq_key:
         try:
@@ -172,7 +191,10 @@ def _build_llm_with_fallback():
                 api_key=groq_key,
                 base_url="https://api.groq.com/openai/v1",
                 temperature=config.api.temperature,
-                max_tokens=min(config.api.max_tokens, 8192),  # marge sous la TPM Groq (30k)
+                # 4096 (pas 8192) : un fichier de test dépasse rarement cette taille, et ça
+                # libère la majeure partie du budget TPM gratuit pour le prompt lui-même —
+                # le "Requested" des erreurs 413 Groq inclut prompt + max_tokens réservé.
+                max_tokens=min(config.api.max_tokens, 4096),
                 max_retries=1,
                 # frequency_penalty discourages the "Best regards / Have a great day"
                 # sign-off loop some Llama models fall into at temperature=0.
@@ -181,7 +203,7 @@ def _build_llm_with_fallback():
         except Exception as e:
             logger.debug("Groq LLM build failed: %s", e)
 
-    # Fallback 1: OpenRouter (utilisé seulement si Groq est indisponible)
+    # Fallback 2: OpenRouter (utilisé seulement si Kimi et Groq sont indisponibles)
     api_key = config.api.openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "")
     if api_key:
         try:
@@ -202,7 +224,7 @@ def _build_llm_with_fallback():
         except Exception as e:
             logger.debug("OpenRouter LLM build failed: %s", e)
 
-    # Fallback 2: Gemini
+    # Fallback 3: Gemini
     gemini_key = config.api.gemini_api_key or os.getenv("GOOGLE_API_KEY", "")
     if gemini_key:
         try:

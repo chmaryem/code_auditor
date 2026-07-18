@@ -6,7 +6,8 @@ This is the ONLY place where state schemas are defined.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, TypedDict
+import operator
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 
 class WatchState(TypedDict, total=False):
@@ -195,6 +196,10 @@ class ChatState(TypedDict, total=False):
     decision_plan: Dict[str, Any]
     context_level: str        # "fast" | "context" | "deep"
     selected_agents: List[str]
+    active_agents: List[str]  # agents blackboard réellement activés (SMA — Phase 2)
+    tools_called: List[str]   # outils appelés lors de l'escalade ReAct (SMA — Phase 4)
+    quality_score: float      # garde-fou qualité déterministe 0-1 (SMA — Phase 6)
+    quality_flags: List[str]  # signaux qualité (empty_or_failed | not_grounded | thin)
     needs_rag: bool
     needs_git: bool
     needs_ci: bool
@@ -231,6 +236,12 @@ class ChatState(TypedDict, total=False):
     code_blocks: List[Dict[str, Any]]
     suggested_files: List[str]
     stats: Dict[str, Any]
+
+    # ── Télémétrie (migration SMA — Phase 0.2) ───────────────────────────────
+    # Compteur d'appels LLM de PREMIER PLAN pour ce tour. Reducer additif : chaque
+    # nœud qui appelle le LLM retourne {"llm_calls": n}, LangGraph somme le tout.
+    # Sert à chiffrer le gain tokens "avant/après" (exposé dans l'événement `done`).
+    llm_calls: Annotated[int, operator.add]
 
     # ── AI Settings (loaded from PostgreSQL per user, defaults used if absent) ──
     ai_temperature: float        # 0.0–1.0, default 0.3

@@ -225,9 +225,10 @@ class PersistentChatMemoryService:
           2. Redis (cache chaud)
         """
         from database.connection import SyncSessionLocal
-        from database.models import Conversation, Message, User
+        from database.models import Conversation, HistoryEvent, Message, User
         from datetime import datetime, timezone
         from sqlalchemy import select, update as sa_update
+        import uuid as _uuid_mod
 
         def _now() -> datetime:
             return datetime.now(timezone.utc)
@@ -272,6 +273,7 @@ class PersistentChatMemoryService:
                 conv = db.execute(
                     select(Conversation).where(Conversation.session_id == session_id)
                 ).scalar_one_or_none()
+                is_new_conv = conv is None
                 if not conv:
                     conv = Conversation(
                         session_id=session_id,
@@ -283,6 +285,25 @@ class PersistentChatMemoryService:
                     )
                     db.add(conv)
                     db.flush()
+
+                    # Emit one history event per new conversation (mirrors the
+                    # cicd/smart_git producers in ci_router.py / git_router.py).
+                    # Turn count / intent are read live from `conversations` at
+                    # timeline time (see _attach_source_meta), so this row does
+                    # not need to be updated on later turns.
+                    db.add(HistoryEvent(
+                        id            = _uuid_mod.uuid4().hex,
+                        user_id       = pg_user.id,
+                        event_type    = "chat_started",
+                        source_module = "chat",
+                        source_id     = conv.id,
+                        title         = title,
+                        summary       = (intent or user_message)[:300],
+                        severity      = "info",
+                        status        = "completed",
+                        metadata_     = {"session_id": session_id, "intent": intent},
+                        created_at    = _now(),
+                    ))
 
                 # Append messages
                 db.add(Message(
@@ -313,6 +334,20 @@ class PersistentChatMemoryService:
                     )
                 )
                 db.commit()
+
+                # Invalidate history cache + notify WS clients so the dashboard
+                # History page picks up the new conversation / updated turn
+                # count without waiting for its next poll.
+                try:
+                    from services import history_cache_service as _hcs
+                    _hcs.invalidate(pg_user.id)
+                except Exception:
+                    pass
+                try:
+                    from api.ws_broadcast import broadcast_from_thread
+                    broadcast_from_thread({"type": "history_update", "module": "chat"})
+                except Exception:
+                    pass
         except Exception as exc:
             logger.warning(
                 "save_exchange_sync: PG write failed (session=%s): %s",

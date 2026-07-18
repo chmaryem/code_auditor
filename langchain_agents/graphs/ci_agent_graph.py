@@ -50,6 +50,9 @@ class CIAgentState(CIState, total=False):
     diagnostic_output: str
     security_output: str
     remediation_output: str
+    diagnostic_used_tools: bool   # did the diagnostic agent call any tool?
+    quality_score: float          # deterministic quality guard (0-1)
+    quality_flags: List[str]      # e.g. ["fix_generic", "not_grounded"]
 
 
 # ── Agent nodes ────────────────────────────────────────────────────────────────
@@ -101,11 +104,13 @@ def node_diagnostic(state: CIAgentState) -> CIAgentState:
         context=_agent_context(state),
     )
     response = result.get("response", "")
+    used_tools = bool(result.get("tools_called"))
     # Clean fallback: if the agent's LLM failed (429/400/timeout), use the
     # deterministic analyzer instead of surfacing a raw error to the user.
     if result.get("llm_error") or _is_llm_error_text(response):
         response = _deterministic_ci_analysis(state)
-    return {**state, "diagnostic_output": response}
+        used_tools = True  # deterministic analyzer reads the real logs
+    return {**state, "diagnostic_output": response, "diagnostic_used_tools": used_tools}
 
 
 def node_security_triage(state: CIAgentState) -> CIAgentState:
@@ -160,8 +165,37 @@ def node_consolidate(state: CIAgentState) -> CIAgentState:
         if det_fix and not suggested_fix:
             suggested_fix = det_fix
 
-    # If no agent ran (e.g. success), leave fields as-is.
+    # Deterministic quality guard (0 LLM call): score the answer's structural
+    # reliability. If it's critically low (generic + not grounded), prefer a
+    # deterministic analysis rather than trusting a weak LLM answer.
     updates: Dict[str, Any] = {}
+    if root_cause:
+        from langchain_agents.graphs.response_quality import (
+            assess_quality, CRITICAL_THRESHOLD,
+        )
+        q = assess_quality(
+            root_cause=root_cause,
+            suggested_fix=suggested_fix,
+            context_text=state.get("logs", "") or "",
+            used_tools=bool(state.get("diagnostic_used_tools")),
+        )
+        if q["score"] < CRITICAL_THRESHOLD:
+            det = _deterministic_ci_analysis(state)
+            det_rc, det_fix = _parse_root_cause_fix(det)
+            if det_rc:
+                root_cause = det_rc
+            if det_fix:
+                suggested_fix = det_fix
+            # Re-score the deterministic answer for transparency.
+            q = assess_quality(
+                root_cause=root_cause, suggested_fix=suggested_fix,
+                context_text=state.get("logs", "") or "", used_tools=True,
+            )
+            logger.info("[CIAgentGraph] low-quality answer → deterministic fallback")
+        updates["quality_score"] = q["score"]
+        updates["quality_flags"] = q["flags"]
+
+    # If no agent ran (e.g. success), leave fields as-is.
     if root_cause:
         updates["root_cause"] = root_cause
     if suggested_fix:

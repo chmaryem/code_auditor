@@ -245,14 +245,22 @@ class LCChatAgent:
 {question}"""
 
     def _build_context_prompt(self, state: Dict[str, Any]) -> tuple[ChatPromptTemplate, Dict[str, Any]]:
-        history = state.get("history", [])[-8:]
+        # Phase 1.4 (migration SMA) : bornes de contexte pilotées par config
+        # (défauts = valeurs historiques 8 tours / 6 docs → aucun changement de
+        # comportement ; abaissables via CHAT_HISTORY_TURNS / CHAT_RAG_TOPK pour
+        # réduire les tokens après validation).
+        from config import config as _cfg
+        _hist_turns = getattr(_cfg.chat, "history_turns", 8)
+        _rag_topk   = getattr(_cfg.chat, "rag_top_k", 6)
+
+        history = state.get("history", [])[-_hist_turns:]
         # AI settings from PostgreSQL (injected by node_load_ai_settings)
         max_ctx       = state.get("ai_max_context", 8000)
         response_style = state.get("ai_response_style", "detailed")
         ai_mode       = state.get("ai_mode", "balanced")
         use_rag       = state.get("ai_use_rag", True)
 
-        rag_docs = state.get("rag_docs", [])[:6] if use_rag else []
+        rag_docs = state.get("rag_docs", [])[:_rag_topk] if use_rag else []
         project_summary = state.get("project_summary", {})
         file_code = state.get("file_code", "")
         file_analysis = state.get("file_analysis", {})
@@ -523,6 +531,58 @@ class LCChatAgent:
             "Je n'ai pas pu appeler le LLM pour répondre. "
             "Le contexte a été chargé, mais vérifie tes clés OpenRouter/Gemini."
         )
+
+    # ── Migration SMA — Synthèse blackboard (Phase 2) ──────────────────────
+
+    @staticmethod
+    def _render_blackboard_signals(state: Dict[str, Any]) -> str:
+        """Rend les signaux déterministes du blackboard (git, CI, état projet) en
+        texte compact, injecté dans la question pour l'unique appel LLM de synthèse.
+
+        Reproduit la logique d'enrichissement des anciens nœuds node_ci_question /
+        node_project_state / node_git_question, mais à partir du blackboard rempli
+        par les agents spécialisés au lieu d'appels séparés."""
+        import json
+
+        blocks: list[str] = []
+
+        git = state.get("git_context") or {}
+        if git:
+            blocks.append("[Git session snapshot]\n" + json.dumps(git, default=str)[:800])
+
+        psc = state.get("project_state_context") or {}
+        if psc:
+            parts = ["[Project state snapshot]"]
+            for key, section in psc.items():
+                if isinstance(section, dict) and section.get("available"):
+                    body = json.dumps({k: v for k, v in section.items() if k != "available"},
+                                      default=str)[:600]
+                    parts.append(f"- {key}: {body}")
+                elif isinstance(section, dict):
+                    parts.append(f"- {key}: unavailable ({section.get('reason', '')})")
+            blocks.append("\n".join(parts))
+
+        if not blocks:
+            return ""
+
+        return (
+            "\n\n".join(blocks)
+            + "\n\nUsing ONLY the signals above plus the file/RAG context provided, "
+            "answer the developer. If a signal is unavailable, say so briefly instead "
+            "of guessing. Prioritize what's blocking or risky, then concrete next actions."
+        )
+
+    async def asynthesize(self, state: Dict[str, Any], config: Any = None) -> str:
+        """Synthèse unique du flux blackboard : agrège les sections du blackboard
+        (fichier, RAG, git, CI, état projet, historique) en UN seul appel LLM streamé.
+
+        Réutilise aanswer() → le mode général (salutation / dashboard sans fichier),
+        la construction du prompt et le streaming sont hérités sans duplication."""
+        signals = self._render_blackboard_signals(state)
+        st = dict(state)
+        if signals:
+            st["user_message"] = (state.get("user_message", "") or "") + "\n\n" + signals
+        return await self.aanswer(st, config=config)
 
     # ── Phase 2 — Code generation ──────────────────────────────────────────
 

@@ -929,16 +929,14 @@ def _codeql_job(profile: ProjectProfile) -> str:
     if profile.build_system == "maven":
         build_step = f"""
       - name: "Build (CodeQL)"
-        run: mvn -B compile -DskipTests -q
-        continue-on-error: true"""
+        run: mvn -B compile -DskipTests -q"""
         # Maven: autobuild non nécessaire — on compile manuellement
         # CodeQL traque la compilation via son agent Java
         use_autobuild = False
     elif profile.build_system == "gradle":
         build_step = """
       - name: "Build (CodeQL)"
-        run: chmod +x ./gradlew && ./gradlew compileJava -x test
-        continue-on-error: true"""
+        run: chmod +x ./gradlew && ./gradlew compileJava -x test"""
         use_autobuild = False
     elif profile.build_system == "npm":
         build_step = """

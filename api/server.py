@@ -751,6 +751,15 @@ async def watch_start(req: WatchStartRequest):
 async def watch_stop(req: WatchStartRequest):
     """Arrête la surveillance d'un projet."""
     proj_key = str(Path(req.project_path).resolve())
+
+    # Purge the cached events snapshot for this project. Without this, the
+    # in-memory _watch_last_events kept the LAST analysis of the previous session,
+    # and the plugin's loadLatestEvents() replayed those stale results into the
+    # tree on the next watch/start (e.g. after a logout + reload) even though the
+    # developer made no new edit. Cleared unconditionally — even if the watcher was
+    # already gone — so a stop always yields a clean slate for the next session.
+    _watch_last_events.pop(proj_key, None)
+
     ctx = _watch_active.pop(proj_key, None)
     if not ctx:
         return {"status": "not_running"}
