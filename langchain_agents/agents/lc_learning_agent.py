@@ -1,15 +1,3 @@
-"""
-lc_learning_agent.py — LangChain LearningAgent.
-
-4 Pillars:
-  LLM     : For generalizing a fix → reusable KB rule
-  Tools   : tool_write_kb_rule, tool_reload_chromadb, tool_check_rule_exists
-  Memory  : PatternMemory (Redis Sorted Set) — tracks pattern frequency
-  Planning: Conditional promotion (pattern seen 3+ times → promote to KB)
-
-This agent handles self-improvement: it learns from developer feedback
-and promotes recurring patterns into permanent Knowledge Base rules.
-"""
 from __future__ import annotations
 
 import json
@@ -23,15 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class LCLearningAgent:
-    """
-    LangChain LearningAgent — self-improving knowledge base.
-
-    Anatomy:
-      - LLM:      For rule generalization (invoke_with_fallback)
-      - Tools:    KB file operations
-      - Memory:   PatternMemory (Redis) — frequency tracking
-      - Planning: 3+ occurrences → auto-promote; CRITICAL → immediate promote
-    """
+   
 
     PROMOTION_THRESHOLD = 3
     CRITICAL_AUTO_PROMOTE = True
@@ -123,17 +103,7 @@ class LCLearningAgent:
         language: str,
         rule_content: str,
     ) -> Optional[Path]:
-        """
-        Stage a learned rule for HUMAN APPROVAL (Tool pillar).
-
-        Writes the rule to data/knowledge_base/{language}/pending/ instead of
-        learned/. The developer reviews it in the plugin and explicitly accepts
-        (→ moved to learned/, used by RAG) or rejects (→ deleted). Auto-writing to
-        learned/ without consent was incorrect: it silently changed the KB the
-        auditor relies on.
-
-        Returns the pending file path, or None on failure.
-        """
+      
         from config import config
 
         pending_dir = config.KNOWLEDGE_BASE_DIR / language / "pending"

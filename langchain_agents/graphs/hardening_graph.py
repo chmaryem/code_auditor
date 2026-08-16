@@ -1,31 +1,4 @@
-"""
-hardening_graph.py — Agentic file-hardening loop (HardeningGraph).
 
-THE FIRST CYCLIC GRAPH in the platform. Unlike WatchGraph (acyclic fan-out),
-this graph loops until the file is clean, the goal score is reached,
-or the agent is stuck.
-
-Graph topology:
-  START → analyze → plan ──► fix → verify → decide ──┐
-                     │                                  │
-                     │  (loop back)  ◄──────────────────┘
-                     └──► done / stuck / escalate → END
-
-Conditional edges:
-  - plan:   no_fixable_issue → done
-  - decide: keep      → plan   (next issue)
-            retry     → fix    (same issue, different approach)
-            stuck     → done   (max retries on this issue)
-            max_iter  → done   (hard brake)
-
-Design principles:
-  - All nodes use lazy imports (same as watch_graph.py)
-  - State accumulates attempts[] so the agent NEVER retries a failed approach
-  - _fix_breaks_code is the FIRST verify gate (< 50ms, no LLM)
-  - TestRunner runs AFTER static gate — only on impacted tests
-  - _broadcast callback pushes live events to SSE/WS (same as _ws_broadcast)
-  - Nothing is written to disk — staged_patches holds in-memory patches only
-"""
 from __future__ import annotations
 
 import hashlib

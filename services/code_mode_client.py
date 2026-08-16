@@ -1,6 +1,3 @@
-"""
-code_mode_client.py — Client API pour le MCP Code Mode.
-"""
 
 from __future__ import annotations
 

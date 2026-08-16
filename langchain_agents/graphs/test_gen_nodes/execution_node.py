@@ -1,17 +1,4 @@
-"""
-execution_node.py — ExecutionAgent (+ finalize).
 
-Wraps step 12 of generate_for_file() and the result/cache assembly:
-
-  node_execution — only reached when write=True. Writes the test to disk,
-      runs it (pytest / mvn|gradle / jest via TestRunner), and on failure routes
-      back to GenerationAgent for one runtime retry (MAX_RETRY_RUNTIME = 1). A
-      passing RETRY run flips validated → True, mirroring the original.
-
-  node_finalize — builds the exact result dict returned by generate_for_file()
-      and writes the Redis cache (Memory out) only when validated AND the tests
-      passed (or were never run, i.e. write=False → run_result is None).
-"""
 from __future__ import annotations
 
 import logging
@@ -83,12 +70,7 @@ def node_execution(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _normalize_review_notes(review_notes: Any) -> Dict[str, Any]:
-    """
-    TestReviewAgent (additif) : garantit que review_notes a toujours ses 2
-    sous-clés (semantic_review, runtime_diagnosis), défaut None si absentes —
-    évite tout KeyError côté consommateur (ex. write=False où le job (b) ne
-    tourne jamais).
-    """
+ 
     notes = dict(review_notes or {})
     notes.setdefault("semantic_review", None)
     notes.setdefault("runtime_diagnosis", None)

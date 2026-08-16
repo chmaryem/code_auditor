@@ -18,18 +18,6 @@ from services.llm_factory import invoke_with_fallback
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# KNOWLEDGE GRAPH — Phase 1
-#
-# Remplace _SECURITY_PATTERNS hardcodé par le KnowledgeGraph.
-#
-# Avant : dict Python statique dans ce fichier
-#         → impossible à modifier sans toucher au code
-#         → retourne juste True/False (code risqué ou non)
-#
-# Après : KnowledgeGraph chargé depuis data/knowledge_graph.json
-#         → modifiable via les fichiers .md et PATTERN_TO_KG_NODE
-#         → retourne les NŒUDS KG précis (SQL_Injection, Resource_Leak...)
-#         → ces nœuds seront utilisés pour enrichir les requêtes RAG
 
 
 from services.knowledge_graph import knowledge_graph
@@ -810,8 +798,7 @@ ANALYZE NOW — START WITH ---DECISION---:"""
 
         return prompt
 
-    # ── Analyse principale ────────────────────────────────────────────────────
-
+ 
     def analyze_code_with_rag(
         self,
         code: str,
@@ -867,13 +854,13 @@ ANALYZE NOW — START WITH ---DECISION---:"""
                 min_keep             = config.rag.compression_min_keep,
             )
 
-        # 2. Formatage du contexte de connaissance
+       
         knowledge_context = self._build_knowledge_context(relevant_docs, rag_scores)
 
-        # 3. Construction du prompt
+       
         prompt = self._build_prompt(code, context, knowledge_context)
 
-        # 4. Appel LLM — OpenRouter/MiniMax (fallback Gemini)
+     
         analysis = invoke_with_fallback(
             prompt,
             temperature = config.api.temperature,
@@ -893,8 +880,6 @@ ANALYZE NOW — START WITH ---DECISION---:"""
             "code":               code,
             "context":            context,
         }
-
-    # ── Chunking — découpage par méthodes ─────────────────────────────────────
 
     @staticmethod
     def _chunk_code_by_methods(code: str, language: str, max_chunk: int = 4000) -> list[str]:
@@ -1034,11 +1019,6 @@ ANALYZE NOW — START WITH ---DECISION---:"""
             "code":               code,
             "context":            context,
         }
-
-    # ── Plan de refactoring ───────────────────────────────────────────────────
-
-
-    # ── Solution Generator ────────────────────────────────────────────────────
 
     def generate_complete_solution(
         self,

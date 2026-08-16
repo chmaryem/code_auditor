@@ -1,25 +1,4 @@
-"""
-chat_graph.py — LangGraph ChatGraph.
 
-Goal:
-  Provide a conversational entry point over the existing Code Auditor systems.
-
-Architecture:
-  load_memory → intent_router → decision_agent
-    → route decision:
-        - CI/Git questions can skip file context
-        - code questions load file context
-    → route file context:
-        - fast explain
-        - contextual Q&A
-        - code generation
-        - test generation placeholder
-    → memory_save → format_response → END
-
-Streaming:
-  stream_chat() uses LangGraph astream_events() and yields SSE events:
-    status | token | code | done | error
-"""
 from __future__ import annotations
 
 import asyncio
@@ -36,9 +15,6 @@ from langchain_agents.graphs.state import ChatState
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Initial state helper
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _initial_state(
     message: str,
@@ -131,10 +107,6 @@ def _initial_state(
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Nodes — Memory + Intent + Decision
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def node_load_ai_settings(state: ChatState) -> Dict[str, Any]:
     """Load per-user AI settings from PostgreSQL. Falls back to defaults silently."""
     user_id = state.get("user_id", "")
@@ -206,13 +178,7 @@ def _decision_cache_key(state: ChatState) -> str:
 
 
 def _cached_or_decide(state: ChatState, agent: Any) -> Dict[str, Any]:
-    """
-    Phase 1.3 (migration SMA) — cache Redis des décisions de routage.
-
-    Ne met en cache QUE les décisions issues du LLM (les seules coûteuses en
-    tokens) ; les décisions regex/cache sont recalculées gratuitement. Tout échec
-    Redis ⇒ recalcul → comportement rigoureusement identique à l'absence de cache.
-    """
+   
     from config import config as _cfg
 
     def _decide() -> Dict[str, Any]:
@@ -265,12 +231,7 @@ def _cached_or_decide(state: ChatState, agent: Any) -> Dict[str, Any]:
 
 
 def node_decision_agent(state: ChatState) -> Dict[str, Any]:
-    """
-    LLM-powered decision agent (v2).
-    Passes cursor context for IDE-aware routing.
-    Falls back to regex if LLM unavailable or low confidence.
-    Phase 1.1/1.3 : routing regex-first + cache Redis (voir _cached_or_decide).
-    """
+  
     from langchain_agents.agents.lc_chat_decision_agent import chat_decision_agent
 
     plan = _cached_or_decide(state, chat_decision_agent)
@@ -315,10 +276,6 @@ def node_decision_agent(state: ChatState) -> Dict[str, Any]:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Nodes — Context
-# ══════════════════════════════════════════════════════════════════════════════
-
 _EXT_LANG = {
     ".py": "python", ".java": "java", ".js": "javascript", ".jsx": "javascript",
     ".ts": "typescript", ".tsx": "typescript", ".go": "go", ".rb": "ruby",
@@ -336,11 +293,7 @@ def _lang_from_path(path: str) -> str:
 
 
 def node_load_file_context(state: ChatState) -> Dict[str, Any]:
-    """Load target file, cached analysis and dependency context.
-
-    Mode dashboard (scope="dashboard") : AUCUN scan du projet local.
-    Le seul code fourni au LLM = les fichiers explicitement attachés par le dev.
-    """
+  
     # ── Périmètre dashboard : uniquement les fichiers attachés ────────────────
     if state.get("scope") == "dashboard":
         attached = state.get("attached_files") or []
@@ -519,9 +472,6 @@ def node_rag_retrieve(state: ChatState) -> Dict[str, Any]:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Nodes — Answer / Specialized paths
-# ══════════════════════════════════════════════════════════════════════════════
 
 _DASHBOARD_ATTACH_NUDGE = (
     "Pour analyser ou expliquer du code, ajoutez le(s) fichier(s) concerné(s) "

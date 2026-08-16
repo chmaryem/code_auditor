@@ -1,28 +1,4 @@
-"""
-lc_rag_curator_agent.py — LangChain RAGCuratorAgent.
 
-4 Pillars:
-  LLM     : OpenRouter/Groq/Gemini cascade via RunnableWithFallbacks (reuses
-            _build_llm_with_fallback() from lc_analysis_agent.py — no raw HTTP)
-  Tools   : N/A — single primitive (curate()), exposed as a bare public method,
-            no @tool wrapper (Pattern B already established for this module —
-            no bind_tools()/agentic loop, so a @tool would add ceremony without
-            value; see plan decision 1.2)
-  Memory  : N/A — stateless per-request filtering, no notion of "retry" or
-            "remembering a file" is relevant here
-  Planning: fixed role (Pattern B) — one LLM call per curate() invocation,
-            never an autonomous tool-calling loop
-
-Role: filters obvious false-positives out of the RAG context retrieved by
-retrieve_rag_context() (test_patterns_kb + ProjectCodeIndexer), BEFORE it
-reaches build_prompt(). Keeps the existing similarity-based ranking as-is —
-this is additive filtering only, never a full rerank.
-
-Zero-regression contract: curate() returns a dict of the EXACT SAME SHAPE as
-its input ({"test_patterns": [...], "project_examples": [...], "total_docs": int}).
-Any failure (LLM error, malformed response) returns the ORIGINAL rag_context
-unchanged — fail-silent, never raises.
-"""
 from __future__ import annotations
 
 import logging

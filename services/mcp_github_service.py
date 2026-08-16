@@ -1,25 +1,4 @@
-"""
-mcp_github_service.py — Client MCP GitHub.
 
-FIX v5 — Détection fiable des conflits :
-
-  PROBLÈME RACINE : get_pull_request() via le serveur MCP npm retourne le champ
-  'mergeable' dans un objet imbriqué parfois, ou None systématiquement car le
-  serveur normalise la réponse GitHub différemment.
-
-  SOLUTION :
-    1. Utiliser get_pull_request_status (outil dédié présent dans les 26 tools)
-       qui retourne mergeableState: "dirty" | "clean" | "unknown"
-       "dirty" = conflits confirmés, sans ambiguïté.
-    2. Si get_pull_request_status indisponible → poll get_pull_request jusqu'à
-       4 fois pour obtenir mergeable != null.
-    3. Si toujours null → comparer les listes de fichiers modifiés entre base et
-       head via l'API (pas les contenus — ça coûte trop de tokens).
-
-  FIX quota LLM :
-    - Toutes les fonctions get_file_content() limitent le retour à 8000 chars
-      max pour éviter l'explosion du contexte Gemini.
-"""
 
 from __future__ import annotations
 

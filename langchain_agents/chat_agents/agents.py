@@ -1,16 +1,4 @@
-"""
-agents.py — Agents spécialisés déterministes (0 token), scope-aware.
 
-Chacun est un FIN WRAPPER autour de la logique EXISTANTE (tools/services) — aucune
-intelligence dupliquée. La spécialisation + la décision locale (should_activate) +
-le blackboard partagé constituent la vraie couche multi-agents ; la synthèse LLM
-unique vit ailleurs (node_synthesize).
-
-Auto-désactivation en scope "dashboard" :
-  - RagAgent / SummaryAgent ne s'activent pas (le dashboard ne scanne pas le projet).
-  - FileAgent n'utilise que les fichiers attachés.
-Ceci reproduit exactement le comportement actuel des deux surfaces.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -23,11 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class FileAgent(BlackboardAgent):
-    """Charge le contexte fichier (attachés en dashboard, target_file en extension).
-
-    Réutilise node_load_file_context : même logique que le flux legacy, y compris la
-    résolution de fichier, l'analyse cachée et le voisinage (dependencies/dependents).
-    """
+ 
 
     name = "file"
     wave = 0  # doit produire file_code AVANT RagAgent
@@ -111,10 +95,7 @@ class CiAgent(BlackboardAgent):
 
 
 class ProjectStateAgent(BlackboardAgent):
-    """Snapshot d'état projet (git risk + secrets + test gaps + sécurité + CI).
-
-    Actif sur l'intent project_state. Réutilise tool_chat_project_state_summary.
-    """
+   
 
     name = "project_state"
 

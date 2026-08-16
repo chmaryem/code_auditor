@@ -1,11 +1,4 @@
-"""
-AnalysisAgent — Construit le contexte, appelle le LLM, valide les résultats.
 
-Contient (migrés depuis incremental_analyzer.py) :
-  - build_system_impact_section() : section [IMPACT SUR LE SYSTÈME] pour le prompt
-  - build_context()               : construit le dict de contexte pour le LLM
-  - analyze()                     : appelle llm_service + valide les blocs
-"""
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -18,17 +11,7 @@ from validators.fix_validator import fix_validator, FixBlock
 # Parser de réponse agentique
 
 def parse_llm_response(raw: str) -> dict:
-    """
-    Lit la réponse agentique de Gemini et extrait :
-      - strategy   : "full_class" | "targeted_methods" | "block_fix"
-      - scope      : description du périmètre
-      - reason     : pourquoi cette stratégie
-      - payload    : contenu adapté à la stratégie
-        full_class        → {"class_code": str, "changes": list}
-        targeted_methods  → {"methods": [{"name": str, "code": str, "why": str}],
-                              "remaining_blocks": list}
-        block_fix         → {"blocks": list}  (format parse_fix_blocks existant)
-    """
+  
     import re
 
     result = {
@@ -60,7 +43,7 @@ def parse_llm_response(raw: str) -> dict:
 
     strategy = result["strategy"]
 
-    # ── Extraire le payload selon la stratégie ────────────────────────────────
+
 
     if strategy == "full_class":
         sol_m = re.search(r"---SOLUTION START---[^`]*```\w*\n(.*?)```[^-]*---SOLUTION END---", raw, re.DOTALL | re.IGNORECASE)
@@ -87,9 +70,7 @@ def parse_llm_response(raw: str) -> dict:
         from output.console_renderer import parse_fix_blocks
         remaining = parse_fix_blocks(raw)
 
-        # Fallback : Gemini a choisi targeted_methods mais n'a produit aucun
-        # ---METHOD START--- block (il a probablement produit ---FIX START--- à la place)
-        # → traiter comme block_fix pour ne rien perdre
+      
         if not methods and remaining:
             import logging as _log
             _log.getLogger(__name__).debug(
@@ -109,20 +90,6 @@ def parse_llm_response(raw: str) -> dict:
 
 
 def parse_dependent_fixes(raw: str, main_file: str) -> list[dict]:
-    """
-    Parse les corrections pour fichiers dépendants depuis la réponse LLM.
-    
-    Le LLM peut générer des ---FIX START--- blocks pour des fichiers dépendants
-    quand il détecte que le fix du fichier principal nécessite des changements
-    dans les fichiers qui l'appellent.
-    
-    Args:
-        raw: Réponse textuelle du LLM
-        main_file: Nom du fichier principal analysé (ex: UserService.java)
-        
-    Returns:
-        Liste de dicts avec: file_path, location, problem, severity, fixed_code
-    """
     import re
     from pathlib import Path
     
@@ -151,15 +118,13 @@ def parse_dependent_fixes(raw: str, main_file: str) -> list[dict]:
         if not location:
             continue
             
-        # Extraction du fichier depuis la location
-        # Format attendu: "UserController.java:42" ou "UserController.java (method), line 42"
         file_match = re.search(r'^([\w.]+\.\w+)', location)
         if not file_match:
             continue
             
         dep_file = file_match.group(1)
         
-        # Si c'est un fichier différent du fichier principal, c'est un fix dépendant
+
         if dep_file != main_file_name:
             problem = _f("PROBLEM")
             sev_raw = _f("SEVERITY").upper().split()[0] if _f("SEVERITY") else "MEDIUM"
@@ -177,15 +142,10 @@ def parse_dependent_fixes(raw: str, main_file: str) -> list[dict]:
     return dependent_fixes
 
 
-# ── Section [IMPACT SUR LE SYSTÈME] ──────────────────────────────────────────
+
 
 def build_system_impact_section(file_name: str, neighborhood: Dict[str, Any]) -> str:
-    """
-    Génère la section [IMPACT SUR LE SYSTÈME] injectée dans le prompt LLM.
-    Le LLM sait exactement quels fichiers et méthodes sont à risque.
-
-    Migré depuis incremental_analyzer._build_system_impact_section() (lignes 589-688)
-    """
+    
     preds    = neighborhood.get("predecessors", [])
     succs    = neighborhood.get("successors", [])
     indirect = neighborhood.get("indirect_impacted", [])
@@ -193,7 +153,7 @@ def build_system_impact_section(file_name: str, neighborhood: Dict[str, Any]) ->
     succ_ent = neighborhood.get("successor_entities", {})
 
     if not preds and not succs:
-        return ""   # fichier isolé → pas de section système
+        return ""   
 
     lines = [
         "", "═" * 68, "  [IMPACT SUR LE SYSTÈME]", "═" * 68,
@@ -242,9 +202,7 @@ def build_system_impact_section(file_name: str, neighborhood: Dict[str, Any]) ->
 
 def build_context(file_path: Path, neighborhood: Dict[str, Any],
                   project_indexer=None, change_info: Dict = None) -> Dict[str, Any]:
-    """
-    Construit le dictionnaire de contexte passé au LLM.
-    """
+  
     from agents.code_agent import code_agent
 
     ctx = {
@@ -268,16 +226,10 @@ def build_context(file_path: Path, neighborhood: Dict[str, Any],
     return ctx
 
 
-#AnalysisAgent 
+
 
 class AnalysisAgent:
-    """
-    Appelle le LLM avec le contexte enrichi et valide chaque correction proposée.
-
-    Usage :
-        result = analysis_agent.analyze(code, context, docs, scores)
-    """
-
+  
     def __init__(self, llm_service=None):
         self._svc = llm_service
 
@@ -300,7 +252,7 @@ class AnalysisAgent:
 
     def _validate_blocks(self, raw_analysis: str, source_code: str,
                          language: str) -> List[Dict]:
-        """Parse et valide chaque bloc ---FIX START--- proposé par le LLM."""
+    
         blocks = []
         parts  = re.split(r'-{3,}\s*FIX START\s*-{3,}', raw_analysis, flags=re.IGNORECASE)
         for raw in parts[1:]:
@@ -343,17 +295,7 @@ class AnalysisAgent:
         docs:          list = None,
         scores:        list = None,
     ) -> dict:
-        """
-        Génère la classe entière réécrite en exploitant tout le contexte.
-        Appelé après analyze() quand le nombre de problèmes critiques est élevé.
-
-        Retourne :
-            {
-                "solution_text" : str  — classe complète réécrite
-                "changes_made"  : list — résumé des corrections
-                "language"      : str
-            }
-        """
+       
         if self._svc is None:
             return {"solution_text": "", "changes_made": [], "language": "unknown"}
 
@@ -362,7 +304,7 @@ class AnalysisAgent:
 
         language = code_agent.detect_language(Path(context.get("file_path", "f.java")))
 
-        # Construire le contexte KB depuis les docs RAG déjà calculés
+       
         knowledge_context = ""
         if docs and scores:
             knowledge_context = self._svc._build_knowledge_context(docs, scores)
@@ -374,7 +316,7 @@ class AnalysisAgent:
             knowledge_context = knowledge_context,
         )
 
-        # Extraire le résumé des changements si présent
+      
         changes = []
         if "CHANGES MADE:" in solution_text:
             changes_section = solution_text.split("CHANGES MADE:")[-1].strip()

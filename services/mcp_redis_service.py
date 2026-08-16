@@ -1,20 +1,4 @@
-"""
-mcp_redis_service.py — Client MCP Redis (séparé de MCP GitHub).
 
-Architecture :
-  - _RedisLoopManager : event loop async dédié (séparé de celui de MCP GitHub)
-  - MCPRedisService   : client MCP avec méthodes typées pour chaque opération Redis
-  - mcp_redis          : singleton global importable depuis n'importe quel module
-
-Le serveur utilisé est le MCP officiel redis/mcp-redis (Python, via pip).
-Il expose 47 tools : hset/hget/hgetall, zadd/zrange, json_set/json_get,
-set/get, scan_all_keys, etc.
-
-Séparation MCP :
-  - MCPGitHubService  → npx @modelcontextprotocol/server-github
-  - MCPRedisService   → redis-mcp-server --url redis://localhost:6379/0
-  Deux processus distincts, deux event loops, zéro couplage.
-"""
 from __future__ import annotations
 
 import asyncio

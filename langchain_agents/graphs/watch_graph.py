@@ -1,34 +1,4 @@
-"""
-watch_graph.py — LangGraph WatchGraph (Orchestrator).
 
-This is the ONLY LangGraph component. It connects the 4 LangChain agents
-(CodeAgent, RetrieverAgent, AnalysisAgent, LearningAgent) in a StateGraph
-with conditional edges.
-
-Replaces: core/orchestrator.py Orchestrator._analyze_file() (12 steps)
-
-Graph topology:
-  hash_check → read_file → change_filter → parse_ast → test_gap_detect
-  → [conditional] index_chromadb → update_kg → update_dep_graph
-  → get_neighborhood → rag_retrieve → build_context → llm_analyze
-  → cache_results → learn_feedback → [conditional] analyze_dependents → END
-  → [conditional] emit_test_gap_only → END
-
-Conditional edges:
-  - hash_check:        not found / read error → END (skip)
-  - read_file:         unsupported language    → END (skip)
-  - test_gap_detect:   insignificant change     → emit_test_gap_only → END
-  - learn_feedback:    has_deps                 → analyze_dependents
-
-TestGapAgent is 0-token (no LLM call) and must run on every save regardless of
-whether the edit is "significant" enough for the LLM-analysis path. It used to
-sit downstream of hash_check's unchanged-hash skip and change_filter's
-significance skip — both designed to protect the EXPENSIVE llm_analyze node —
-so a missing-test gap was silently never (re)detected once a file's content
-hash had been seen once, or whenever an edit was classified as minor. Fixed by
-moving test_gap_detect right after parse_ast (its only real data dependency)
-and gating only the downstream LLM-heavy branch behind significance.
-"""
 from __future__ import annotations
 
 import logging
@@ -50,10 +20,6 @@ _YL = "\033[93m"
 _CY = "\033[96m"
 _DM = "\033[2m"
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Node Functions — each takes WatchState, returns partial WatchState updates
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def node_hash_check(state: WatchState) -> Dict[str, Any]:

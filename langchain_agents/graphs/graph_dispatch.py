@@ -1,16 +1,4 @@
-"""
-graph_dispatch.py — Feature-flagged dispatcher: deterministic vs agentic graphs.
 
-Single switch point so callers (API, CIPoller, CLI) don't hardcode which graph
-runs. The agentic multi-agent graph is now the DEFAULT; the deterministic graph
-stays as an automatic fallback (and can be forced via the escape-hatch flag).
-
-Safety: if the agentic graph raises, we fall back to the deterministic one so
-an LLM outage never breaks the pipeline.
-
-    (unset / 1 / true)  → agentic graphs (ci_agent_graph / cd_agent_graph)  [default]
-    CI_CD_AGENTIC=0     → force deterministic graphs (ci_graph / cd_graph)
-"""
 from __future__ import annotations
 
 import logging

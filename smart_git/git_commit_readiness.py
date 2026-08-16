@@ -1,30 +1,4 @@
-"""
-git_commit_readiness.py — Agrégateur "Commit Readiness" (cockpit local Smart Git).
 
-Rôle :
-  Exécute les cinq vérifications locales Smart Git de façon DIRECTE (sans passer
-  par le LangGraph) et les agrège en un verdict unique, explicable et typé :
-
-    score   : 0–100   (pondération des cinq checks)
-    verdict : READY | WARN | BLOCKED
-    blockers / warnings : raisons textuelles tirées des checks RÉELS
-
-Pourquoi un appel direct (et non le LangGraph) :
-  Chaque check est 100 % local et déterministe (regex / git CLI / fichiers).
-  Invoquer le graphe complet (session → diff → branch → pr → conflict → …) pour
-  une opération locale ajoute de la latence inutile. Cet agrégateur appelle les
-  modules concernés directement → réponse rapide, 0 token LLM.
-
-Checks agrégés :
-  1. secrets       (git_secret_scanner)   — BLOQUANT
-  2. conflicts     (git_diff_parser)      — BLOQUANT
-  3. commit_lint   (git_commit_linter)    — AVERTISSEMENT (si message fourni)
-  4. test_impact   (git_test_impact)      — AVERTISSEMENT
-  5. session       (git_diff_parser)      — INFORMATIF (contexte/contexte risque)
-
-Cet agrégateur est additif : il ne modifie aucun module existant et ne touche
-ni au dashboard ni au LangGraph.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -42,9 +16,6 @@ from smart_git.git_diff_parser import (
 )
 
 
-# ── Pondération du score ───────────────────────────────────────────────────────
-# Chaque check apporte un nombre de points au score sur 100. Un BLOQUANT en échec
-# plafonne aussi le verdict à BLOCKED quelle que soit la note des autres checks.
 
 WEIGHT_SECRETS  = 35   # bloquant — sécurité avant tout
 WEIGHT_CONFLICTS = 25  # bloquant — un commit sur état en conflit est dangereux

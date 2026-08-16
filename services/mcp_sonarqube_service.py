@@ -1,22 +1,4 @@
-"""
-mcp_sonarqube_service.py — Client MCP SonarCloud.
 
-Connecte le Code Auditor au SonarSource/sonarqube-mcp-server (officiel)
-via Docker (mcp/sonarqube) en utilisant le même patron que MCPGitHubService.
-
-Configuration SonarCloud (env vars) :
-  SONARQUBE_TOKEN : User token SonarCloud (requis)
-  SONARQUBE_ORG   : Clé de l'organisation SonarCloud (requis pour Cloud)
-
-Usage :
-    sonar = get_mcp_sonarqube()
-    gate = sonar.get_quality_gate_status("chmaryem_myapp")
-    # → {"status": "OK"|"ERROR"|"WARN", "conditions": [...]}
-
-Fallback :
-    Si Docker n'est pas disponible, utilise la REST API SonarCloud directement
-    via urllib (même pattern que _push_via_rest dans ci_deploy_agent.py).
-"""
 
 from __future__ import annotations
 
@@ -33,9 +15,6 @@ logger = logging.getLogger(__name__)
 
 SONARCLOUD_URL = "https://sonarcloud.io"
 SONARCLOUD_API = "https://sonarcloud.io/api"
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _get_sonar_token() -> str:
     token = os.environ.get("SONARQUBE_TOKEN", "")

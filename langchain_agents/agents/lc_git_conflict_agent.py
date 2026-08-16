@@ -1,17 +1,4 @@
-"""
-lc_git_conflict_agent.py — Smart Git Conflict Agent.
 
-Role:
-  Safe conflict detection and dry-run resolution wrapper.
-
-Uses existing:
-  smart_git.git_diff_parser.detect_conflict_files
-
-Important:
-  This first LangGraph version is SAFE by default.
-  It detects conflicts and returns a dry-run report.
-  It does NOT write files and does NOT push branches.
-"""
 
 from __future__ import annotations
 
@@ -20,16 +7,7 @@ from typing import Any, Dict
 
 
 class LCGitConflictAgent:
-    """
-    ConflictAgent answers:
-      - are there conflicts?
-      - which files are conflicted?
-      - can we prepare a dry-run resolution?
-
-    Pillars: owns tool_conflict_scan (+ the conflict_resolution_graph subgraph
-    for actual resolution), and an AgentRedisMemory namespace.
-    Node in the graph: node_conflict (intent: conflict_resolution_dry_run).
-    """
+ 
 
     def __init__(self) -> None:
         from langchain_agents.tools.git_tools import tool_conflict_scan

@@ -1,19 +1,4 @@
-"""
-lc_apply_agent.py — Apply generated code to files (safe, diff-aware).
 
-Phase B — Feature B1.
-
-Converts LLM-generated code into:
-  1. A unified diff (for review)
-  2. A VS Code WorkspaceEdit payload (for direct application in the IDE)
-  3. Optionally writes to disk (trusted local mode only)
-
-Safety rules:
-  - Never writes outside project root
-  - Never overwrites without explicit confirmation (write_mode="overwrite")
-  - Dry-run by default (returns diff + workspaceEdit, does not write)
-  - All edits are validated (syntax check for Python)
-"""
 from __future__ import annotations
 
 import difflib
@@ -61,15 +46,7 @@ def _build_workspace_edit(
     file_path: str,
     edits: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    Build a VS Code WorkspaceEdit payload.
-
-    Each edit has:
-      {range: {start: {line, character}, end: {line, character}}, newText: str}
-
-    The extension applies this via:
-      vscode.workspace.applyEdit(WorkspaceEdit.fromJSON(payload))
-    """
+ 
     return {
         "version": 1,
         "edits": [
@@ -87,10 +64,7 @@ def _replace_function_edit(
     new_function_body: str,
     language: str = "python",
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Find a function in original_code and replace it.
-    Returns (vscode_edits, modified_code).
-    """
+  
     lines = original_code.split("\n")
 
     # Find function start line
@@ -149,14 +123,7 @@ def _replace_function_edit(
 # ── Apply agent ───────────────────────────────────────────────────────────────
 
 class LCApplyAgent:
-    """
-    Apply generated code patches to files.
-
-    Modes:
-      dry_run  : return diff + workspaceEdit, do NOT write (default)
-      preview  : same as dry_run but with syntax validation
-      apply    : write to disk (requires project_path containment check)
-    """
+   
 
     def apply_function_patch(
         self,

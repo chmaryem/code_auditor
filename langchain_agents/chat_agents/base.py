@@ -1,13 +1,4 @@
-"""
-base.py — Contrat d'agent blackboard + registre.
 
-Un agent blackboard est un agent DÉTERMINISTE et AUTONOME :
-  - should_activate(state) : décide lui-même s'il est pertinent (scope + message).
-  - contribute(state)      : produit sa section du blackboard (0 appel LLM).
-
-Le registre est ordonné : FileAgent d'abord (il produit `file_code` dont dépendent
-RAG/deps), puis les autres en parallèle (voir node_gather dans chat_graph.py).
-"""
 from __future__ import annotations
 
 import logging

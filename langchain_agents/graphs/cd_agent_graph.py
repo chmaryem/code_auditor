@@ -1,28 +1,4 @@
-"""
-cd_agent_graph.py — Agentic CDGraph (supervisor + specialist agents).
 
-Parallel, feature-flagged alternative to cd_graph.py. invoke_cd_agent_run
-mirrors invoke_cd_run (same signature incl. dry_run and same return shape), so
-the dashboard preview keeps working unchanged.
-
-Hybrid design:
-  - Deterministic STRUCTURED nodes are REUSED from cd_graph.py
-    (fetch_deployment, pre_deploy_risk_score, check_environment,
-    monitor_health, post_deploy_report, index_result, notify). These populate
-    the numeric fields the dashboard needs (readiness score/verdict, health
-    grade/latency).
-  - The REASONING is done by real tool-calling agents (cd_agents.py): a
-    supervisor routes to a Deploy Analysis Agent and a Rollback Agent, which
-    autonomously call cd_tools.
-
-Flow:
-  fetch_deployment → pre_deploy_risk_score → check_environment → monitor_health
-    → supervise → [deploy_analysis] → [rollback] → consolidate
-    → post_deploy_report → index_result → notify → END
-  (conditional edges: only the specialists picked by the supervisor's route
-  are actually visited — a healthy deploy skips both and goes straight to
-  consolidate.)
-"""
 from __future__ import annotations
 
 import logging

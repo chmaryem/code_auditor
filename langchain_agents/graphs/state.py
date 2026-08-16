@@ -1,9 +1,4 @@
-"""
-state.py — Shared state definitions for LangGraph graphs.
 
-Each graph uses a TypedDict state that flows through all nodes.
-This is the ONLY place where state schemas are defined.
-"""
 from __future__ import annotations
 
 import operator
@@ -148,16 +143,7 @@ class CDState(TypedDict, total=False):
 
 
 class ChatState(TypedDict, total=False):
-    """
-    State for the ChatGraph pipeline.
-
-    ChatGraph now supports:
-      - Memory-aware decision routing
-      - Fast explain path
-      - Contextual Q&A path
-      - Code generation path
-      - SSE streaming path
-    """
+   
 
     # ── Input ────────────────────────────────────────────────────────────────
     session_id: str
@@ -260,14 +246,7 @@ class ChatState(TypedDict, total=False):
 
 
 class SmartGitState(TypedDict, total=False):
-    """
-    State for the SmartGitGraph pipeline (multi-agent Smart Git orchestration).
-
-    Flow: node_router (RouterAgent, LLM) → [route_by_intent] → one worker node
-    (WorkingCopyAgent | PRAgent | ConflictAgent) → node_synthesize (join) → END.
-    Worker nodes select their tool(s) by `intent` and write their report field;
-    node_synthesize reads whatever report is present and produces `response`.
-    """
+ 
 
     # ── Input ────────────────────────────────────────────────────────────────
     user_message: str

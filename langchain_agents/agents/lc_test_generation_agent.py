@@ -1,21 +1,4 @@
-"""
-lc_test_generation_agent.py — LangChain TestGenerationAgent.
 
-3 Pillars réels:
-  LLM     : OpenRouter/Groq/Gemini cascade via RunnableWithFallbacks (réutilise
-            _build_llm_with_fallback() de lc_analysis_agent.py — pas de HTTP brut)
-  Memory  : AgentRedisMemory("test_generation_agent") — mémorise la raison du dernier
-            retry par fichier, pour préventivement enrichir la prochaine génération
-  Planning: le StateGraph test_gen_graph.py (topologie fixe + edges conditionnels)
-            EST le plan — ce n'est pas dupliqué ici (cf. décision Pattern B, pas de
-            bind_tools()/boucle agentique autonome : la topologie fixe est le
-            contrat de non-régression).
-
-(Un pillar "Tools" a existé un temps — langchain_agents/tools/test_gen_tools.py,
-8 @tool wrappers — mais n'était jamais invoqué : bind_tools() n'a jamais été
-appelé, les nœuds du StateGraph appellent _helpers.py directement. Supprimé
-comme code mort plutôt que gardé pour la forme.)
-"""
 from __future__ import annotations
 
 import logging

@@ -1,26 +1,4 @@
-"""
-RetrieverAgent — Recherche RAG consciente du système.
 
-Contient :
-  - GraphNeighborhoodExtractor : extrait le voisinage NetworkX d'un fichier
-    (predecessors = appelants, successors = dépendances, impact indirect)
-  - SystemAwareRAG             : pipeline RAG en 2 passes
-      Passe 1 : ChromaDB multi-query → top-20 candidats
-        • Queries structurelles (code brut + signatures appelants + dépendances)
-        • KG expand_queries (depth=2) — nœuds détectés → règles connexes
-        • KG n_hop_retrieval (depth=3) — NetworkX + KG → règles N-hop
-        • Project code index — code projet similaire
-      Passe 2 : Cross-encoder reranking → top-8 vraiment pertinents
-      Fusion + déduplication + tri final.
-  - RetrieverAgent             : façade publique qui orchestre les deux
-
-Nouveautés :
-  - Cross-encoder reranking (sentence-transformers, modèle local)
-  - _build_rerank_query() : query enrichie avec patterns KG pour le reranker
-  - TOP_K_CANDIDATES = 20 (passe 1 large) → TOP_K = 8 (passe 2 précise)
-  - Fallback automatique si sentence-transformers absent
-  - _detected_patterns injecté dans neighborhood pour le reranking
-"""
 from __future__ import annotations
 
 import logging
@@ -34,27 +12,8 @@ from config import config as _cfg
 
 logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GraphNeighborhoodExtractor
-# ─────────────────────────────────────────────────────────────────────────────
-
 class GraphNeighborhoodExtractor:
-    """
-    Interroge le graphe NetworkX pour extraire le voisinage complet d'un fichier.
-
-    Sources combinées :
-      1. NetworkX predecessors/successors (imports résolus)
-      2. ProjectIndexer.get_related_files() (convention de nommage — filet de sécurité)
-
-    Retourne :
-      predecessors          : fichiers qui utilisent ce fichier (risque de casse)
-      successors            : fichiers que ce fichier utilise
-      indirect_impacted     : predecessors des predecessors (profondeur 2)
-      predecessor_entities  : {fichier: [{name, params, criticality}]}
-      successor_entities    : {fichier: [{name, params, criticality}]}
-      criticality           : nb de predecessors directs
-    """
+   
 
     def __init__(self, graph, project_indexer):
         self.graph           = graph
@@ -79,7 +38,6 @@ class GraphNeighborhoodExtractor:
             pred_paths_nx = []
             succ_paths_nx = []
 
-        # Source 2 : conventions de nommage (filet de sécurité)
         related_by_name = []
         if self.project_indexer and self.project_indexer.context:
             try:
@@ -87,15 +45,14 @@ class GraphNeighborhoodExtractor:
             except Exception:
                 pass
 
-        # Union sans doublons (dict.fromkeys préserve l'ordre)
+   
         all_preds = list(dict.fromkeys(pred_paths_nx + related_by_name))
         all_succs = list(dict.fromkeys(succ_paths_nx))
 
-        # Entités enrichies (name + params + criticality)
+    
         pred_entities = self._collect_entities_rich(all_preds)
         succ_entities = self._collect_entities_rich(all_succs)
 
-        # Impact indirect (profondeur 2)
         indirect_impacted = set()
         for fp in all_preds:
             pred_node = f"file:{fp}"
@@ -116,10 +73,7 @@ class GraphNeighborhoodExtractor:
     def _collect_entities_rich(
         self, file_paths: List[str]
     ) -> Dict[str, List[Dict]]:
-        """
-        Collecte les entités enrichies (name + params + criticality)
-        depuis project_indexer.
-        """
+        
         result = {}
         if not self.project_indexer or not self.project_indexer.context:
             return result
@@ -180,27 +134,9 @@ class GraphNeighborhoodExtractor:
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SystemAwareRAG
-# ─────────────────────────────────────────────────────────────────────────────
 
 class SystemAwareRAG:
-    """
-    RAG conscient du système — pipeline en 2 passes.
-
-    Passe 1 (large) : ChromaDB multi-query → jusqu'à TOP_K_CANDIDATES=20 candidats
-      Sources A : queries structurelles (code + signatures appelants + dépendances)
-      Sources B : KG expand_queries depth=2
-      Sources C : KG n_hop_retrieval depth=3
-      Sources D : project_code_index (code réel du projet)
-
-    Passe 2 (précise) : Cross-encoder reranking → TOP_K=8 docs finals
-      Modèle : cross-encoder/ms-marco-MiniLM-L-6-v2 (local, ~80MB)
-      Score final = 0.7 * ce_score_normalized + 0.3 * l2_score_inverted
-      Fallback : tri L2 simple si sentence-transformers absent
-
-    IMPORTANT : distance L2 Jina (THRESHOLD=1.2) ≠ cosinus (relevance_threshold=0.45)
-    """
+   
 
     # ── Attributs de classe ───────────────────────────────────────────────────
 
@@ -246,11 +182,7 @@ class SystemAwareRAG:
 
     @classmethod
     def _get_reranker(cls):
-        """
-        Charge le cross-encoder une seule fois (lazy singleton thread-safe).
-        Double-checked locking pour éviter les chargements simultanés
-        lorsque les deux branches de parallel_context s'initialisent en parallèle.
-        """
+        
         if cls._reranker_loaded:
             return cls._reranker
         with cls._reranker_lock:
@@ -283,16 +215,7 @@ class SystemAwareRAG:
         current_file_name: str = "",
         networkx_graph     = None,
     ) -> Tuple[List[Document], List[float]]:
-        """
-        Retourne (docs, scores) fusionnés depuis toutes les sources.
-
-        Étapes :
-          1. Construire toutes les queries (A + B + C)
-          2. Rechercher dans ChromaDB + project_code_index (passe 1)
-          3. Fusionner et dédupliquer → top-20 candidats
-          4. Cross-encoder reranking → top-8 finals (passe 2)
-          5. Fallback L2 si reranker absent ou erreur
-        """
+      
 
         # ── Source A : queries structurelles ──────────────────────────────────
         queries = self._build_queries(current_code, neighborhood)
@@ -430,11 +353,11 @@ class SystemAwareRAG:
                 return top_docs, top_scores
             # Si _rerank retourne vide (erreur interne) → fallback
 
-        # ── Fallback : tri L2 simple ──────────────────────────────────────────
+
         top = candidates[: self.TOP_K]
         return [d for d, _ in top], [s for _, s in top]
 
-    # ── Reranking ─────────────────────────────────────────────────────────────
+ 
 
     def _rerank(
         self,
@@ -642,5 +565,5 @@ class RetrieverAgent:
         )
 
 
-# Instance globale
+
 retriever_agent = RetrieverAgent()

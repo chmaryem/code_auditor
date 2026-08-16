@@ -1,14 +1,4 @@
-"""
-lc_inline_completion_agent.py — Smart cursor-aware inline code completion.
 
-3-tier pipeline (per keystroke):
-  Tier 1 — In-memory cache          < 1 ms   repeated patterns
-  Tier 2 — Graph symbol fast path   < 5 ms   unambiguous name completion (no LLM)
-  Tier 3 — LLM with project context ~500 ms  everything else (Groq-first cascade)
-
-Project context for the LLM is built from the DependencyGraph already loaded at
-server startup — zero additional I/O per keystroke.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -98,20 +88,7 @@ def _build_fast_llm():
 # ── Agent ──────────────────────────────────────────────────────────────────────
 
 class LCInlineCompletionAgent:
-    """
-    Smart inline completion agent.
-
-    Pipeline:
-      1. In-memory cache                      — sub-ms, repeated patterns
-      2. Graph fast path (Phase 1)            — unambiguous symbol, 0 LLM
-         • local file symbols visible before cursor
-         • imported symbols (by name, typed into the import list)
-      3. LLM call with enriched project context:
-         Phase A — local symbols visible before cursor
-         Phase B — imported symbols' signatures
-         Phase C — project-wide prefix-token match
-    """
-
+   
     CACHE_TTL     = 300   # 5 min  — completion in-memory TTL
     CTX_CACHE_TTL = 120   # 2 min  — project context block TTL per file
     MAX_TOKENS    = 128   # ~4 lines; keeps LLM latency low

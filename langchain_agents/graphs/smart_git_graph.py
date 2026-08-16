@@ -1,30 +1,4 @@
-"""
-smart_git_graph.py — Smart Git multi-agent orchestration (LangGraph).
 
-Genuine multi-agent architecture for Smart Git, consistent with the platform's
-other graphs (ci_graph.py, cd_graph.py): a deterministic-then-conditional
-topology with a single convergence (join) node.
-
-Topology (same shape as CIGraph/CDGraph):
-
-    entry → node_router            (RouterAgent — LLM classify → intent)
-    node_router → [route_by_intent]  (conditional edges)
-        → node_working_copy   (WorkingCopyAgent — local/pre-commit + branch)
-        → node_pr             (PRAgent — GitHub PR review/readiness/desc/cross)
-        → node_conflict       (ConflictAgent — conflict dry-run + subgraph)
-    {3 workers} → node_synthesize  (SynthesisAgent — JOIN → response) → END
-
-Four pillars, each on existing infra:
-  - Agents        : 5 LangChain agents (router, working_copy, pr, conflict, synthesis)
-  - Tools         : langchain_agents/tools/git_tools.py (each agent owns a subset)
-  - Memory        : AgentRedisMemory per agent + shared blackboard/session
-                    memory (smart_git/pr_context_cache.py)
-  - Orchestration : this StateGraph
-
-The conflict path composes an existing subgraph
-(smart_git/conflict_resolution_graph.py) for actual resolution — real graph
-composition, already live in production.
-"""
 from __future__ import annotations
 
 import json

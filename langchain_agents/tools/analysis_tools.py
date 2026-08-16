@@ -1,12 +1,4 @@
-"""
-analysis_tools.py — LangChain @tool wrappers for LLM analysis operations.
 
-Tools:
-  - tool_build_context        : Build enriched context dict for LLM prompt
-  - tool_build_system_impact  : Build [IMPACT SUR LE SYSTÈME] section
-  - tool_validate_fix_blocks  : Validate proposed fix blocks against source code
-  - tool_llm_analyze          : Invoke LLM with cascade fallback
-"""
 from pathlib import Path
 from typing import Any, Dict, List
 

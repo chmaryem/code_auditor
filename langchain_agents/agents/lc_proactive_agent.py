@@ -1,33 +1,4 @@
-"""
-lc_proactive_agent.py — Proactive suggestions engine (Phase C2).
 
-Instead of waiting for the developer to ask, this agent:
-  - Detects uncommitted bugs (from GitSessionTracker + WatchGraph results)
-  - Detects test gaps (files modified but not tested)
-  - Detects CI risk patterns (file changed = previously failed CI stage)
-  - Detects architectural coupling changes (dep graph impact)
-
-Output format:
-  {
-    "suggestions": [
-      {
-        "type": "test_gap" | "uncommitted_bug" | "ci_risk" | "coupling",
-        "severity": "info" | "warning" | "critical",
-        "title": "short title",
-        "message": "markdown message",
-        "file":  "affected file",
-        "action": "generate_tests" | "analyze_file" | "review_pr" | null
-      }
-    ],
-    "total": N,
-    "has_critical": bool
-  }
-
-Usage:
-  - Called automatically by ChatGraph after node_memory_save
-  - Also exposed via POST /api/chat/proactive for VS Code extension
-  - VS Code extension shows suggestions in a side panel (CodeLens or notification)
-"""
 from __future__ import annotations
 
 import logging
@@ -39,12 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class ProactiveAgent:
-    """
-    Proactive suggestion engine.
-
-    Runs lightweight heuristics (no LLM on the critical path) to generate
-    actionable suggestions shown to the developer without them asking.
-    """
+   
 
     SEVERITY_PRIORITY = {"critical": 0, "warning": 1, "info": 2}
 

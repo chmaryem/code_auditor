@@ -1,38 +1,4 @@
-"""
-knowledge_graph.py — KG Automatisé
-═══════════════════════════════════
 
-VISION : Le KG ne doit jamais être écrit à la main.
-Il se construit tout seul depuis 3 sources :
-
-  Source 1 — Front-matter des .md (KB de règles)
-      sql_injection.md contient :
-          kg_nodes: [SQL_Injection, Resource_Leak]
-          kg_relations:
-            - [SQL_Injection, FIXED_BY, PreparedStatement]
-      → KG lit ces métadonnées → construit les nœuds et arêtes
-
-  Source 2 — AST du code projet (via code_parser.py)
-      Auth.java contient class TokenManager, method authenticate()
-      → KG crée automatiquement :
-          nœud "Auth.java::TokenManager"   (type: entity_class)
-          nœud "Auth.java::authenticate"   (type: entity_method)
-          arête TokenManager → HAS_METHOD → authenticate
-          arête Auth.java    → CONTAINS   → TokenManager
-
-  Source 3 — Liaison sémantique (heuristiques + LLM optionnel)
-      authenticate(username, password) → HANDLES → Authentication
-      Authentication → IS_CONCEPT_OF → Security
-      → N-hop depuis Auth.java trouve les règles Security
-
-TRAVERSAL N-HOP :
-  Auth.java modifié
-      → NetworkX : impacte UserController.java
-      → KG entités : UserController::login → HANDLES → Authentication
-      → KG concepts : Authentication → IS_CONCEPT_OF → Security
-      → ChromaDB : chercher règles Security + Authentication
-  Le LLM reçoit des règles qu'il n'aurait jamais trouvées par recherche textuelle.
-"""
 
 from __future__ import annotations
 

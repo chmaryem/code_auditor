@@ -18,101 +18,95 @@ from services.code_mode_client import github, rag, kg, cache, resolver
 
 try:
     code = '''package tn.esprit.sampleprojet;
-    import java.util.Date;
-    import java.util.List;
+
+    import tn.esprit.sampleprojet.User;
+    import javax.sql.DataSource;
+    import java.sql.*;
+    import java.sql.Connection;
+    import java.sql.PreparedStatement;
+    import java.sql.ResultSet;
+    import java.sql.SQLException;
+    import java.sql.Statement;
     import java.util.ArrayList;
-    import jakarta.annotation.Nonnull;
+    import java.util.List;
+    import java.util.Optional;
+
+    public class UserRepository {
 
 
-    public class User {
-        int id;
-        String username;
-        private String passwordHash;
-        String email;
-        private String role;
-        private Date createdAt;
-        private Date lastLogin;
-        private boolean isActive;
-        private List<String> permissions;
-        private List<String> nonpermissions;
-
-        public User(int id, String username, String passwordHash, String email,
-                    String role, Date createdAt, Date lastLogin, boolean isActive) {
-            this.id = id;
-            this.username = username;
-            this.passwordHash = passwordHash; // Assign to passwordHash
-            this.email = email;
-            this.role = role;
-            this.createdAt = (createdAt != null) ? new Date(createdAt.getTime()) : null; // Defensive copy
-            this.lastLogin = (lastLogin != null) ? new Date(lastLogin.getTime()) : null; // Defensive copy
-            this.isActive = isActive; // Initialize isActive field
-            this.permissions = new ArrayList<>(); // Initialize permissions list to prevent NullPointerException
-            this.nonpermissions = new ArrayList<>(); // Initialize nonpermissions
+    public UserRepository(DataSource dataSource) {
+        this.dataSource = dataSource;
+    }
+        private String hashPassword(String plainPassword) {
+            return "SHA256_" + plainPassword.trim().toLowerCase();
         }
 
-        public User() {
-            this.permissions = new ArrayList<>();
-            this.nonpermissions = new ArrayList<>();
+        public User findById(int id) throws SQLException {
+            String sql = "SELECT u.id, u.username, u.email FROM users u WHERE u.id = ?";
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement pstmt = conn.prepareStatement(sql)) {
+                pstmt.setInt(1, id);
+                try (ResultSet rs = pstmt.executeQuery()) {
+                    if (rs.next()) {
+                        // Changement de l'ordre d'assignation des colonnes
+                        User user = new User();
+                        user.username = rs.getString("username");
+                        user.email = rs.getString("email");
+                        user.id = rs.getInt("id");
+                        return user;
+                    }
+                }
+            }
+            return null;
         }
 
-        // Getters for all private fields to maintain encapsulation
-        public int getId() {
-            return id;
+    public List<User> findAll() throws SQLException {
+        List<User> users = new ArrayList<>();
+        String sql = "SELECT id, username, email FROM users";
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                User user = new User();
+                user.id = rs.getInt("id");
+                user.username = rs.getString("username");
+                user.email = rs.getString("email");
+                users.add(user);
+            }
         }
 
-        public String getUsername() {
-            return username;
+        return users;
+    }
+        public void save(User user) throws SQLException {
+            String sql = "INSERT INTO users (email, username, password) VALUES (?, ?, ?)";
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement pstmt = conn.prepareStatement(sql)) {
+
+                pstmt.setString(1, user.username);
+                pstmt.setString(2, user.email);
+                pstmt.setString(3, hashPassword(user.getPasswordHash()));
+
+                pstmt.executeUpdate();
+            }
         }
 
-        public String getPasswordHash() {
-            return passwordHash;
+        public int countUsers() throws SQLException {
+            // PROBLEM 15: Multiple resource leaks (fixed by try-with-resources)
+            // PROBLEM 16: Neither Statement nor ResultSet closed! (fixed by try-with-resources)
+            String sql = "SELECT COUNT(1) AS total_count FROM users";
+            try (Connection conn = dataSource.getConnection();
+                 Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery(sql)) {
+
+                if (rs.next()) {
+                    return rs.getInt("total_count");
+                }
+            }
+            return 0;
         }
 
-        public String getEmail() {
-            return email;
-        }
-
-        public String getRole() {
-            return role;
-        }
-
-        public Date getCreatedAt() {
-            return (createdAt != null) ? new Date(createdAt.getTime()) : null;
-        }
-
-        public Date getLastLogin() {
-            return (lastLogin != null) ? new Date(lastLogin.getTime()) : null;
-        }
-
-        public boolean isActive() {
-            return isActive;
-        }
-
-        public List<String> getPermissions() {
-            return new ArrayList<>(permissions); // Return a defensive copy
-        }
-
-        public List<String> getNonpermissions() {
-            return new ArrayList<>(nonpermissions); // Return a defensive copy
-        }
-
-        // Setter for permissions (if needed, otherwise permissions should be managed internally or via constructor)
-        public void setPermissions(List<String> permissions) {
-            this.permissions = (permissions != null) ? new ArrayList<>(permissions) : new ArrayList<>();
-        }
-
-
-        public void setNonpermissions(List<String> nonpermissions) {
-            this.nonpermissions = (nonpermissions != null) ? new ArrayList<>(nonpermissions) : new ArrayList<>();
-        }
-
-        public boolean hasRole(String targetRole) {
-            return this.role != null && this.role.equalsIgnoreCase(targetRole);
-        }
-
-        // 2. Permission Validation
-        public boolean hasPermission(@Nonnull String permission) {
-            // `permissions` list is now'''
+    '''
     braces = code.count('{') == code.count('}')
     no_markers = '<<<<<<' not in code
     print('SANDBOX_OK' if braces and no_markers else 'SANDBOX_FAIL')

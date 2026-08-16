@@ -1,25 +1,4 @@
-"""
-ci_agent_graph.py — Agentic CIGraph (supervisor + specialist agents).
 
-Parallel, feature-flagged alternative to ci_graph.py. Same inputs/outputs
-(invoke_ci_agent_run mirrors invoke_ci_run), so it can be swapped in behind a
-flag with the deterministic graph kept as a fallback.
-
-Hybrid design:
-  - Deterministic prefetch/post/notify nodes are REUSED from ci_graph.py
-    (log download, classification, PR comment, indexing, notification).
-  - The reasoning steps are REAL tool-calling agents (ci_agents.py): the LLM
-    decides which tools to call. A supervisor agent decides which specialists
-    run.
-
-Flow:
-  fetch_run → classify_failure → retry_check → supervise
-    → [diagnostic] → [security_triage] → [remediation]   (conditional edges:
-      only the specialists picked by the supervisor's route are actually
-      visited, in that fixed order — the others are skipped by the graph
-      itself, not called-and-ignored)
-    → consolidate → post_pr_comment → index_result → notify → END
-"""
 from __future__ import annotations
 
 import logging
@@ -274,13 +253,6 @@ def _parse_root_cause_fix(text: str) -> tuple[str, str]:
     return rc, fix
 
 
-# ── Conditional routing ──────────────────────────────────────────────────────
-# The specialist sequence stays fixed (diagnostic → security_triage →
-# remediation) regardless of the order the supervisor's `route` list lists
-# them in — only presence/absence in `route` decides whether a node is
-# actually visited. This makes the routing real (LangGraph skips the node
-# entirely) instead of the earlier "visit every node, no-op if not routed".
-
 def _route_after_supervise(state: CIAgentState) -> str:
     route = state.get("route", [])
     for step in ("diagnostic", "security_triage", "remediation"):
@@ -349,7 +321,6 @@ def build_ci_agent_graph():
     return g.compile()
 
 
-# ── Public invoke (mirrors invoke_ci_run) ──────────────────────────────────────
 
 _ci_agent_graph = None
 

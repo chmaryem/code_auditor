@@ -1,14 +1,4 @@
-"""
-lc_analysis_agent.py — LangChain AnalysisAgent.
 
-4 Pillars:
-  LLM     : OpenRouter/Gemini cascade via RunnableWithFallbacks
-  Tools   : tool_llm_analyze, tool_build_context, tool_validate_fix_blocks
-  Memory  : AnalysisCacheMemory (Redis) — cached results, post-solution flags
-  Planning: Decision tree in prompt (full_class / targeted_methods / block_fix)
-
-This agent is the core LLM reasoning engine of the system.
-"""
 from __future__ import annotations
 
 import logging
@@ -32,28 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def parse_structured_output(text: str) -> dict:
-    """
-    Extrait et valide le bloc JSON <STRUCTURED_OUTPUT> de la réponse LLM.
-
-    Le LLM est invité (via le prompt) à terminer sa réponse par un bloc :
-        <STRUCTURED_OUTPUT>
-        { "strategy": "...", "strategy_reason": "...", "issues": [...], "fixes": [...] }
-        </STRUCTURED_OUTPUT>
-
-    Si ce bloc est absent ou malformé, retourne un dict vide — les appelants
-    (node_emit_ws_events) reviennent alors aux parseurs regex de fallback.
-
-    Args:
-        text: Texte brut de la réponse LLM (analysis["analysis"]).
-
-    Returns:
-        Dict avec les clés :
-            strategy        (str)  : "full_class" | "targeted_methods" | "block_fix"
-            strategy_reason (str)  : explication courte, max 100 chars
-            issues          (list) : liste de dicts conformes à WSIssueV2
-            fixes           (list) : liste de dicts conformes à WSFixV2
-        Ou {} si le bloc n'est pas trouvé / JSON invalide.
-    """
+   
     if not text:
         return {}
 
@@ -91,7 +60,7 @@ def parse_structured_output(text: str) -> dict:
 
 
 def _normalize_issues(raw: list) -> list:
-    """Sanitise la liste d'issues pour garantir les types attendus."""
+ 
     if not isinstance(raw, list):
         return []
     normalized = []
@@ -117,7 +86,7 @@ def _normalize_issues(raw: list) -> list:
 
 
 def _normalize_fixes(raw: list) -> list:
-    """Sanitise la liste de fixes pour garantir les types attendus."""
+   
     if not isinstance(raw, list):
         return []
     normalized = []
@@ -151,11 +120,7 @@ def _safe_int(value) -> "int | None":
 
 
 def _build_llm_with_fallback():
-    """
-    Build LLM with cascade fallback: OpenRouter → Groq → Gemini.
-
-    Uses RunnableWithFallbacks from LangChain for automatic failover.
-    """
+   
     from config import config
     import os
 
@@ -251,15 +216,7 @@ def _build_llm_with_fallback():
 
 
 class LCAnalysisAgent:
-    """
-    LangChain AnalysisAgent — core LLM reasoning engine.
-
-    Anatomy:
-      - LLM:      RunnableWithFallbacks (OpenRouter→Gemini)
-      - Tools:    llm_analyze, build_context, validate_fix_blocks
-      - Memory:   AnalysisCacheMemory (Redis), post-solution flags
-      - Planning: Strategy decision tree (full_class/targeted_methods/block_fix)
-    """
+  
 
     def __init__(self):
         self.memory = AgentRedisMemory("analysis_agent")
